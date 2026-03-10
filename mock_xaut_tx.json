@@ -1,0 +1,18 @@
+{
+    "transfers": [
+      {
+        "blockchain": "ethereum",
+        "blockNumber": 23958390,
+        "transactionHash": "0x008084abd045a9b3301fb84e7ba120bafbf573f6a4e0f9c700390cb2d47681d9",
+        "transferIndex": 0,
+        "token": "xaut",
+        "amount": "0.006894",
+        "timestamp": 1765079399,
+        "transactionIndex": 103,
+        "logIndex": 1624,
+        "from": "0xdd3d72C53Ff982ff59853da71158bf1538b3Ceee",
+        "to": "0x9417d411f7ad5df3c81cc3379cb3124f692f8a79",
+        "label": "transaction"
+      }
+    ]
+  }

@@ -9,6 +9,7 @@ import { View } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import 'react-native-reanimated';
 import getChainsConfig from '@/config/get-chains-config';
+import '@/utils/mock-xaut-transfers-patch';
 import { Toaster } from 'sonner-native';
 import { colors } from '@/constants/colors';
 import { networkConfigs } from '@/config/networks';

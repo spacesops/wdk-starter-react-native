@@ -199,20 +199,66 @@ export default function WalletScreen() {
     router.push('/receive/select-token');
   };
 
+  /** Normalize provider token to config key (e.g. "XAU₮", "XAU" -> "xaut") so we match XAU₮ transactions. */
+  const tokenToConfigKey = useCallback((token: string | undefined): string => {
+    const t = (token ?? '').toString().toLowerCase();
+    if (t === 'xaut' || t === 'xau' || t.startsWith('xau')) return 'xaut';
+    if (t === 'usat' || t === 'usa' || t.startsWith('usa')) return 'usat';
+    return t || '';
+  }, []);
+
   const handleXautChartButtonPress = useCallback(() => {
     const rawList = walletTransactions?.list ?? [];
-    const xautSymbol = assetConfig.xaut?.symbol ?? 'XAU₮';
-    const isXautTx = (tx: { token?: string }) => {
-      const t = (tx.token ?? '').toString();
-      const lower = t.toLowerCase();
-      return lower === 'xaut' || lower === 'xau' || lower.startsWith('xau') || t === xautSymbol;
-    };
+    // Diagnostic: balance comes from indexer token-balances; transactions from token-transfers.
+    // If the indexer does not return XAUT transfers, you get balance but no XAUT transactions.
+    const byToken = rawList.reduce<Record<string, number>>((acc, tx) => {
+      const key = tokenToConfigKey(tx.token) || (tx.token ?? '?');
+      acc[key] = (acc[key] ?? 0) + 1;
+      return acc;
+    }, {});
+    console.log('[XAU₮] Transaction list total:', rawList.length, 'by token:', byToken);
+
+    const isXautTx = (tx: { token?: string }) => tokenToConfigKey(tx.token) === 'xaut';
     const xautTxs = rawList.filter(isXautTx);
     console.log('[XAU₮] transactions count:', xautTxs.length);
     xautTxs.forEach((tx, i) => {
       console.log('[XAU₮]', i + 1, tx);
     });
-  }, [walletTransactions?.list]);
+
+    // Log first (earliest) XAUT transaction with date in YYYY-MM-DD HH:mm:ss
+    if (xautTxs.length > 0) {
+      const earliestXaut = xautTxs.reduce((a, b) =>
+        ((a.timestamp ?? 0) <= (b.timestamp ?? 0) ? a : b)
+      );
+      const tsXaut = earliestXaut.timestamp;
+      const msXaut = typeof tsXaut === 'number' && tsXaut < 1e12 ? tsXaut * 1000 : tsXaut;
+      const dXaut = new Date(msXaut);
+      const dateStrXaut =
+        `${dXaut.getFullYear()}-${String(dXaut.getMonth() + 1).padStart(2, '0')}-${String(dXaut.getDate()).padStart(2, '0')} ` +
+        `${String(dXaut.getHours()).padStart(2, '0')}:${String(dXaut.getMinutes()).padStart(2, '0')}:${String(dXaut.getSeconds()).padStart(2, '0')}`;
+      console.log('[XAU₮] First XAU₮ transaction:', dateStrXaut, earliestXaut);
+    } else {
+      console.log('[XAU₮] First XAU₮ transaction: none');
+    }
+
+    // Log earliest Bitcoin transaction with date in YYYY-MM-DD HH:mm:ss
+    const isBtcTx = (tx: { token?: string }) => (tx.token ?? '').toString().toLowerCase() === 'btc';
+    const btcTxs = rawList.filter(isBtcTx);
+    if (btcTxs.length === 0) {
+      console.log('[XAUT] Earliest Bitcoin transaction: none');
+      return;
+    }
+    const earliest = btcTxs.reduce((a, b) =>
+      ((a.timestamp ?? 0) <= (b.timestamp ?? 0) ? a : b)
+    );
+    const ts = earliest.timestamp;
+    const ms = typeof ts === 'number' && ts < 1e12 ? ts * 1000 : ts;
+    const d = new Date(ms);
+    const dateStr =
+      `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ` +
+      `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`;
+    console.log('[XAUT] Earliest Bitcoin transaction:', dateStr, earliest);
+  }, [walletTransactions?.list, tokenToConfigKey]);
 
   const handleBtcChartButtonPress = useCallback(async () => {
     const rawList = walletTransactions?.list ?? [];

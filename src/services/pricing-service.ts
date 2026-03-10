@@ -10,6 +10,19 @@ function getSpacesApiBaseUrl(): string {
   return base || 'http://192.168.1.111:7264';
 }
 
+export function getPricingServiceHostname(): string {
+  try {
+    const base = getSpacesApiBaseUrl();
+    if (base) {
+      const url = new URL(base);
+      return url.hostname || base;
+    }
+  } catch {
+    // ignore and fall through
+  }
+  return 'pricing service';
+}
+
 export enum FiatCurrency {
   USD = 'USD',
 }

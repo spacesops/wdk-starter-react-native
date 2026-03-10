@@ -11,6 +11,7 @@
     "ios": "expo run:ios",
     "ios:prod": "expo run:ios --configuration Release",
     "ios:prod:device": "expo run:ios --configuration Release --device",
+    "ios:testflight:prepare": "npm run prebuild && ./scripts/patch-ios-dev-team.sh && echo \"\u2713 iOS project prepared for TestFlight. Opening Xcode...\" && open ios/Spaces.xcworkspace",
     "web": "expo start --web",
     "lint": "expo lint",
     "lint:fix": "expo lint --fix",

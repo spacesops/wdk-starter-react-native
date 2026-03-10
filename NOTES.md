@@ -146,3 +146,20 @@ rm node_modules/@tetherto/wdk-react-native-provider/lib/module/services/wdk-serv
 // 2. Rebuild the native app: npm run android (or npm run ios)
 // 3. The new variables will now be available
 // Note: You CANNOT just restart the dev server - you must rebuild the native app.
+
+// XAUT balance vs transactions: Balance (e.g. 0.006894) comes from the indexer's token-balances
+// endpoint; the transaction list comes from token-transfers. If the indexer does not return XAUT
+// transfers (e.g. not indexed), you see balance but "[XAU₮] First XAU₮ transaction: none". Fix is on
+// the indexer/backend: ensure batch/token-transfers returns XAUT for the given address. Pressing
+// the XAUT button now logs "by token: { btc: N, ... }" so you can confirm which tokens are in the list.
+// Temporary workaround: set EXPO_PUBLIC_MOCK_XAUT_TRANSFERS=true in .env to merge mock_xaut_tx.json
+// into the token-transfers response (remove when batch/token-transfers is fixed).
+
+
+curl -s https://wdk-api.tether.io/api/v1/bitcoin/btc/bc1pcp2p7nzg8kknr42w6yel8k7hpy5tedjpacnwlvtfhzgmaq6u4qnq06nhac/token-transfers   --header 'X-Api-Key: bc21afea3aa7c6c6e83c14818da3d90b31c535f9edbe3368c6c71027ae1f6c01'   --cookie '=bc21afea3aa7c6c6e83c14818da3d90b31c535f9edbe3368c6c71027ae1f6c01' | jq .
+
+curl -s https://wdk-api.tether.io/api/v1/ethereum/usdt/0x9417D411f7Ad5DF3c81cc3379cB3124f692F8a79/token-transfers   --header 'X-Api-Key: bc21afea3aa7c6c6e83c14818da3d90b31c535f9edbe3368c6c71027ae1f6c01'   --cookie '=bc21afea3aa7c6c6e83c14818da3d90b31c535f9edbe3368c6c71027ae1f6c01' | jq .
+
+curl -s https://wdk-api.tether.io/api/v1/ethereum/xaut/0x9417D411f7Ad5DF3c81cc3379cB3124f692F8a79/token-transfers   --header 'X-Api-Key: bc21afea3aa7c6c6e83c14818da3d90b31c535f9edbe3368c6c71027ae1f6c01'   --cookie '=bc21afea3aa7c6c6e83c14818da3d90b31c535f9edbe3368c6c71027ae1f6c01' | jq .
+
+curl -s https://wdk-api.tether.io/api/v1/ethereum/usat/0x9417D411f7Ad5DF3c81cc3379cB3124f692F8a79/token-transfers   --header 'X-Api-Key: bc21afea3aa7c6c6e83c14818da3d90b31c535f9edbe3368c6c71027ae1f6c01'   --cookie '=bc21afea3aa7c6c6e83c14818da3d90b31c535f9edbe3368c6c71027ae1f6c01' | jq .
