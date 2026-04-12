@@ -8,6 +8,7 @@ const config = getDefaultConfig(__dirname);
 // This is required for Metro to properly watch files outside the project root
 config.watchFolders = [
   ...(config.watchFolders || []),
+  path.resolve(__dirname, '../wdk-react-native-provider'),
   path.resolve(__dirname, '../wdk-wallet-btc'),
 ];
 
@@ -41,47 +42,52 @@ wdkConfig.watchFolders = [
 
 // Override node_modules resolution AFTER WDK config to use local wdk-wallet-btc package
 // This ensures our override isn't overwritten by WDK's config
+const appNodeModules = path.resolve(__dirname, 'node_modules');
 wdkConfig.resolver.extraNodeModules = {
   ...(wdkConfig.resolver.extraNodeModules || {}),
   '@wdk/wallet-btc': path.resolve(__dirname, '../wdk-wallet-btc'),
   '@spacesops/wdk-wallet-btc': path.resolve(__dirname, '../wdk-wallet-btc'),
+  react: path.resolve(appNodeModules, 'react'),
+  'react-native': path.resolve(appNodeModules, 'react-native'),
+  'react/jsx-runtime': path.resolve(appNodeModules, 'react/jsx-runtime'),
+  'react/jsx-dev-runtime': path.resolve(appNodeModules, 'react/jsx-dev-runtime'),
 };
 
 // Now wrap the WDK's resolveRequest with our custom alias logic
 const wdkResolveRequest = wdkConfig.resolver.resolveRequest;
 
+// Modules that must always resolve to the app's single copy to avoid duplicate instance bugs
+const SINGLETON_MODULES = {
+  react: path.resolve(appNodeModules, 'react/index.js'),
+  'react/jsx-runtime': path.resolve(appNodeModules, 'react/jsx-runtime.js'),
+  'react/jsx-dev-runtime': path.resolve(appNodeModules, 'react/jsx-dev-runtime.js'),
+  'react-native': path.resolve(appNodeModules, 'react-native/index.js'),
+};
+
 wdkConfig.resolver.resolveRequest = (context, moduleName, platform) => {
+  // Force singleton React/RN — prevents duplicate-instance hook crashes from
+  // locally-linked packages (e.g. wdk-react-native-provider) that carry their own node_modules/react
+  if (Object.prototype.hasOwnProperty.call(SINGLETON_MODULES, moduleName)) {
+    return { type: 'sourceFile', filePath: SINGLETON_MODULES[moduleName] };
+  }
+
   // Handle @/ alias
   if (moduleName.startsWith('@/')) {
     const resolvedPath = moduleName.replace('@/', path.resolve(__dirname, 'src') + '/');
     try {
       return context.resolveRequest(context, resolvedPath, platform);
     } catch (e) {
-      // If the resolved path fails, fall through to WDK resolver
+      // fall through to WDK resolver
     }
   }
 
   // Handle local wdk-wallet-btc override for Metro bundler
-  // This MUST run BEFORE delegating to WDK's resolver to ensure we intercept first
   if (moduleName === '@wdk/wallet-btc' || moduleName === '@spacesops/wdk-wallet-btc') {
     const localPackagePath = path.resolve(__dirname, '../wdk-wallet-btc');
     const indexPath = path.join(localPackagePath, 'index.js');
-    
-    // Log that we're intercepting this resolution (appears in Metro terminal, not app console)
-    console.log(`[Metro Resolver] 🔍 Intercepting ${moduleName} -> ${indexPath}`);
-    
-    // Check if the index file exists
     const fs = require('fs');
     if (fs.existsSync(indexPath)) {
-      console.log(`[Metro Resolver] ✅ Resolving ${moduleName} to local package: ${indexPath}`);
-      // Return the file path directly - Metro will handle the rest
-      // The extraNodeModules config ensures Metro knows where to find relative imports
-      return {
-        type: 'sourceFile',
-        filePath: indexPath,
-      };
-    } else {
-      console.warn(`[Metro Resolver] ❌ Local package index.js not found at: ${indexPath}`);
+      return { type: 'sourceFile', filePath: indexPath };
     }
   }
 
