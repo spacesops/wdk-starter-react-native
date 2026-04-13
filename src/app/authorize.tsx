@@ -36,9 +36,28 @@ export default function AuthorizeScreen() {
         router.replace('/wallet');
       }
     } catch (error) {
+      const message = getErrorMessage(error, 'Failed to unlock wallet');
+
+      // Code 10 = USER_CANCELED — user dismissed the prompt intentionally, not an error
+      if (message.includes('code: 10')) {
+        setError(null);
+        return;
+      }
+
+      // Code 13 = biometrics locked out after too many attempts
+      if (message.includes('code: 13')) {
+        setError('Biometrics locked. Use your device PIN to unlock.');
+        return;
+      }
+
+      // Code 7 = too many failed attempts
+      if (message.includes('code: 7')) {
+        setError('Too many attempts. Please try again in a moment.');
+        return;
+      }
+
       console.error('Failed to unlock wallet:', error);
-      setError(getErrorMessage(error, 'Failed to unlock wallet'));
-      return;
+      setError('Authentication failed. Please try again.');
     } finally {
       setIsLoading(false);
     }

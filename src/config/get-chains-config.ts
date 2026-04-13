@@ -5,7 +5,9 @@ const getChainsConfig = () => {
       blockchain: 'ethereum',
       // Using LlamaRPC as primary provider (fast, reliable, free)
       // Alternatives: https://ethereum.publicnode.com, https://1rpc.io/eth
-      provider: 'https://eth.llamarpc.com',
+      // provider: 'https://ethereum.publicnode.com',
+      provider: 'https://1rpc.io/eth',
+      // provider: 'https://eth.llamarpc.com',
       bundlerUrl: 'https://api.candide.dev/public/v3/ethereum',
       paymasterUrl: 'https://api.candide.dev/public/v3/ethereum',
       paymasterAddress: '0x8b1f6cb5d062aa2ce8d581942bbb960420d875ba',
@@ -17,6 +19,21 @@ const getChainsConfig = () => {
         address: '0xdAC17F958D2ee523a2206206994597C13D831ec7',
       },
     },
+    // ethereum: {
+    //   chainId: 1,
+    //   blockchain: 'ethereum',
+    //   provider: 'https://eth.merkle.io',
+    //   bundlerUrl: 'https://api.candide.dev/public/v3/ethereum',
+    //   paymasterUrl: 'https://api.candide.dev/public/v3/ethereum',
+    //   paymasterAddress: '0x8b1f6cb5d062aa2ce8d581942bbb960420d875ba',
+    //   entrypointAddress: '0x0000000071727De22E5E9d8BAf0edAc6f37da032',
+    //   transferMaxFee: 5000000,
+    //   swapMaxFee: 5000000,
+    //   bridgeMaxFee: 5000000,
+    //   paymasterToken: {
+    //     address: '0xdAC17F958D2ee523a2206206994597C13D831ec7',
+    //   }
+    // },
     arbitrum: {
       chainId: 42161,
       blockchain: 'arbitrum',

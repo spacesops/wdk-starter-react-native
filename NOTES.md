@@ -125,9 +125,19 @@ rm -rf node_modules
 rm -f package-lock.json 
 npm install --ignore-scripts
 rm -rf android && rm -rf ios
+//npm run start:clear ???
 npm run prebuild:clean
 npm run postinstall
 npm run android
+
+
+Regenerate the WDK worklet bundle: Run 
+npm run gen:bundle
+ after making changes to wdk-wallet-btc — this re-runs @tetherto/pear-wrk-wdk's gen:mobile-bundle script which should pick up the local override.
+
+
+npx expo start --clear
+
 
 The current Bitcoin wallet configuration is set to testnet and the account address is tb1p6lnnwcht84s3nczmc96q2usukcyucrvjpxlekhqj6eu36at46cusdplcgq .
 
