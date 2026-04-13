@@ -173,3 +173,6 @@ curl -s https://wdk-api.tether.io/api/v1/ethereum/usdt/0x9417D411f7Ad5DF3c81cc33
 curl -s https://wdk-api.tether.io/api/v1/ethereum/xaut/0x9417D411f7Ad5DF3c81cc3379cB3124f692F8a79/token-transfers   --header 'X-Api-Key: bc21afea3aa7c6c6e83c14818da3d90b31c535f9edbe3368c6c71027ae1f6c01'   --cookie '=bc21afea3aa7c6c6e83c14818da3d90b31c535f9edbe3368c6c71027ae1f6c01' | jq .
 
 curl -s https://wdk-api.tether.io/api/v1/ethereum/usat/0x9417D411f7Ad5DF3c81cc3379cB3124f692F8a79/token-transfers   --header 'X-Api-Key: bc21afea3aa7c6c6e83c14818da3d90b31c535f9edbe3368c6c71027ae1f6c01'   --cookie '=bc21afea3aa7c6c6e83c14818da3d90b31c535f9edbe3368c6c71027ae1f6c01' | jq .
+
+
+
