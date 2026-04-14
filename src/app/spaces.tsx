@@ -466,7 +466,8 @@ export default function SpacesScreen() {
       }
 
       console.log('[Spaces] Transaction broadcasted successfully:', txHash);
-      toast.success(`Transaction broadcasted! Hash: ${txHash.substring(0, 16)}...`);
+      const hashStr = typeof txHash === 'object' && txHash !== null ? (txHash as any).hash ?? JSON.stringify(txHash) : String(txHash);
+      toast.success(`Transaction broadcasted! Hash: ${hashStr.substring(0, 16)}...`);
 
       // Add subspace to My Spaces and start polling if we have jobId
       if (currentJobId && purchaseData) {
@@ -610,10 +611,11 @@ export default function SpacesScreen() {
 
         if (scriptType === 'P2TR') {
           // P2TR (Taproot) - use memo method
+          // WDKService expects amount in BTC; total_price is in sats
           const quoteOptions = {
             network: NetworkType.SEGWIT,
             accountIndex: 0,
-            amount: purchaseData.total_price,
+            amount: purchaseData.total_price / 100000000,
             recipientAddress: purchaseData.taproot_address,
             asset: AssetTicker.BTC,
             memo: purchaseData.handle,
@@ -632,51 +634,45 @@ export default function SpacesScreen() {
           const balanceSats = balanceBTC * 100000000;
 
           // Estimate transaction fee to check if we have enough balance
-          let estimatedFee = 0;
-          let totalRequired = quoteOptions.amount;
+          const requestedSats = purchaseData.total_price;
+          let estimatedFeeSats = 0;
+          let totalRequiredSats = requestedSats;
           try {
             const feeQuote = await WDKService.quoteSendByNetworkWithMemo(
               quoteOptions.network,
               quoteOptions.accountIndex,
-              quoteOptions.amount / 100000000, // Convert to BTC for quote
+              quoteOptions.amount,
               quoteOptions.recipientAddress,
               quoteOptions.asset,
               quoteOptions.memo
             );
-            // Fee is returned in base units (BTC), convert to satoshis
-            estimatedFee = feeQuote * 100000000;
-            totalRequired = quoteOptions.amount + estimatedFee;
+            estimatedFeeSats = Math.round(feeQuote * 100000000);
+            totalRequiredSats = requestedSats + estimatedFeeSats;
           } catch (feeError) {
             console.warn('[Spaces] Could not estimate fee, using amount only:', feeError);
-            // If fee estimation fails, we'll let the transaction attempt proceed
-            // and it will fail with a more specific error
           }
 
           console.log('[Spaces] Balance check (P2TR):', {
             balanceBTC: balanceBTC.toFixed(8),
             balanceSats: Math.round(balanceSats),
-            requestedAmount: quoteOptions.amount,
-            requestedAmountBTC: (quoteOptions.amount / 100000000).toFixed(8),
-            estimatedFee: Math.round(estimatedFee),
-            estimatedFeeBTC: (estimatedFee / 100000000).toFixed(8),
-            totalRequired: Math.round(totalRequired),
-            totalRequiredBTC: (totalRequired / 100000000).toFixed(8),
-            sufficient: balanceSats >= totalRequired,
+            requestedAmountSats: requestedSats,
+            requestedAmountBTC: quoteOptions.amount.toFixed(8),
+            estimatedFeeSats,
+            totalRequiredSats,
+            sufficient: balanceSats >= totalRequiredSats,
           });
 
-          if (balanceSats < totalRequired) {
-            const shortfall = totalRequired - balanceSats;
+          if (balanceSats < totalRequiredSats) {
+            const shortfall = totalRequiredSats - balanceSats;
             console.error('[Spaces] Insufficient balance (including fees) - P2TR:', {
-              balanceBTC: balanceBTC.toFixed(8),
               balanceSats: Math.round(balanceSats),
-              requestedAmount: quoteOptions.amount,
-              estimatedFee: Math.round(estimatedFee),
-              totalRequired: Math.round(totalRequired),
-              shortfall: Math.round(shortfall),
-              shortfallBTC: (shortfall / 100000000).toFixed(8),
+              requestedSats,
+              estimatedFeeSats,
+              totalRequiredSats,
+              shortfall,
             });
             throw new Error(
-              `Insufficient balance. Have ${Math.round(balanceSats)} sats, need ${Math.round(totalRequired)} sats (${quoteOptions.amount} amount + ${Math.round(estimatedFee)} fee, shortfall: ${Math.round(shortfall)} sats)`
+              `Insufficient balance. Have ${Math.round(balanceSats)} sats, need ${totalRequiredSats} sats (${requestedSats} amount + ${estimatedFeeSats} fee, shortfall: ${shortfall} sats)`
             );
           }
 
@@ -690,10 +686,11 @@ export default function SpacesScreen() {
           );
         } else {
           // P2WPKH (Native SegWit) - use non-memo method
+          // WDKService expects amount in BTC; total_price is in sats
           const quoteOptions = {
             network: NetworkType.SEGWIT,
             accountIndex: 0,
-            amount: purchaseData.total_price,
+            amount: purchaseData.total_price / 100000000,
             recipientAddress: purchaseData.taproot_address,
             asset: AssetTicker.BTC,
           };

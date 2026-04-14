@@ -131,6 +131,8 @@ npm run postinstall
 npm run android
 
 
+cd /Users/i830671/git/wdk-react-native-provider && npm run gen:worker-bundle
+
 Regenerate the WDK worklet bundle: Run 
 npm run gen:bundle
  after making changes to wdk-wallet-btc — this re-runs @tetherto/pear-wrk-wdk's gen:mobile-bundle script which should pick up the local override.

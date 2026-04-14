@@ -7,10 +7,10 @@
 			"path": "../wdk-wallet-btc"
 		},
 		{
-			"path": "../spacesops"
+			"path": "../wdk-react-native-provider"
 		},
 		{
-			"path": "../wdk-react-native-provider"
+			"path": "../pear-wrk-wdk"
 		}
 	],
 	"settings": {}

@@ -10,6 +10,7 @@ config.watchFolders = [
   ...(config.watchFolders || []),
   path.resolve(__dirname, '../wdk-react-native-provider'),
   path.resolve(__dirname, '../wdk-wallet-btc'),
+  path.resolve(__dirname, '../pear-wrk-wdk'),
 ];
 
 const { transformer, resolver } = config;
@@ -23,8 +24,11 @@ config.resolver = {
   ...resolver,
   assetExts: resolver.assetExts.filter(ext => ext !== 'svg'),
   sourceExts: [...resolver.sourceExts, 'svg'],
-  // Ensure module paths include root node_modules
-  nodeModulesPaths: [path.resolve(__dirname, 'node_modules')],
+  nodeModulesPaths: [
+    path.resolve(__dirname, 'node_modules'),
+    path.resolve(__dirname, '../wdk-react-native-provider/node_modules'),
+    path.resolve(__dirname, '../pear-wrk-wdk/node_modules'),
+  ],
   alias: {
     '@': path.resolve(__dirname, 'src'),
   },
@@ -45,6 +49,7 @@ wdkConfig.watchFolders = [
 const appNodeModules = path.resolve(__dirname, 'node_modules');
 wdkConfig.resolver.extraNodeModules = {
   ...(wdkConfig.resolver.extraNodeModules || {}),
+  '@tetherto/pear-wrk-wdk': path.resolve(__dirname, '../pear-wrk-wdk'),
   '@wdk/wallet-btc': path.resolve(__dirname, '../wdk-wallet-btc'),
   '@spacesops/wdk-wallet-btc': path.resolve(__dirname, '../wdk-wallet-btc'),
   react: path.resolve(appNodeModules, 'react'),

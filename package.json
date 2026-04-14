@@ -33,7 +33,7 @@
     "@react-navigation/elements": "^2.6.3",
     "@react-navigation/native": "^7.1.8",
     "@reduxjs/toolkit": "^2.9.0",
-    "@tetherto/pear-wrk-wdk": "npm:@spacesops/pear-wrk-wdk@^1.0.0-beta.22",
+    "@tetherto/pear-wrk-wdk": "file:../pear-wrk-wdk",
     "@tetherto/wdk-pricing-bitfinex-http": "^1.0.0-beta.1",
     "@tetherto/wdk-pricing-provider": "^1.0.0-beta.1",
     "@tetherto/wdk-react-native-provider": "file:../wdk-react-native-provider",
