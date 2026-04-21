@@ -1,0 +1,52 @@
+# On-chain update payment flow (quote only — no broadcast)
+
+This mirrors `WalletAccountBtc.quoteUpdateTransactionWithHexTX` in `@tetherto/wdk-wallet-btc`.
+The **funding** account (e.g. BIP-44 account index `0`) pays fees and adds inputs; the **prior**
+account (Taproot path under `m/86'/{coin}'/…`, e.g. `9'/0/0`) must sign the input that spends the
+**1077 sat** output from `priorTx`.
+
+## Parameters (aligned with this app)
+
+Use values that match your **current** space row and wallet config — not fixed testnet txids.
+
+1. **`to`** — Taproot **receive address** for this space’s script pubkey. In the app this is resolved
+   with `WDKService.deriveTaprootAddressesFromPaths` by matching `scriptPubKeyHex` to one of the paths
+   from `buildSpacesScanDerivationPaths()` (see `EXPO_PUBLIC_SPACES_ACCOUNT_NUMBER` and
+   `EXPO_PUBLIC_SPACES_ACCOUNT_GAP`).
+
+2. **`priorAccountRelativePath`** — Wallet-relative suffix for `getAccountByPath('bitcoin', path)`,
+   e.g. `9'/0/0` when the full path is `m/86'/0'/9'/0/0`. Must be the same account whose address
+   script matches the 1077-sat output in `priorTx`.
+
+3. **`priorTx`** — **Txid** of the transaction that created the UTXO you are spending (must contain an
+   output of exactly **1077 sats** to the prior account). The app tries to read this from the latest
+   `listnums` entry (`txid`, `tx_id`, `tx_hash`, etc.) and stores it as `priorTxid` on the space row.
+
+4. **`hex`** — Wire payload from the Hex Tool (`newDataHex`), hex string for the OP_RETURN payload.
+
+5. **`fundingAccountIndex`** — BIP-44 Bitcoin account used as **account0** in the old snippet. Here:
+   `EXPO_PUBLIC_SPACES_FUNDING_BTC_ACCOUNT_INDEX` (default `0`).
+
+6. **`confirmationTarget`** — e.g. `1` for fee estimation.
+
+## RPC / app usage
+
+The worklet exposes `quoteUpdateTransactionWithHexTX` with:
+
+  `{ network: 'bitcoin', fundingAccountIndex, options: { to, hex, priorTx, priorAccountRelativePath, confirmationTarget?, feeRate?, value? } }`
+
+The Subspace “Purchase” action calls this and **logs the transaction hex to Metro**; it does **not**
+call `updateTransactionWithHex` / broadcast.
+
+## Manual snippet (conceptual)
+
+  // const priorAcct = await wallet.getAccountByPath("9'/0/0")  // use your real relative path
+  // const to = await priorAcct.getAddress()  // must match scriptPubKeyHex for this space
+  // await accountFunding.quoteUpdateTransactionWithHexTX({
+  //   to,
+  //   hex: '<wire from Hex Tool>',
+  //   priorTx: '<txid from listnums last num>',
+  //   priorAcct,
+  //   confirmationTarget: 1,
+  // })
+  // console.log(txHex)  // inspect; broadcast later with updateTransactionWithHex if desired

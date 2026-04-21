@@ -24,6 +24,12 @@ import {
 } from '@tetherto/wdk-react-native-provider';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import getChainsConfig from '@/config/get-chains-config';
+import {
+  buildSpacesScanDerivationPaths,
+  fullPathToWalletRelativePath,
+  getBitcoinTaprootPathPrefix,
+} from '@/utils/spaces-scan-paths';
+import { WDKSpaces } from '@/utils/wdk-spaces';
 import * as Clipboard from 'expo-clipboard';
 import { toast } from 'sonner-native';
 
@@ -31,6 +37,127 @@ const SPACE_NAME_OPTIONS = ['spacesops_services', 'are_currently_unavailable', '
 const DURATION_OPTIONS = ['~10 mins', '~1 hour', '~8 hours'];
 const SPACES_API_BASE_URL = process.env.EXPO_PUBLIC_SPACES_API_BASE_URL || 'http://192.168.1.111:7264';
 const SPACES_APP_NAME = 'spaces-wallet';
+
+/** One row from POST /api/subsd/find-handles (flexible shapes). */
+interface FindHandlesSpaceRow {
+  subspace: string;
+  spaceName: string;
+  handle: string;
+  /** From API `public_scriptkey` (or aliases); used for listnums / chainPresence. */
+  scriptPubKeyHex?: string;
+}
+
+function mySpacesRowKey(subspace: string, spaceName: string): string {
+  return `${subspace.trim()}\0${spaceName.trim().toLowerCase()}`;
+}
+
+/**
+ * Extract subspace@space entries from find-handles JSON (handles, results, data, matches, etc.).
+ */
+function parseFindHandlesResponse(body: unknown): FindHandlesSpaceRow[] {
+  const collected: FindHandlesSpaceRow[] = [];
+
+  const addFromHandleString = (raw: string) => {
+    const h = raw.trim();
+    if (!h.includes('@')) return;
+    const at = h.indexOf('@');
+    const subspace = h.slice(0, at).trim();
+    const spaceName = h.slice(at + 1).trim().toLowerCase();
+    if (!subspace || !spaceName) return;
+    collected.push({ subspace, spaceName, handle: `${subspace}@${spaceName}` });
+  };
+
+  const scriptKeyFromObject = (o: Record<string, unknown>): string | undefined => {
+    const v =
+      o.public_scriptkey ??
+      o.public_script_key ??
+      o.script_pubkey ??
+      o.scriptPubkey ??
+      o.scriptPubKey ??
+      o.scriptPubKeyHex;
+    return typeof v === 'string' && v.length > 0 ? v : undefined;
+  };
+
+  const addRow = (
+    subspace?: unknown,
+    spaceName?: unknown,
+    handle?: unknown,
+    scriptPubKeyHex?: string
+  ) => {
+    if (typeof handle === 'string' && handle.includes('@')) {
+      addFromHandleString(handle);
+      return;
+    }
+    if (typeof subspace === 'string' && typeof spaceName === 'string') {
+      const sub = subspace.trim();
+      const sn = spaceName.trim().toLowerCase();
+      if (sub && sn) {
+        collected.push({
+          subspace: sub,
+          spaceName: sn,
+          handle: `${sub}@${sn}`,
+          ...(scriptPubKeyHex ? { scriptPubKeyHex } : {}),
+        });
+      }
+    }
+  };
+
+  const consumeArray = (arr: unknown[]) => {
+    for (const item of arr) {
+      if (typeof item === 'string') addFromHandleString(item);
+      else if (item && typeof item === 'object') {
+        const o = item as Record<string, unknown>;
+        const spk = scriptKeyFromObject(o);
+        const handleField = o.handle ?? o.full_handle ?? o.fullHandle ?? o.name;
+        if (typeof handleField === 'string' && handleField.includes('@')) {
+          const h = handleField.trim();
+          const at = h.indexOf('@');
+          const subspace = h.slice(0, at).trim();
+          const spaceName = h.slice(at + 1).trim().toLowerCase();
+          if (subspace && spaceName) {
+            collected.push({
+              subspace,
+              spaceName,
+              handle: `${subspace}@${spaceName}`,
+              ...(spk ? { scriptPubKeyHex: spk } : {}),
+            });
+          }
+          continue;
+        }
+        addRow(
+          o.subspace ?? o.sub_name ?? o.subName,
+          o.space ?? o.space_name ?? o.spaceName ?? o.domain,
+          handleField,
+          spk
+        );
+      }
+    }
+  };
+
+  if (body == null) return [];
+
+  if (Array.isArray(body)) {
+    consumeArray(body);
+  } else if (typeof body === 'object') {
+    const o = body as Record<string, unknown>;
+    const arrays = [o.handles, o.results, o.data, o.items, o.matches, o.rows, o.spaces] as const;
+    for (const a of arrays) {
+      if (Array.isArray(a)) consumeArray(a);
+    }
+  }
+
+  const byKey = new Map<string, FindHandlesSpaceRow>();
+  for (const r of collected) {
+    const k = mySpacesRowKey(r.subspace, r.spaceName);
+    const prev = byKey.get(k);
+    if (!prev) {
+      byKey.set(k, r);
+    } else if (!prev.scriptPubKeyHex && r.scriptPubKeyHex) {
+      byKey.set(k, { ...prev, scriptPubKeyHex: r.scriptPubKeyHex });
+    }
+  }
+  return Array.from(byKey.values());
+}
 
 interface SpaceAvailabilityResponse {
   state: 'available' | 'taken';
@@ -67,7 +194,7 @@ export default function SpacesScreen() {
   const [buttonState, setButtonState] = useState<'available' | 'taken' | 'loading' | null>(null);
   const [isButtonEnabled, setIsButtonEnabled] = useState(false);
   const [buttonLabel, setButtonLabel] = useState('Purchase');
-  const [selectedDuration, setSelectedDuration] = useState<string>('~10 mins');
+  const [selectedDuration, setSelectedDuration] = useState<string>('~8 hours');
   const [priceSats, setPriceSats] = useState<number | null>(null);
   const [blockFee1, setBlockFee1] = useState<number | null>(null);
   const [blockFee6, setBlockFee6] = useState<number | null>(null);
@@ -82,6 +209,10 @@ export default function SpacesScreen() {
   const [quoteId, setQuoteId] = useState<number | null>(null);
   const [handle, setHandle] = useState<string | null>(null);
   const [isConfirmationMode, setIsConfirmationMode] = useState(false);
+  const [couponCode, setCouponCode] = useState<string>('');
+  const [discountPercent, setDiscountPercent] = useState<number | null>(null);
+  const [completelyFree, setCompletelyFree] = useState(false);
+  const [couponStatus, setCouponStatus] = useState<'idle' | 'validating' | 'valid' | 'invalid'>('idle');
   const [purchaseData, setPurchaseData] = useState<{
     taproot_address: string;
     handle: string;
@@ -113,7 +244,9 @@ export default function SpacesScreen() {
     | 'sptr_delivered'
     | 'expired'
     | 'cancelled'
-    | 'purchasing'; // Legacy status for backward compatibility
+    | 'purchasing' // Legacy status for backward compatibility
+    | 'requesting' // Free coupon: no transaction needed
+    | 'discovered'; // From Find Spaces scan; no job polling
 
   const [mySpaces, setMySpaces] = useState<
     {
@@ -126,6 +259,14 @@ export default function SpacesScreen() {
       purchaseId?: number; // Subname purchase ID
       sptrPurchaseId?: number; // SPTR purchase ID
       hasSptr?: boolean; // Whether this purchase includes SPTR
+      /** Taproot script pubkey hex (e.g. from Find Spaces scan); used for listnums-by-spk. */
+      scriptPubKeyHex?: string;
+      /** Set on space details when purchase status was unknown; from GET /api/listnums-by-spk. */
+      chainPresence?: 'on-chain' | 'off-chain';
+      /** Last `nums` entry `data` when chainPresence is on-chain. */
+      listnumsLastDataHex?: string;
+      /** User-saved wire hex from Hex Tool (Save Hex String). */
+      newDataHex?: string;
     }[]
   >([]);
   const [jobPollingState, setJobPollingState] = useState<
@@ -155,12 +296,17 @@ export default function SpacesScreen() {
   const [isFindPurchaseExpanded, setIsFindPurchaseExpanded] = useState(true);
   const [isAboutSpacesExpanded, setIsAboutSpacesExpanded] = useState(false);
 
-  const handleSubspaceSelect = (subspace: string, spaceName: string) => {
+  const handleSubspaceSelect = (space: {
+    subspace: string;
+    spaceName: string;
+    scriptPubKeyHex?: string;
+  }) => {
     router.push({
       pathname: '/subspace',
       params: {
-        subspace: subspace,
-        spaceName: spaceName,
+        subspace: space.subspace,
+        spaceName: space.spaceName,
+        ...(space.scriptPubKeyHex ? { scriptPubKeyHex: space.scriptPubKeyHex } : {}),
       },
     });
   };
@@ -169,6 +315,9 @@ export default function SpacesScreen() {
   const getSpaceStatus = (subspace: string, spaceName: string): string => {
     const space = mySpaces.find((s) => s.subspace === subspace && s.spaceName === spaceName);
     if (!space) return 'Unknown';
+
+    if (space.chainPresence === 'on-chain') return 'On-chain';
+    if (space.chainPresence === 'off-chain') return 'Off-chain';
 
     const statusMap: Record<UnifiedStatus, string> = {
       pending_payment: 'Awaiting Payment',
@@ -185,6 +334,8 @@ export default function SpacesScreen() {
       expired: 'Expired',
       cancelled: 'Cancelled',
       purchasing: 'Purchasing', // Legacy status
+      requesting: 'Requesting',
+      discovered: 'Discovered',
     };
 
     return statusMap[space.status] || 'Unknown';
@@ -211,6 +362,126 @@ export default function SpacesScreen() {
     } catch (error) {
       console.error('[Spaces] Failed to copy transaction hex:', error);
       Alert.alert('Error', 'Failed to copy transaction hex to clipboard');
+    }
+  };
+
+  const handleFindSpaces = async () => {
+    const fullPaths = buildSpacesScanDerivationPaths();
+    console.log('[Spaces] Find Spaces — derivation paths:', JSON.stringify(fullPaths));
+    if (fullPaths.length === 0) {
+      toast.error('Set EXPO_PUBLIC_SPACES_ACCOUNT_NUMBER and EXPO_PUBLIC_SPACES_ACCOUNT_GAP in .env');
+      return;
+    }
+
+    const { bip, coinType } = getBitcoinTaprootPathPrefix();
+    const relativePaths: string[] = [];
+    for (const p of fullPaths) {
+      const rel = fullPathToWalletRelativePath(p, bip, coinType);
+      if (rel == null) {
+        console.error('[Spaces] Find Spaces — path does not match config prefix:', p);
+        toast.error('Derivation path prefix mismatch with wallet config');
+        return;
+      }
+      relativePaths.push(rel);
+    }
+
+    try {
+      const { addressesJson } = await WDKSpaces.deriveTaprootAddressesFromPaths(relativePaths);
+      const entries = JSON.parse(addressesJson) as { address: string; scriptPubKeyHex: string }[];
+      const pathAndAddress = fullPaths.map((path, i) => {
+        const row = entries[i];
+        return {
+          path,
+          address: row?.address ?? null,
+          scriptPubKeyHex: row?.scriptPubKeyHex ?? null,
+        };
+      });
+      console.log('[Spaces] Find Spaces — taproot addresses & scriptPubKeys:', JSON.stringify(pathAndAddress));
+
+      const scriptPubkeys = entries
+        .map((e) => e.scriptPubKeyHex)
+        .filter((h): h is string => typeof h === 'string' && h.length > 0);
+      if (scriptPubkeys.length > 0) {
+        try {
+          const findHandlesUrl = `${SPACES_API_BASE_URL}/api/subsd/find-handles`;
+          console.log('[Spaces] Find Spaces — POST', findHandlesUrl, { script_pubkeys: scriptPubkeys });
+          const findRes = await fetch(findHandlesUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'application/json',
+            },
+            body: JSON.stringify({ script_pubkeys: scriptPubkeys }),
+          });
+          const findText = await findRes.text();
+          let findData: unknown;
+          try {
+            findData = findText ? JSON.parse(findText) : null;
+          } catch {
+            findData = findText;
+          }
+          console.log('[Spaces] Find Spaces — find-handles response:', {
+            ok: findRes.ok,
+            status: findRes.status,
+            body: findData,
+          });
+          if (!findRes.ok) {
+            toast.error(`find-handles failed (${findRes.status})`);
+          } else if (findData !== null && typeof findData === 'object') {
+            const fd = findData as Record<string, unknown>;
+            if (fd.success === false) {
+              console.log('[Spaces] Find Spaces — find-handles success:false, skipping My Spaces merge');
+            } else {
+              const parsed = parseFindHandlesResponse(findData);
+              console.log('[Spaces] Find Spaces — parsed handles:', JSON.stringify(parsed));
+              if (parsed.length > 0) {
+                setMySpaces((prev) => {
+                  const seen = new Set(prev.map((s) => mySpacesRowKey(s.subspace, s.spaceName)));
+                  const toAdd = parsed.filter((p) => !seen.has(mySpacesRowKey(p.subspace, p.spaceName)));
+                  if (toAdd.length === 0) {
+                    console.log('[Spaces] Find Spaces — no new handles (all already in My Spaces)');
+                    return prev;
+                  }
+                  console.log(
+                    '[Spaces] Find Spaces — adding',
+                    toAdd.length,
+                    'handle(s) to My Spaces (no polling):',
+                    JSON.stringify(toAdd)
+                  );
+                  return [
+                    ...prev,
+                    ...toAdd.map((p) => {
+                      let scriptPubKeyHex: string | undefined = p.scriptPubKeyHex;
+                      if (!scriptPubKeyHex && parsed.length === scriptPubkeys.length) {
+                        const idx = parsed.findIndex(
+                          (r) =>
+                            r.subspace === p.subspace && r.spaceName === p.spaceName
+                        );
+                        if (idx >= 0) scriptPubKeyHex = scriptPubkeys[idx];
+                      }
+                      return {
+                        subspace: p.subspace,
+                        spaceName: p.spaceName,
+                        handle: p.handle,
+                        status: 'discovered' as UnifiedStatus,
+                        ...(scriptPubKeyHex ? { scriptPubKeyHex } : {}),
+                      };
+                    }),
+                  ];
+                });
+              }
+            }
+          }
+        } catch (findErr) {
+          console.error('[Spaces] Find Spaces — find-handles request failed:', findErr);
+          toast.error(
+            findErr instanceof Error ? findErr.message : 'find-handles request failed'
+          );
+        }
+      }
+    } catch (error) {
+      console.error('[Spaces] Find Spaces — derive addresses failed:', error);
+      toast.error(error instanceof Error ? error.message : 'Failed to derive addresses');
     }
   };
 
@@ -533,6 +804,122 @@ export default function SpacesScreen() {
       if (!purchaseData || !quoteId) {
         console.error('[Spaces] Missing purchase data or quoteId');
         Alert.alert('Error', 'Missing purchase information. Please try again.');
+        return;
+      }
+
+      // Free coupon path: skip transaction composition entirely
+      if (completelyFree) {
+        setButtonState('loading');
+        setIsButtonEnabled(false);
+        setButtonLabel('Requesting...');
+
+        try {
+          const currentSubspace = subspace.trim();
+          const currentSpaceName = spaceName.toLowerCase();
+
+          // Add to My Spaces
+          const newSpace = {
+            subspace: currentSubspace,
+            spaceName: currentSpaceName,
+            handle: purchaseData.handle,
+            status: 'requesting' as const,
+          };
+          setMySpaces((prev) => {
+            const existingIndex = prev.findIndex(
+              (s) => s.subspace === newSpace.subspace && s.spaceName === newSpace.spaceName
+            );
+            if (existingIndex >= 0) {
+              const updated = [...prev];
+              updated[existingIndex] = newSpace;
+              return updated;
+            }
+            return [...prev, newSpace];
+          });
+
+          // PUT to confirm purchase
+          const url = `${SPACES_API_BASE_URL}/spaces/${currentSpaceName}/${currentSubspace}?app=${SPACES_APP_NAME}&format=json`;
+          console.log(`[Spaces API] PUT ${url} (free coupon)`);
+
+          const response = await fetch(url, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ quote_id: quoteId }),
+          });
+
+          if (!response.ok) {
+            const errorText = await response.text();
+            console.error(`[Spaces API] PUT ${url} - HTTP error! status: ${response.status}`, errorText);
+            throw new Error(`HTTP error! status: ${response.status}`);
+          }
+
+          const data = await response.json();
+          console.log(`[Spaces API] PUT ${url} - Success (free coupon)`, data);
+
+          if (data.job_id) {
+            setCurrentJobId(data.job_id);
+            setCurrentJobData({
+              handle: data.handle || purchaseData.handle,
+              subspace: currentSubspace,
+              spaceName: currentSpaceName,
+            });
+
+            setMySpaces((prev) =>
+              prev.map((space) =>
+                space.subspace === currentSubspace && space.spaceName === currentSpaceName
+                  ? {
+                      ...space,
+                      jobId: data.job_id,
+                      purchaseId: data.purchase_id,
+                      sptrJobId: data.sptr_job_id || undefined,
+                      sptrPurchaseId: data.sptr_purchase_id || undefined,
+                      hasSptr: !!data.sptr_job_id,
+                      status: 'pending_payment' as UnifiedStatus,
+                    }
+                  : space
+              )
+            );
+
+            if (data.handle) {
+              const storageKey = `spaces_purchase_${data.job_id}`;
+              const storageData = {
+                job_id: data.job_id,
+                handle: data.handle,
+                quote_id: data.quote_id,
+                purchase_id: data.purchase_id,
+                sptr_job_id: data.sptr_job_id,
+                sptr_purchase_id: data.sptr_purchase_id,
+                has_sptr: !!data.sptr_job_id,
+                timestamp: Date.now(),
+              };
+              await AsyncStorage.setItem(storageKey, JSON.stringify(storageData));
+              console.log('[Spaces] Stored purchase data:', storageKey);
+            }
+
+            pollJobStatus(data.job_id, currentSpaceName, currentSubspace).catch((error) => {
+              console.error('[Spaces] Polling failed:', error);
+            });
+          }
+
+          // Dismiss confirmation
+          setIsConfirmationMode(false);
+          setPurchaseData(null);
+          setButtonState('available');
+          setIsButtonEnabled(true);
+
+          if (priceSats !== null) {
+            const blockFee = getBlockFee(selectedDuration, blockFee1, blockFee6, blockFee48);
+            if (blockFee !== null && btcPriceUSD !== null) {
+              setButtonLabel(calculateTotalPrice(priceSats, blockFee1, blockFee6, blockFee48, selectedDuration, btcPriceUSD, takeOnchain, sptrPrice, sptrFee1, sptrFee6, sptrFee48));
+            }
+          }
+
+          toast.success(`Requested ${purchaseData.handle} for free!`);
+        } catch (error) {
+          console.error('[Spaces] Free coupon request failed:', error);
+          Alert.alert('Error', error instanceof Error ? error.message : 'Failed to process request');
+          setButtonState('available');
+          setIsButtonEnabled(true);
+        }
         return;
       }
 
@@ -1027,7 +1414,7 @@ export default function SpacesScreen() {
     try {
       const confTarget = getConfTarget(selectedDuration);
       const sptrBlockFee = getSptrFee(selectedDuration, sptrFee1, sptrFee6, sptrFee48);
-      const requestBody = {
+      const requestBody: Record<string, unknown> = {
         block_fee: blockFee,
         handle: handle,
         price: priceSats,
@@ -1037,6 +1424,9 @@ export default function SpacesScreen() {
         sptr_price: sptrPrice,
         block_sptr_fee: sptrBlockFee,
       };
+      if (couponStatus === 'valid' && couponCode.trim()) {
+        requestBody.coupon_code = couponCode.trim().toUpperCase();
+      }
 
       console.log('[Spaces API] POST request body:', JSON.stringify(requestBody, null, 2));
 
@@ -1311,6 +1701,38 @@ export default function SpacesScreen() {
     },
     [getBlockFee, getSptrFee]
   );
+
+  // Calculate displayed total with coupon discount applied to price only (block_fee never discounted)
+  const getDiscountedTotal = useCallback((): number | null => {
+    if (!purchaseData || priceSats === null) return null;
+    if (completelyFree) return 0;
+    if (discountPercent === null) return purchaseData.total_price;
+
+    const blockFee = getBlockFee(selectedDuration, blockFee1, blockFee6, blockFee48) ?? 0;
+    const discountedPrice = Math.floor(priceSats * (100 - discountPercent) / 100);
+    let total = blockFee + discountedPrice;
+    if (takeOnchain && sptrPrice !== null) {
+      const sptrFee = getSptrFee(selectedDuration, sptrFee1, sptrFee6, sptrFee48);
+      if (sptrFee !== null) total += sptrPrice + sptrFee;
+    }
+    return total;
+  }, [
+    completelyFree,
+    discountPercent,
+    priceSats,
+    purchaseData,
+    selectedDuration,
+    blockFee1,
+    blockFee6,
+    blockFee48,
+    takeOnchain,
+    sptrPrice,
+    sptrFee1,
+    sptrFee6,
+    sptrFee48,
+    getBlockFee,
+    getSptrFee,
+  ]);
 
   // Initialize pricing service and fetch BTC price
   useEffect(() => {
@@ -1698,6 +2120,61 @@ export default function SpacesScreen() {
     return () => clearInterval(interval);
   }, [jobPollingState]);
 
+  // Reset coupon state when leaving confirmation mode
+  useEffect(() => {
+    if (!isConfirmationMode) {
+      setCouponCode('');
+      setDiscountPercent(null);
+      setCompletelyFree(false);
+      setCouponStatus('idle');
+    }
+  }, [isConfirmationMode]);
+
+  // Validate coupon code with 2-second debounce after user stops typing
+  useEffect(() => {
+    if (!isConfirmationMode) return;
+
+    if (!couponCode.trim()) {
+      setDiscountPercent(null);
+      setCompletelyFree(false);
+      setCouponStatus('idle');
+      return;
+    }
+
+    setCouponStatus('validating');
+
+    const timeoutId = setTimeout(async () => {
+      try {
+        const spaceNameLower = spaceName.toLowerCase();
+        const url = `${SPACES_API_BASE_URL}/api/spaces/${spaceNameLower}/validate-coupon`;
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: couponCode.trim().toUpperCase() }),
+        });
+        const data = await response.json();
+        if (data.success && data.valid) {
+          setDiscountPercent(data.discount_percent);
+          setCompletelyFree(!!data.completely_free);
+          setCouponStatus('valid');
+          toast.success(data.message || `Coupon applied: ${data.discount_percent}% off`);
+        } else {
+          setDiscountPercent(null);
+          setCompletelyFree(false);
+          setCouponStatus('invalid');
+          toast.error(data.message || 'Invalid coupon code');
+        }
+      } catch {
+        setDiscountPercent(null);
+        setCompletelyFree(false);
+        setCouponStatus('invalid');
+        toast.error('Could not validate coupon');
+      }
+    }, 2000);
+
+    return () => clearTimeout(timeoutId);
+  }, [couponCode, isConfirmationMode, spaceName]);
+
   // Recalculate price when duration changes or BTC price updates
   useEffect(() => {
     if (buttonState === 'available' && priceSats !== null) {
@@ -1741,6 +2218,34 @@ export default function SpacesScreen() {
     calculateTotalPrice,
     getBlockFee,
   ]);
+
+  // Keep confirmation-mode button label in sync when coupon discount changes
+  useEffect(() => {
+    if (!isConfirmationMode || !purchaseData) return;
+
+    if (completelyFree) {
+      setButtonLabel(`Request ${purchaseData.handle} for free`);
+      return;
+    }
+
+    const displayTotal =
+      discountPercent !== null && priceSats !== null
+        ? (getDiscountedTotal() ?? purchaseData.total_price)
+        : purchaseData.total_price;
+
+    const formattedSats = displayTotal.toLocaleString();
+
+    if (btcPriceUSD !== null) {
+      const usdAmount = (displayTotal / 100000000) * btcPriceUSD;
+      const formattedUSD = usdAmount.toLocaleString('en-US', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      });
+      setButtonLabel(`Send ${formattedSats} sats = $${formattedUSD} for ${purchaseData.handle}`);
+    } else {
+      setButtonLabel(`Send ${formattedSats} sats for ${purchaseData.handle}`);
+    }
+  }, [completelyFree, discountPercent, couponStatus, isConfirmationMode, purchaseData, btcPriceUSD, priceSats, getDiscountedTotal]);
 
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
@@ -1792,33 +2297,6 @@ export default function SpacesScreen() {
               </TouchableOpacity>
             </View>
 
-            {/* Duration Radio Buttons - Hidden in confirmation mode */}
-            {!isConfirmationMode && (
-              <View style={styles.radioGroup}>
-                {DURATION_OPTIONS.map((option) => (
-                  <TouchableOpacity
-                    key={option}
-                    style={styles.radioButton}
-                    onPress={() => setSelectedDuration(option)}
-                    activeOpacity={0.7}
-                  >
-                    {selectedDuration === option ? (
-                      <Circle size={20} color={colors.primary} fill={colors.primary} />
-                    ) : (
-                      <Circle size={20} color={colors.textSecondary} />
-                    )}
-                    <Text
-                      style={[
-                        styles.radioLabel,
-                        selectedDuration === option && styles.radioLabelSelected,
-                      ]}
-                    >
-                      {option}
-                    </Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-            )}
 
             {/* Confirmation message - Shown in confirmation mode */}
             {isConfirmationMode && purchaseData && (
@@ -1858,19 +2336,67 @@ export default function SpacesScreen() {
                       </View>
                     </>
                   )}
+                  {/* Coupon code input */}
+                  <View style={styles.couponRow}>
+                    <TextInput
+                      style={[
+                        styles.couponInput,
+                        couponStatus === 'valid' && styles.couponInputValid,
+                        couponStatus === 'invalid' && styles.couponInputInvalid,
+                      ]}
+                      placeholder="Coupon code (optional)"
+                      placeholderTextColor={colors.textSecondary}
+                      value={couponCode}
+                      onChangeText={(text) => {
+                        setCouponCode(text);
+                        if (couponStatus !== 'idle') setCouponStatus('idle');
+                        if (discountPercent !== null) setDiscountPercent(null);
+                        if (completelyFree) setCompletelyFree(false);
+                      }}
+                      autoCapitalize="characters"
+                      autoCorrect={false}
+                    />
+                    {couponStatus === 'validating' && (
+                      <Text style={styles.couponStatusChecking}>Checking…</Text>
+                    )}
+                    {couponStatus === 'valid' && discountPercent !== null && (
+                      <Text style={styles.couponStatusValid}>-{discountPercent}%</Text>
+                    )}
+                    {couponStatus === 'invalid' && (
+                      <Text style={styles.couponStatusInvalid}>Invalid</Text>
+                    )}
+                  </View>
+
+                  {/* Discount row — only visible when coupon is valid */}
+                  {couponStatus === 'valid' && discountPercent !== null && priceSats !== null && (
+                    <View style={styles.purchaseOrderRow}>
+                      <Text style={styles.purchaseOrderItemText}>coupon discount</Text>
+                      <Text style={[styles.purchaseOrderPriceText, styles.discountAmountText]}>
+                        -{Math.floor(priceSats * discountPercent / 100).toLocaleString()} sats
+                      </Text>
+                    </View>
+                  )}
+                  {/* Fee discount row — negate transaction fee when coupon makes purchase completely free */}
+                  {completelyFree && (
+                    <View style={styles.purchaseOrderRow}>
+                      <Text style={styles.purchaseOrderItemText}>fee discount</Text>
+                      <Text style={[styles.purchaseOrderPriceText, styles.discountAmountText]}>
+                        -{(getBlockFee(selectedDuration, blockFee1, blockFee6, blockFee48) ?? 0).toLocaleString()} sats
+                      </Text>
+                    </View>
+                  )}
+
                   <View style={[styles.purchaseOrderRow, styles.purchaseOrderTotalRow]}>
                     <Text style={styles.purchaseOrderTotalText}>Total</Text>
                     <Text style={styles.purchaseOrderTotalPriceText}>
-                      {(() => {
+                      {(getDiscountedTotal() ?? (() => {
                         let total = purchaseData.total_price;
                         if (takeOnchain && sptrPrice !== null) {
                           const sptrFee = getSptrFee(selectedDuration, sptrFee1, sptrFee6, sptrFee48);
-                          if (sptrFee !== null) {
-                            total += sptrPrice + sptrFee;
-                          }
+                          if (sptrFee !== null) total += sptrPrice + sptrFee;
                         }
-                        return total.toLocaleString();
-                      })()} sats
+                        return total;
+                      })()).toLocaleString()} sats
                     </Text>
                   </View>
                 </View>
@@ -1989,7 +2515,10 @@ export default function SpacesScreen() {
           {mySpaces.length === 0 ? (
             <View style={styles.infoCard}>
               <Text style={styles.emptyText}>No spaces yet</Text>
-              <Text style={styles.emptySubtext}>Search for and purchase a space above.</Text>
+              <Text style={styles.emptySubtext}>
+                Search for and purchase a space above, or scan for existing spaces by pressing the
+                Find Spaces button.
+              </Text>
             </View>
           ) : (
             <View style={styles.tableContainer}>
@@ -2012,7 +2541,7 @@ export default function SpacesScreen() {
                   >
                     <TouchableOpacity
                       style={styles.tableCellSpace}
-                      onPress={() => handleSubspaceSelect(space.subspace, space.spaceName)}
+                      onPress={() => handleSubspaceSelect(space)}
                       activeOpacity={0.7}
                     >
                       <Text style={styles.tableCellSpaceText}>
@@ -2034,6 +2563,13 @@ export default function SpacesScreen() {
               })}
             </View>
           )}
+          <TouchableOpacity
+            style={styles.findSpacesButton}
+            onPress={handleFindSpaces}
+            activeOpacity={0.7}
+          >
+            <Text style={styles.findSpacesButtonText}>Find Spaces</Text>
+          </TouchableOpacity>
         </View>
 
         {/* Info Section */}
@@ -2214,6 +2750,21 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: colors.textSecondary,
     textAlign: 'center',
+  },
+  findSpacesButton: {
+    marginTop: 12,
+    backgroundColor: colors.card,
+    borderRadius: 12,
+    paddingVertical: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: colors.primary,
+  },
+  findSpacesButtonText: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: colors.primary,
   },
   searchCard: {
     backgroundColor: colors.card,
@@ -2635,5 +3186,52 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '600',
     color: colors.white || '#ffffff',
+  },
+  couponRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 4,
+    gap: 8,
+  },
+  couponInput: {
+    flex: 1,
+    backgroundColor: colors.background,
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    fontSize: 13,
+    color: colors.text,
+    borderWidth: 1,
+    borderColor: colors.borderDark,
+    letterSpacing: 1,
+  },
+  couponInputValid: {
+    borderColor: '#22c55e',
+  },
+  couponInputInvalid: {
+    borderColor: '#ef4444',
+  },
+  couponStatusChecking: {
+    fontSize: 12,
+    color: colors.textSecondary,
+    minWidth: 60,
+    textAlign: 'right',
+  },
+  couponStatusValid: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#22c55e',
+    minWidth: 40,
+    textAlign: 'right',
+  },
+  couponStatusInvalid: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#ef4444',
+    minWidth: 40,
+    textAlign: 'right',
+  },
+  discountAmountText: {
+    color: '#22c55e',
   },
 });
