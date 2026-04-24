@@ -1,7 +1,7 @@
 import Header from '@/components/header';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
 import { AtSign, Check, ChevronDown, ChevronRight, ChevronUp, Circle, Copy, Info } from 'lucide-react-native';
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useFocusEffect } from '@react-navigation/native';
 import {
   Alert,
@@ -30,6 +30,7 @@ import {
   getBitcoinTaprootPathPrefix,
 } from '@/utils/spaces-scan-paths';
 import { WDKSpaces } from '@/utils/wdk-spaces';
+import { registerPurchaseStatusPollStarter } from '@/utils/purchase-poll-bridge';
 import * as Clipboard from 'expo-clipboard';
 import { toast } from 'sonner-native';
 
@@ -37,6 +38,246 @@ const SPACE_NAME_OPTIONS = ['spacesops_services', 'are_currently_unavailable', '
 const DURATION_OPTIONS = ['~10 mins', '~1 hour', '~8 hours'];
 const SPACES_API_BASE_URL = process.env.EXPO_PUBLIC_SPACES_API_BASE_URL || 'http://192.168.1.111:7264';
 const SPACES_APP_NAME = 'spaces-wallet';
+
+/** @see PURCHASE.md — subname quote + purchase; pointer flow is separate (`purchase_type: "pointer"`). */
+const PURCHASE_TYPE_SUBNAME = 'subname';
+const PURCHASE_TYPE_POINTER = 'pointer';
+
+/** Dedupe concurrent `pollJobStatus` for the same job (e.g. Subspace + My Spaces). */
+const activePurchaseJobPolls = new Set<number>();
+
+/**
+ * GET /api/purchases/:spaceName/:subspace/status — `unified_status` for one handle.
+ * `purchaseType` `pointer` = Take on-chain row; else subname.
+ * HTTP **404** = no purchase row for this handle (e.g. discovered via Find Spaces only) — not an error.
+ */
+async function fetchUnifiedHandleStatus(
+  baseUrl: string,
+  spaceName: string,
+  subspace: string,
+  purchaseType: 'subname' | 'pointer' | undefined
+): Promise<{ unifiedStatus: string | null; noServerPurchase: boolean }> {
+  const pt = purchaseType === 'pointer' ? PURCHASE_TYPE_POINTER : PURCHASE_TYPE_SUBNAME;
+  const b = baseUrl.replace(/\/$/, '');
+  const url = `${b}/api/purchases/${encodeURIComponent(spaceName)}/${encodeURIComponent(subspace)}/status?purchase_type=${pt}`;
+  try {
+    const res = await fetch(url, { headers: { Accept: 'application/json' } });
+    if (res.status === 404) {
+      return { unifiedStatus: null, noServerPurchase: true };
+    }
+    const data = (await res.json()) as { success?: boolean; unified_status?: string };
+    if (res.ok && data.success && typeof data.unified_status === 'string') {
+      return { unifiedStatus: data.unified_status, noServerPurchase: false };
+    }
+    console.warn('[Spaces] fetchUnifiedHandleStatus', { spaceName, subspace, pt, status: res.status });
+  } catch (e) {
+    console.warn('[Spaces] fetchUnifiedHandleStatus', spaceName, subspace, e);
+  }
+  return { unifiedStatus: null, noServerPurchase: false };
+}
+
+function extractTxidFromListnumsEntry(entry: unknown): string | undefined {
+  if (!entry || typeof entry !== 'object') return undefined;
+  const o = entry as Record<string, unknown>;
+  for (const k of ['txid', 'tx_id', 'tx_hash', 'hash', 'transaction_id']) {
+    const v = o[k];
+    if (typeof v === 'string' && /^[0-9a-fA-F]{64}$/i.test(v)) {
+      return v.toLowerCase();
+    }
+  }
+  return undefined;
+}
+
+/**
+ * `GET /api/listnums-by-spk` — matches subspace: non-empty `nums` ⇒ on-chain.
+ * `null` = request failed; do not change stored `chainPresence`.
+ */
+async function fetchListnumsChainSnapshot(
+  baseUrl: string,
+  scriptPubkeyHex: string
+): Promise<{
+  onChain: boolean;
+  listnumsLastDataHex?: string;
+  priorTxid?: string;
+} | null> {
+  const b = baseUrl.replace(/\/$/, '');
+  const url = `${b}/api/listnums-by-spk?script_pubkey=${encodeURIComponent(scriptPubkeyHex.trim())}`;
+  try {
+    const res = await fetch(url);
+    const text = await res.text();
+    let body: unknown;
+    try {
+      body = text ? JSON.parse(text) : null;
+    } catch {
+      body = null;
+    }
+    const o = body && typeof body === 'object' ? (body as Record<string, unknown>) : {};
+    const nums = Array.isArray(o.nums) ? o.nums : [];
+    if (!res.ok) {
+      console.warn('[Spaces] listnums-by-spk', { status: res.status });
+      return null;
+    }
+    const onChain = nums.length > 0;
+    let listnumsLastDataHex: string | undefined;
+    let priorTxid: string | undefined;
+    if (onChain) {
+      const last = nums[nums.length - 1];
+      if (last && typeof last === 'object' && 'data' in last) {
+        const d = (last as { data?: unknown }).data;
+        listnumsLastDataHex = typeof d === 'string' ? d : undefined;
+      }
+      priorTxid = extractTxidFromListnumsEntry(last);
+    }
+    return { onChain, listnumsLastDataHex, priorTxid };
+  } catch (e) {
+    console.warn('[Spaces] listnums-by-spk', e);
+    return null;
+  }
+}
+
+/** POST purchase response may use `pointer_*` (current API) or legacy `sptr_*`. */
+/** @see PURCHASE.md — `payment_watch.path` with `{jobId}`; body includes `transaction_id` after broadcast. */
+type PaymentWatchSpec = {
+  method?: string;
+  path: string;
+  body?: Record<string, unknown>;
+};
+
+/** API may use `purchase_id` (JSON) or `purchaseId` (some stacks); normalize to a number. */
+function purchaseIdFromRecord(d: Record<string, unknown>): number | undefined {
+  const v = d.purchase_id ?? d.purchaseId;
+  if (typeof v === 'number' && Number.isFinite(v)) {
+    return v;
+  }
+  if (typeof v === 'string' && v.trim() !== '') {
+    const n = Number.parseInt(v, 10);
+    if (Number.isFinite(n)) {
+      return n;
+    }
+  }
+  return undefined;
+}
+
+function purchaseIdFromResponseBodyText(text: string): number | undefined {
+  const t = text?.trim();
+  if (!t) {
+    return undefined;
+  }
+  try {
+    const j = JSON.parse(t) as Record<string, unknown>;
+    return purchaseIdFromRecord(j);
+  } catch {
+    return undefined;
+  }
+}
+
+function buildWatchPaymentRequestUrl(
+  baseUrl: string,
+  pathTemplate: string,
+  jobId: number
+): string {
+  const p = pathTemplate
+    .replace(/\{jobId\}/g, String(jobId))
+    .replace(/\{job_id\}/g, String(jobId));
+  if (/^https?:\/\//i.test(p)) {
+    return p;
+  }
+  const b = baseUrl.replace(/\/$/, '');
+  return `${b}${p.startsWith('/') ? p : `/${p}`}`;
+}
+
+async function postJobsWatchPayment(
+  baseUrl: string,
+  spec: PaymentWatchSpec,
+  jobId: number,
+  transactionId: string,
+  logLabel: string
+): Promise<{ ok: boolean; purchaseId?: number }> {
+  if (!spec.path) {
+    return { ok: false };
+  }
+  const url = buildWatchPaymentRequestUrl(baseUrl, spec.path, jobId);
+  const method = (spec.method || 'POST').toUpperCase();
+  const body = { ...(spec.body ?? {}), transaction_id: transactionId };
+  const start = Date.now();
+  try {
+    const res = await fetch(url, {
+      method,
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const ms = Date.now() - start;
+    if (!res.ok) {
+      const t = await res.text();
+      console.error(`[Spaces API] ${method} ${url} - watch-payment (${ms}ms) [${logLabel}]`, t);
+      return { ok: false };
+    }
+    const text = await res.text();
+    const purchaseId = purchaseIdFromResponseBodyText(text);
+    console.log(
+      `[Spaces API] ${method} ${url} - watch-payment OK (${ms}ms) [${logLabel}]`,
+      text || '(empty body)'
+    );
+    return { ok: true, purchaseId };
+  } catch (e) {
+    console.error(`[Spaces] watch-payment [${logLabel}]`, e);
+    return { ok: false };
+  }
+}
+
+async function postWatchPaymentFallback(
+  baseUrl: string,
+  jobId: number,
+  spaceNameLower: string,
+  transactionId: string,
+  logLabel: string
+): Promise<{ ok: boolean; purchaseId?: number }> {
+  const b = baseUrl.replace(/\/$/, '');
+  const url = `${b}/api/jobs/${jobId}/watch-payment?space=${encodeURIComponent(spaceNameLower)}`;
+  const start = Date.now();
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ transaction_id: transactionId }),
+    });
+    const ms = Date.now() - start;
+    if (!res.ok) {
+      const t = await res.text();
+      console.error(
+        `[Spaces API] POST ${url} - watch-payment fallback (${ms}ms) [${logLabel}]`,
+        t
+      );
+      return { ok: false };
+    }
+    const text = await res.text();
+    const purchaseId = purchaseIdFromResponseBodyText(text);
+    console.log(
+      `[Spaces API] POST ${url} - watch-payment OK (${ms}ms) [${logLabel}]`,
+      text || '(empty body)'
+    );
+    return { ok: true, purchaseId };
+  } catch (e) {
+    console.error(`[Spaces] watch-payment fallback [${logLabel}]`, e);
+    return { ok: false };
+  }
+}
+
+function pointerIdsFromPurchaseResponse(data: Record<string, unknown>): {
+  pointerJobId?: number;
+  pointerPurchaseId?: number;
+} {
+  const asPosInt = (v: unknown): number | undefined => {
+    if (v == null) return undefined;
+    const n = typeof v === 'number' ? v : Number(v);
+    if (!Number.isFinite(n) || n <= 0) return undefined;
+    return Math.trunc(n);
+  };
+  return {
+    pointerJobId: asPosInt(data.pointer_job_id ?? data.sptr_job_id),
+    pointerPurchaseId: asPosInt(data.pointer_purchase_id ?? data.sptr_purchase_id),
+  };
+}
 
 /** One row from POST /api/subsd/find-handles (flexible shapes). */
 interface FindHandlesSpaceRow {
@@ -190,6 +431,17 @@ export default function SpacesScreen() {
   const { wallet, addresses, balances } = useWallet();
   const [subspace, setSubspace] = useState('');
   const [spaceName, setSpaceName] = useState<string>('');
+  /** Avoid repeating the "select space name first" warning on every subspace keystroke. */
+  const subspaceBeforeSpaceNameWarnedRef = useRef(false);
+  /** Set when POST/PUT confirms a purchase so broadcast can POST /api/payments/callback even if mySpaces hasn’t re-rendered yet. */
+  const pendingPaymentCallbackRef = useRef<{ jobId: number; purchaseId: number } | null>(null);
+  /** From successful POST /spaces/... (PURCHASE.md `payment_watch` / `pointer_payment_watch`); used after broadcast. */
+  const postPurchaseWatchRef = useRef<{
+    primary: PaymentWatchSpec | null;
+    pointer: PaymentWatchSpec | null;
+    primaryJobId: number | null;
+    pointerJobId: number | null;
+  } | null>(null);
   const [showDropdown, setShowDropdown] = useState(false);
   const [buttonState, setButtonState] = useState<'available' | 'taken' | 'loading' | null>(null);
   const [isButtonEnabled, setIsButtonEnabled] = useState(false);
@@ -267,6 +519,11 @@ export default function SpacesScreen() {
       listnumsLastDataHex?: string;
       /** User-saved wire hex from Hex Tool (Save Hex String). */
       newDataHex?: string;
+      /**
+       * Which `purchase_type` the unified status API should use (defaults to subname).
+       * Set to `pointer` for Take on-chain / standalone pointer purchases.
+       */
+      unifiedStatusPurchaseType?: 'subname' | 'pointer';
     }[]
   >([]);
   const [jobPollingState, setJobPollingState] = useState<
@@ -354,6 +611,114 @@ export default function SpacesScreen() {
     // Return minutes (rounded to 1 decimal place)
     return Math.round((timeRemaining / 60000) * 10) / 10;
   };
+
+  const handleRefreshAllMySpacesStatuses = useCallback(async () => {
+    if (mySpaces.length === 0) {
+      toast.info('No spaces in My Spaces');
+      return;
+    }
+    const [unifiedRows, listnumsRows] = await Promise.all([
+      Promise.all(
+        mySpaces.map(async (space) => {
+          const r = await fetchUnifiedHandleStatus(
+            SPACES_API_BASE_URL,
+            space.spaceName,
+            space.subspace,
+            space.unifiedStatusPurchaseType
+          );
+          return {
+            key: `${space.subspace}\0${space.spaceName.toLowerCase()}`,
+            unifiedStatus: r.unifiedStatus,
+            noServerPurchase: r.noServerPurchase,
+          };
+        })
+      ),
+      Promise.all(
+        mySpaces.map(async (space) => {
+          const key = `${space.subspace}\0${space.spaceName.toLowerCase()}`;
+          const spk = space.scriptPubKeyHex?.trim();
+          if (!spk) {
+            return { key, listnumsSnapshot: null as null };
+          }
+          const listnumsSnapshot = await fetchListnumsChainSnapshot(SPACES_API_BASE_URL, spk);
+          return { key, listnumsSnapshot };
+        })
+      ),
+    ]);
+
+    const byKey = new Map<string, string>();
+    let noServerPurchaseCount = 0;
+    let otherFailureCount = 0;
+    for (const r of unifiedRows) {
+      if (r.unifiedStatus) {
+        byKey.set(r.key, r.unifiedStatus);
+      } else if (r.noServerPurchase) {
+        noServerPurchaseCount += 1;
+      } else {
+        otherFailureCount += 1;
+      }
+    }
+
+    const listnumsByKey = new Map<
+      string,
+      { onChain: boolean; listnumsLastDataHex?: string; priorTxid?: string }
+    >();
+    let onChainFromListnums = 0;
+    for (const r of listnumsRows) {
+      if (r.listnumsSnapshot) {
+        listnumsByKey.set(r.key, r.listnumsSnapshot);
+        if (r.listnumsSnapshot.onChain) {
+          onChainFromListnums += 1;
+        }
+      }
+    }
+
+    setMySpaces((prev) =>
+      prev.map((row) => {
+        const k = `${row.subspace}\0${row.spaceName.toLowerCase()}`;
+        const st = byKey.get(k);
+        const snap = listnumsByKey.get(k);
+        let next = row;
+        if (st) {
+          next = { ...next, status: st as UnifiedStatus };
+        }
+        if (snap) {
+          if (snap.onChain) {
+            next = {
+              ...next,
+              chainPresence: 'on-chain',
+              listnumsLastDataHex: snap.listnumsLastDataHex,
+              priorTxid: snap.priorTxid,
+            };
+          } else {
+            next = {
+              ...next,
+              chainPresence: 'off-chain',
+              listnumsLastDataHex: undefined,
+              priorTxid: undefined,
+            };
+          }
+        }
+        return next;
+      })
+    );
+    const n = byKey.size;
+    if (n > 0) {
+      toast.success(
+        n === mySpaces.length
+          ? 'Handle status updated'
+          : `Updated ${n} of ${mySpaces.length} handles`
+      );
+    } else if (onChainFromListnums > 0) {
+      toast.success(
+        onChainFromListnums === mySpaces.length
+          ? 'On-chain status updated'
+          : `On-chain: ${onChainFromListnums} of ${mySpaces.length} handle(s) (by script key)`
+      );
+    } else if (otherFailureCount > 0) {
+      toast.error('Could not fetch handle status. Check your connection or server.');
+    }
+  }, [mySpaces]);
 
   const handleCopyTxHex = async () => {
     try {
@@ -493,13 +858,37 @@ export default function SpacesScreen() {
       initialDelay?: number;
       maxDelay?: number;
       maxAttempts?: number;
+      /** @default 'subname' — use `pointer` for Take on-chain / standalone pointer. */
+      unifiedStatusPurchaseType?: 'subname' | 'pointer';
     } = {}
   ) => {
     const {
       initialDelay = 2000, // Start with 2 seconds
       maxDelay = 300000, // Max 5 minutes
       maxAttempts = 100,
+      unifiedStatusPurchaseType = 'subname',
     } = options;
+
+    if (activePurchaseJobPolls.has(jobId)) {
+      console.log(`[Spaces] pollJobStatus: skip duplicate for job ${jobId}`);
+      return null;
+    }
+    activePurchaseJobPolls.add(jobId);
+
+    const purchaseTypeQuery =
+      unifiedStatusPurchaseType === 'pointer' ? PURCHASE_TYPE_POINTER : PURCHASE_TYPE_SUBNAME;
+    let pointerPaymentConfirmToastShown = false;
+    const paymentConfirmedOrLater = new Set<string>([
+      'confirmed',
+      'proof_created',
+      'proof_batched',
+      'proof_committed',
+      'certificate_pending',
+      'certificate_delivered',
+      'sptr_creating',
+      'sptr_created',
+      'sptr_delivered',
+    ]);
 
     let delay = initialDelay;
     let attempt = 0;
@@ -522,133 +911,176 @@ export default function SpacesScreen() {
       setMySpaces((prev) =>
         prev.map((space) =>
           space.subspace === subspace && space.spaceName === spaceName.toLowerCase()
-            ? { ...space, status: status, jobId }
+            ? { ...space, status: status, jobId, unifiedStatusPurchaseType }
             : space
         )
       );
     };
 
-    // Try to use unified status endpoint if we have spaceName and subspace
-    const unifiedStatusUrl = `${SPACES_API_BASE_URL}/api/purchases/${spaceName}/${subspace}/status`;
+    // Unified status: subname (default) vs pointer (Take on-chain standalone).
+    const unifiedStatusUrl = `${SPACES_API_BASE_URL}/api/purchases/${encodeURIComponent(spaceName)}/${encodeURIComponent(subspace)}/status?purchase_type=${purchaseTypeQuery}`;
 
-    while (attempt < maxAttempts) {
-      try {
-        // Set next check time (for first attempt, this is immediate, then uses delay)
-        const nextCheckTime = attempt === 0 ? Date.now() : Date.now() + delay;
-        updatePollingState(nextCheckTime, true);
-        console.log(
-          `[Spaces] Polling job ${jobId} - attempt ${attempt + 1}${attempt > 0 ? `, next check in ${delay}ms` : ' (immediate)'}`
-        );
-
-        // Try unified status endpoint first, fallback to job status endpoint
-        let response;
-        let data;
-        let unifiedStatus: UnifiedStatus | null = null;
-
+    try {
+      while (attempt < maxAttempts) {
         try {
-          response = await fetch(unifiedStatusUrl);
-          data = await response.json();
-          if (data.success && data.unified_status) {
-            unifiedStatus = data.unified_status as UnifiedStatus;
-            console.log(`[Spaces] Got unified status: ${unifiedStatus} for ${subspace}@${spaceName}`);
+          // Set next check time (for first attempt, this is immediate, then uses delay)
+          const nextCheckTime = attempt === 0 ? Date.now() : Date.now() + delay;
+          updatePollingState(nextCheckTime, true);
+          console.log(
+            `[Spaces] Polling job ${jobId} (purchase_type=${purchaseTypeQuery}) - attempt ${
+              attempt + 1
+            }${attempt > 0 ? `, next check in ${delay}ms` : ' (immediate)'}`
+          );
+
+          // Try unified status endpoint first, fallback to job status endpoint
+          let response;
+          let data;
+          let unifiedStatus: UnifiedStatus | null = null;
+
+          try {
+            response = await fetch(unifiedStatusUrl);
+            data = await response.json();
+            if (data.success && data.unified_status) {
+              unifiedStatus = data.unified_status as UnifiedStatus;
+              console.log(
+                `[Spaces] Got unified status: ${unifiedStatus} for ${subspace}@${spaceName}`
+              );
+            }
+          } catch (unifiedError) {
+            console.warn(
+              `[Spaces] Unified status endpoint failed, falling back to job status:`,
+              unifiedError
+            );
+            // Fallback to job status endpoint
+            response = await fetch(url);
+            data = await response.json();
           }
-        } catch (unifiedError) {
-          console.warn(`[Spaces] Unified status endpoint failed, falling back to job status:`, unifiedError);
-          // Fallback to job status endpoint
-          response = await fetch(url);
-          data = await response.json();
-        }
 
-        if (!data.success) {
-          throw new Error(data.message || 'Failed to fetch job status');
-        }
+          if (!data.success) {
+            throw new Error(data.message || 'Failed to fetch job status');
+          }
 
-        // Use unified status if available, otherwise map from job status
-        if (unifiedStatus) {
-          updateSpaceStatus(unifiedStatus);
-        } else {
+          // Use unified status if available, otherwise map from job status
+          if (unifiedStatus) {
+            updateSpaceStatus(unifiedStatus);
+            if (unifiedStatusPurchaseType === 'pointer') {
+              const pointerTerminal: UnifiedStatus[] = [
+                'certificate_delivered',
+                'sptr_delivered',
+                'expired',
+                'cancelled',
+              ];
+              if (
+                !pointerPaymentConfirmToastShown &&
+                paymentConfirmedOrLater.has(unifiedStatus) &&
+                !pointerTerminal.includes(unifiedStatus)
+              ) {
+                pointerPaymentConfirmToastShown = true;
+                toast.success('Payment confirmed on-chain');
+              }
+            }
+          } else {
+            const job = data.job;
+            // Map job status to unified status
+            const statusMap: Record<string, UnifiedStatus> = {
+              pending_payment: 'pending_payment',
+              processing: 'processing',
+              confirmed: 'confirmed',
+              expired: 'expired',
+              cancelled: 'cancelled',
+            };
+            const mappedStatus = statusMap[job.status] || 'pending_payment';
+            updateSpaceStatus(mappedStatus);
+          }
+
+          // Check for terminal states
+          const terminalStates: UnifiedStatus[] = [
+            'certificate_delivered',
+            'sptr_delivered',
+            'expired',
+            'cancelled',
+          ];
+          const currentStatus =
+            unifiedStatus || (data.purchase?.unified_status as UnifiedStatus) || 'pending_payment';
+
+          if (terminalStates.includes(currentStatus)) {
+            updatePollingState(nextCheckTime, false);
+            console.log(`[Spaces] Job ${jobId} completed with status: ${currentStatus}`);
+            if (currentStatus === 'certificate_delivered' || currentStatus === 'sptr_delivered') {
+              toast.success(`Purchase complete for ${subspace}@${spaceName}`);
+            } else if (currentStatus === 'expired') {
+              toast.error(`Purchase expired for ${subspace}@${spaceName}`);
+            } else if (currentStatus === 'cancelled') {
+              toast.info(`Purchase cancelled for ${subspace}@${spaceName}`);
+            }
+            return data;
+          }
+
+          // Check expiration
           const job = data.job;
-          // Map job status to unified status
-          const statusMap: Record<string, UnifiedStatus> = {
-            pending_payment: 'pending_payment',
-            processing: 'processing',
-            confirmed: 'confirmed',
-            expired: 'expired',
-            cancelled: 'cancelled',
-          };
-          const mappedStatus = statusMap[job.status] || 'pending_payment';
-          updateSpaceStatus(mappedStatus);
-        }
-
-        // Check for terminal states
-        const terminalStates: UnifiedStatus[] = ['certificate_delivered', 'sptr_delivered', 'expired', 'cancelled'];
-        const currentStatus = unifiedStatus || (data.purchase?.unified_status as UnifiedStatus) || 'pending_payment';
-        
-        if (terminalStates.includes(currentStatus)) {
-          updatePollingState(nextCheckTime, false);
-          console.log(`[Spaces] Job ${jobId} completed with status: ${currentStatus}`);
-          if (currentStatus === 'certificate_delivered' || currentStatus === 'sptr_delivered') {
-            toast.success(`Purchase complete for ${subspace}@${spaceName}`);
-          } else if (currentStatus === 'expired') {
+          if (job && job.is_expired) {
+            updateSpaceStatus('expired');
+            updatePollingState(nextCheckTime, false);
             toast.error(`Purchase expired for ${subspace}@${spaceName}`);
-          } else if (currentStatus === 'cancelled') {
-            toast.info(`Purchase cancelled for ${subspace}@${spaceName}`);
+            return { ...data, expired: true };
           }
-          return data;
-        }
 
-        // Check expiration
-        const job = data.job;
-        if (job && job.is_expired) {
-          updateSpaceStatus('expired');
-          updatePollingState(nextCheckTime, false);
-          toast.error(`Purchase expired for ${subspace}@${spaceName}`);
-          return { ...data, expired: true };
-        }
-
-        if (job) {
-          console.log(`[Spaces] Job ${jobId}: ${job.status} (attempt ${attempt + 1})`);
-          if (job.blocks_until_expiration !== null) {
-            console.log(`  Blocks until expiration: ${job.blocks_until_expiration}`);
+          if (job) {
+            console.log(`[Spaces] Job ${jobId}: ${job.status} (attempt ${attempt + 1})`);
+            if (job.blocks_until_expiration !== null) {
+              console.log(`  Blocks until expiration: ${job.blocks_until_expiration}`);
+            }
           }
-        }
-        if (unifiedStatus) {
-          console.log(`[Spaces] Unified status: ${unifiedStatus} (attempt ${attempt + 1})`);
-        }
+          if (unifiedStatus) {
+            console.log(`[Spaces] Unified status: ${unifiedStatus} (attempt ${attempt + 1})`);
+          }
 
-        // Exponential backoff: double delay, up to maxDelay
-        delay = Math.min(delay * 2, maxDelay);
-        attempt++;
+          // Exponential backoff: double delay, up to maxDelay
+          delay = Math.min(delay * 2, maxDelay);
+          attempt++;
 
-        // Set next check time for the next poll (after exponential backoff)
-        const nextCheckTimeAfterDelay = Date.now() + delay;
-        updatePollingState(nextCheckTimeAfterDelay, true);
+          // Set next check time for the next poll (after exponential backoff)
+          const nextCheckTimeAfterDelay = Date.now() + delay;
+          updatePollingState(nextCheckTimeAfterDelay, true);
 
-        // Wait before next poll
-        await new Promise((resolve) => setTimeout(resolve, delay));
-      } catch (error) {
-        console.error(`[Spaces] Polling error (attempt ${attempt + 1}):`, error);
-        const nextCheckTime = Date.now() + delay;
-        updatePollingState(nextCheckTime, true);
+          // Wait before next poll
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        } catch (error) {
+          console.error(`[Spaces] Polling error (attempt ${attempt + 1}):`, error);
+          const nextCheckTime = Date.now() + delay;
+          updatePollingState(nextCheckTime, true);
 
-        // On error, wait before retrying (with exponential backoff)
-        await new Promise((resolve) => setTimeout(resolve, delay));
-        delay = Math.min(delay * 2, maxDelay);
-        attempt++;
+          // On error, wait before retrying (with exponential backoff)
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          delay = Math.min(delay * 2, maxDelay);
+          attempt++;
 
-        // If max attempts reached, stop polling
-        if (attempt >= maxAttempts) {
-          updatePollingState(nextCheckTime, false);
-          toast.error(`Max polling attempts reached for ${subspace}@${spaceName}`);
-          return null;
+          // If max attempts reached, stop polling
+          if (attempt >= maxAttempts) {
+            updatePollingState(nextCheckTime, false);
+            toast.error(`Max polling attempts reached for ${subspace}@${spaceName}`);
+            return null;
+          }
         }
       }
-    }
 
-    updatePollingState(Date.now(), false);
-    toast.error(`Max polling attempts (${maxAttempts}) reached for ${subspace}@${spaceName}`);
-    return null;
+      updatePollingState(Date.now(), false);
+      toast.error(`Max polling attempts (${maxAttempts}) reached for ${subspace}@${spaceName}`);
+      return null;
+    } finally {
+      activePurchaseJobPolls.delete(jobId);
+    }
   };
+
+  const pollJobStatusRef = useRef(pollJobStatus);
+  pollJobStatusRef.current = pollJobStatus;
+  useEffect(() => {
+    return registerPurchaseStatusPollStarter((p) => {
+      void pollJobStatusRef.current(p.jobId, p.spaceName, p.subspace, {
+        unifiedStatusPurchaseType: p.unifiedStatusPurchaseType,
+      });
+    });
+  }, []);
 
   const handleSimulate = async () => {
     console.log('[Spaces] Simulate transaction:', txHex);
@@ -739,6 +1171,147 @@ export default function SpacesScreen() {
       console.log('[Spaces] Transaction broadcasted successfully:', txHash);
       const hashStr = typeof txHash === 'object' && txHash !== null ? (txHash as any).hash ?? JSON.stringify(txHash) : String(txHash);
       toast.success(`Transaction broadcasted! Hash: ${hashStr.substring(0, 16)}...`);
+
+      const currentSpaceNameLower = spaceName.toLowerCase();
+      const currentSubspaceTrimmed = subspace.trim();
+
+      // Register payment tx for watching (PURCHASE.md) — same txid as /api/payments/callback, after POST /spaces/... we stored payment_watch
+      let purchaseIdFromWatch: number | undefined;
+      if (hashStr) {
+        const w = postPurchaseWatchRef.current;
+        const primaryJobId = w?.primaryJobId ?? currentJobId;
+        if (w?.primary && primaryJobId != null) {
+          const r = await postJobsWatchPayment(
+            SPACES_API_BASE_URL,
+            w.primary,
+            primaryJobId,
+            hashStr,
+            'primary'
+          );
+          if (r.purchaseId != null) {
+            purchaseIdFromWatch = r.purchaseId;
+          }
+          if (!r.ok) {
+            const fb = await postWatchPaymentFallback(
+              SPACES_API_BASE_URL,
+              primaryJobId,
+              currentSpaceNameLower,
+              hashStr,
+              'primary-fallback'
+            );
+            if (fb.purchaseId != null) {
+              purchaseIdFromWatch = fb.purchaseId;
+            }
+            if (!fb.ok) {
+              toast.error('Could not register payment for watching. Polling may still work.');
+            }
+          }
+        } else if (primaryJobId != null) {
+          const fb = await postWatchPaymentFallback(
+            SPACES_API_BASE_URL,
+            primaryJobId,
+            currentSpaceNameLower,
+            hashStr,
+            'primary'
+          );
+          if (fb.purchaseId != null) {
+            purchaseIdFromWatch = fb.purchaseId;
+          }
+          if (!fb.ok) {
+            toast.error('Could not register payment for watching. Polling may still work.');
+          }
+        }
+        if (w?.pointer && w.pointerJobId != null) {
+          const pr = await postJobsWatchPayment(
+            SPACES_API_BASE_URL,
+            w.pointer,
+            w.pointerJobId,
+            hashStr,
+            'pointer'
+          );
+          if (pr.purchaseId != null) {
+            purchaseIdFromWatch = pr.purchaseId;
+          }
+          if (!pr.ok) {
+            const pfb = await postWatchPaymentFallback(
+              SPACES_API_BASE_URL,
+              w.pointerJobId,
+              currentSpaceNameLower,
+              hashStr,
+              'pointer-fallback'
+            );
+            if (pfb.purchaseId != null) {
+              purchaseIdFromWatch = pfb.purchaseId;
+            }
+          }
+        }
+      }
+
+      const callbackUrl = `${SPACES_API_BASE_URL}/api/payments/callback`;
+      const label = `${currentSubspaceTrimmed}@${currentSpaceNameLower}`;
+      const spaceEntry = mySpaces.find(
+        (s) => s.subspace === currentSubspaceTrimmed && s.spaceName === currentSpaceNameLower
+      );
+      let purchaseIdForCallback: number | undefined = spaceEntry?.purchaseId;
+      if (
+        purchaseIdForCallback == null &&
+        currentJobId != null &&
+        pendingPaymentCallbackRef.current != null &&
+        pendingPaymentCallbackRef.current.jobId === currentJobId
+      ) {
+        purchaseIdForCallback = pendingPaymentCallbackRef.current.purchaseId;
+      }
+      if (purchaseIdForCallback == null && currentJobId != null) {
+        try {
+          const raw = await AsyncStorage.getItem(`spaces_purchase_${currentJobId}`);
+          if (raw) {
+            const j = JSON.parse(raw) as Record<string, unknown>;
+            const fromStore = purchaseIdFromRecord(j);
+            if (fromStore != null) {
+              purchaseIdForCallback = fromStore;
+            }
+          }
+        } catch (e) {
+          console.warn('[Spaces] payment callback: AsyncStorage read failed', e);
+        }
+      }
+      if (purchaseIdForCallback == null && purchaseIdFromWatch != null) {
+        purchaseIdForCallback = purchaseIdFromWatch;
+      }
+      if (hashStr && purchaseIdForCallback != null) {
+        const cbStart = Date.now();
+        try {
+          const res = await fetch(callbackUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              transaction_id: hashStr,
+              label,
+              purchase_id: purchaseIdForCallback,
+            }),
+          });
+          const ms = Date.now() - cbStart;
+          if (!res.ok) {
+            const errText = await res.text();
+            console.error(
+              `[Spaces API] POST ${callbackUrl} - HTTP ${res.status} (${ms}ms)`,
+              errText
+            );
+            toast.error('Payment was broadcast but the server could not be notified. Polling will continue.');
+          } else {
+            const bodyText = await res.text();
+            console.log(`[Spaces API] POST ${callbackUrl} - Success (${ms}ms)`, bodyText || '(empty body)');
+          }
+        } catch (e) {
+          console.error('[Spaces] POST payment callback failed:', e);
+          toast.error('Could not reach payment callback. Polling will continue.');
+        }
+      } else {
+        console.warn(
+          '[Spaces] Skipping /api/payments/callback: missing purchase_id (mySpaces/AsyncStorage) or transaction id',
+          { purchaseId: purchaseIdForCallback, hasHash: !!hashStr }
+        );
+      }
 
       // Add subspace to My Spaces and start polling if we have jobId
       if (currentJobId && purchaseData) {
@@ -843,7 +1416,7 @@ export default function SpacesScreen() {
           const response = await fetch(url, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ quote_id: quoteId }),
+            body: JSON.stringify({ quote_id: quoteId, purchase_type: PURCHASE_TYPE_SUBNAME }),
           });
 
           if (!response.ok) {
@@ -855,42 +1428,45 @@ export default function SpacesScreen() {
           const data = await response.json();
           console.log(`[Spaces API] PUT ${url} - Success (free coupon)`, data);
 
-          if (data.job_id) {
-            setCurrentJobId(data.job_id);
-            setCurrentJobData({
-              handle: data.handle || purchaseData.handle,
-              subspace: currentSubspace,
-              spaceName: currentSpaceName,
-            });
+            if (data.job_id) {
+              const d = data as Record<string, unknown>;
+              const { pointerJobId, pointerPurchaseId } = pointerIdsFromPurchaseResponse(d);
+              const resolvedPurchaseIdFree = purchaseIdFromRecord(d);
+              setCurrentJobId(data.job_id);
+              setCurrentJobData({
+                handle: data.handle || purchaseData.handle,
+                subspace: currentSubspace,
+                spaceName: currentSpaceName,
+              });
 
-            setMySpaces((prev) =>
-              prev.map((space) =>
-                space.subspace === currentSubspace && space.spaceName === currentSpaceName
-                  ? {
-                      ...space,
-                      jobId: data.job_id,
-                      purchaseId: data.purchase_id,
-                      sptrJobId: data.sptr_job_id || undefined,
-                      sptrPurchaseId: data.sptr_purchase_id || undefined,
-                      hasSptr: !!data.sptr_job_id,
-                      status: 'pending_payment' as UnifiedStatus,
-                    }
-                  : space
-              )
-            );
+              setMySpaces((prev) =>
+                prev.map((space) =>
+                  space.subspace === currentSubspace && space.spaceName === currentSpaceName
+                    ? {
+                        ...space,
+                        jobId: data.job_id,
+                        purchaseId: resolvedPurchaseIdFree,
+                        sptrJobId: pointerJobId,
+                        sptrPurchaseId: pointerPurchaseId,
+                        hasSptr: pointerJobId != null && pointerJobId > 0,
+                        status: 'pending_payment' as UnifiedStatus,
+                      }
+                    : space
+                )
+              );
 
-            if (data.handle) {
-              const storageKey = `spaces_purchase_${data.job_id}`;
-              const storageData = {
-                job_id: data.job_id,
-                handle: data.handle,
-                quote_id: data.quote_id,
-                purchase_id: data.purchase_id,
-                sptr_job_id: data.sptr_job_id,
-                sptr_purchase_id: data.sptr_purchase_id,
-                has_sptr: !!data.sptr_job_id,
-                timestamp: Date.now(),
-              };
+              if (data.handle) {
+                const storageKey = `spaces_purchase_${data.job_id}`;
+                const storageData = {
+                  job_id: data.job_id,
+                  handle: data.handle,
+                  quote_id: data.quote_id,
+                  purchase_id: resolvedPurchaseIdFree ?? data.purchase_id,
+                  sptr_job_id: pointerJobId,
+                  sptr_purchase_id: pointerPurchaseId,
+                  has_sptr: pointerJobId != null && pointerJobId > 0,
+                  timestamp: Date.now(),
+                };
               await AsyncStorage.setItem(storageKey, JSON.stringify(storageData));
               console.log('[Spaces] Stored purchase data:', storageKey);
             }
@@ -1198,15 +1774,8 @@ export default function SpacesScreen() {
           return [...prev, newSpace];
         });
 
-        // Display transaction hex in modal
-        setTxHex(transactionHex);
-        setShowTxHexModal(true);
-
-        // Reset button state while showing modal
-        setButtonState('available');
-        setIsButtonEnabled(true);
-
-        // Send PUT request to confirm purchase
+        // Register the purchase with the server before showing the broadcast modal so job_id / purchase_id exist
+        // (otherwise the user could broadcast while the PUT is still in flight and the payment callback would lack purchase_id).
         const spaceNameLower = spaceName.toLowerCase();
         const url = `${SPACES_API_BASE_URL}/spaces/${spaceNameLower}/${subspace.trim()}?app=${SPACES_APP_NAME}&format=json`;
         const startTime = Date.now();
@@ -1214,6 +1783,7 @@ export default function SpacesScreen() {
 
         const requestBody = {
           quote_id: quoteId,
+          purchase_type: PURCHASE_TYPE_SUBNAME,
         };
 
         console.log('[Spaces API] PUT request body:', JSON.stringify(requestBody, null, 2));
@@ -1241,6 +1811,9 @@ export default function SpacesScreen() {
         const data = await response.json();
         console.log(`[Spaces API] PUT ${url} - Success (${duration}ms)`, data);
 
+        const dataRec = data as Record<string, unknown>;
+        const { pointerJobId, pointerPurchaseId } = pointerIdsFromPurchaseResponse(dataRec);
+
         // Store job_id and related data for polling
         if (data.job_id) {
           setCurrentJobId(data.job_id);
@@ -1257,6 +1830,8 @@ export default function SpacesScreen() {
           );
         }
 
+        const resolvedPurchaseIdPut = purchaseIdFromRecord(dataRec);
+
         // Update space entry with job IDs and purchase IDs
         setMySpaces((prev) =>
           prev.map((space) =>
@@ -1264,15 +1839,31 @@ export default function SpacesScreen() {
               ? {
                   ...space,
                   jobId: data.job_id,
-                  purchaseId: data.purchase_id,
-                  sptrJobId: data.sptr_job_id || undefined,
-                  sptrPurchaseId: data.sptr_purchase_id || undefined,
-                  hasSptr: !!data.sptr_job_id,
+                  purchaseId: resolvedPurchaseIdPut,
+                  sptrJobId: pointerJobId,
+                  sptrPurchaseId: pointerPurchaseId,
+                  hasSptr: pointerJobId != null && pointerJobId > 0,
                   status: 'pending_payment' as UnifiedStatus,
                 }
               : space
           )
         );
+
+        const parsedPurchaseId = resolvedPurchaseIdPut ?? NaN;
+        const parsedJobId =
+          typeof data.job_id === 'number'
+            ? data.job_id
+            : data.job_id != null
+              ? Number(data.job_id)
+              : NaN;
+        if (Number.isFinite(parsedPurchaseId) && Number.isFinite(parsedJobId)) {
+          pendingPaymentCallbackRef.current = {
+            jobId: parsedJobId,
+            purchaseId: parsedPurchaseId,
+          };
+        } else {
+          pendingPaymentCallbackRef.current = null;
+        }
 
         // Store job_id and handle in local storage
         if (data.job_id && data.handle) {
@@ -1281,15 +1872,29 @@ export default function SpacesScreen() {
             job_id: data.job_id,
             handle: data.handle,
             quote_id: data.quote_id,
-            purchase_id: data.purchase_id,
-            sptr_job_id: data.sptr_job_id,
-            sptr_purchase_id: data.sptr_purchase_id,
-            has_sptr: !!data.sptr_job_id,
+            purchase_id: resolvedPurchaseIdPut ?? data.purchase_id,
+            sptr_job_id: pointerJobId,
+            sptr_purchase_id: pointerPurchaseId,
+            has_sptr: pointerJobId != null && pointerJobId > 0,
             timestamp: Date.now(),
           };
           await AsyncStorage.setItem(storageKey, JSON.stringify(storageData));
           console.log('[Spaces] Stored purchase data in AsyncStorage:', storageKey, storageData);
+        } else if (data.job_id != null && Number.isFinite(parsedPurchaseId)) {
+          const storageKey = `spaces_purchase_${data.job_id}`;
+          await AsyncStorage.setItem(
+            storageKey,
+            JSON.stringify({
+              job_id: data.job_id,
+              purchase_id: parsedPurchaseId,
+              timestamp: Date.now(),
+            })
+          );
+          console.log('[Spaces] Stored minimal purchase id in AsyncStorage:', storageKey);
         }
+
+        setTxHex(transactionHex);
+        setShowTxHexModal(true);
 
         // Reset confirmation mode
         setIsConfirmationMode(false);
@@ -1415,15 +2020,18 @@ export default function SpacesScreen() {
       const confTarget = getConfTarget(selectedDuration);
       const sptrBlockFee = getSptrFee(selectedDuration, sptrFee1, sptrFee6, sptrFee48);
       const requestBody: Record<string, unknown> = {
+        purchase_type: PURCHASE_TYPE_SUBNAME,
         block_fee: blockFee,
         handle: handle,
         price: priceSats,
         quote_id: quoteId,
         conf_target: confTarget,
-        sptr: takeOnchain ? 'true' : 'false',
-        sptr_price: sptrPrice,
-        block_sptr_fee: sptrBlockFee,
       };
+      if (takeOnchain && sptrPrice != null && sptrPrice > 0) {
+        requestBody.include_pointer_purchase = true;
+        requestBody.pointer_price = sptrPrice;
+        requestBody.block_pointer_fee = sptrBlockFee;
+      }
       if (couponStatus === 'valid' && couponCode.trim()) {
         requestBody.coupon_code = couponCode.trim().toUpperCase();
       }
@@ -1452,6 +2060,30 @@ export default function SpacesScreen() {
 
       const data = await response.json();
       console.log(`[Spaces API] POST ${url} - Success (${duration}ms)`, data);
+
+      const dataRec = data as Record<string, unknown>;
+      const { pointerJobId: pointerJobIdFromPost } = pointerIdsFromPurchaseResponse(dataRec);
+      const postJobRaw = dataRec.job_id;
+      const primaryJobIdParsed =
+        typeof postJobRaw === 'number'
+          ? postJobRaw
+          : postJobRaw != null
+            ? Number(postJobRaw)
+            : NaN;
+      const pw = dataRec.payment_watch;
+      const ppw = dataRec.pointer_payment_watch;
+      postPurchaseWatchRef.current = {
+        primary:
+          pw && typeof pw === 'object' && typeof (pw as PaymentWatchSpec).path === 'string'
+            ? (pw as PaymentWatchSpec)
+            : null,
+        pointer:
+          ppw && typeof ppw === 'object' && typeof (ppw as PaymentWatchSpec).path === 'string'
+            ? (ppw as PaymentWatchSpec)
+            : null,
+        primaryJobId: Number.isFinite(primaryJobIdParsed) ? primaryJobIdParsed : null,
+        pointerJobId: pointerJobIdFromPost ?? null,
+      };
 
       // Store purchase data and enter confirmation mode
       setPurchaseData({
@@ -1523,6 +2155,7 @@ export default function SpacesScreen() {
 
     try {
       const requestBody = {
+        purchase_type: PURCHASE_TYPE_SUBNAME,
         quote_id: quoteId,
         handle: handle,
       };
@@ -1555,6 +2188,7 @@ export default function SpacesScreen() {
       // Reset confirmation mode and clear purchase data
       setIsConfirmationMode(false);
       setPurchaseData(null);
+      postPurchaseWatchRef.current = null;
 
       // Reset button state to initial
       setButtonState('available');
@@ -1840,6 +2474,20 @@ export default function SpacesScreen() {
     loadSpaces();
   }, []);
 
+  // If the user types a subspace before choosing space_name, warn once (until they pick a space or clear subspace)
+  useEffect(() => {
+    const hasSub = subspace.trim().length > 0;
+    const hasSpace = Boolean(spaceName?.trim());
+    if (hasSub && !hasSpace) {
+      if (!subspaceBeforeSpaceNameWarnedRef.current) {
+        toast.warning('Select a space name first, then enter your subspace.');
+        subspaceBeforeSpaceNameWarnedRef.current = true;
+      }
+    } else {
+      subspaceBeforeSpaceNameWarnedRef.current = false;
+    }
+  }, [subspace, spaceName]);
+
   // Check space availability when subspace or spaceName changes
   useEffect(() => {
     const checkAvailability = async () => {
@@ -1880,8 +2528,19 @@ export default function SpacesScreen() {
         const duration = endTime - startTime;
 
         if (!response.ok) {
+          let bodyPreview = '';
+          try {
+            bodyPreview = (await response.text()).slice(0, 500);
+          } catch {
+            /* ignore */
+          }
+          const hint =
+            response.status === 503 || response.status === 502
+              ? ' (server/CGI unavailable or overloaded — retry later)'
+              : '';
           console.error(
-            `[Spaces API] GET ${url} - HTTP error! status: ${response.status} (${duration}ms)`
+            `[Spaces API] GET ${url} - HTTP ${response.status} ${response.statusText}${hint} (${duration}ms)`,
+            bodyPreview ? `body: ${bodyPreview}` : 'empty body'
           );
           throw new Error(`HTTP error! status: ${response.status}`);
         }
@@ -2074,8 +2733,15 @@ export default function SpacesScreen() {
         if (activeSpaces.length > 0) {
           console.log('[Spaces] Resuming polling for', activeSpaces.length, 'active jobs');
           activeSpaces.forEach(
-            (space: { jobId: number; subspace: string; spaceName: string }) => {
-              pollJobStatus(space.jobId, space.spaceName, space.subspace).catch((error) => {
+            (space: {
+              jobId: number;
+              subspace: string;
+              spaceName: string;
+              unifiedStatusPurchaseType?: 'subname' | 'pointer';
+            }) => {
+              pollJobStatus(space.jobId, space.spaceName, space.subspace, {
+                unifiedStatusPurchaseType: space.unifiedStatusPurchaseType ?? 'subname',
+              }).catch((error) => {
                 console.error(
                   '[Spaces] Failed to resume polling for job',
                   space.jobId,
@@ -2509,7 +3175,14 @@ export default function SpacesScreen() {
         <View style={styles.section}>
           <View style={styles.sectionHeader}>
             <AtSign size={20} color={colors.primary} />
-            <Text style={styles.sectionTitle}>My Spaces</Text>
+            <TouchableOpacity
+              onPress={handleRefreshAllMySpacesStatuses}
+              activeOpacity={1}
+              accessibilityRole="button"
+              accessibilityLabel="My Spaces, refresh all handle statuses"
+            >
+              <Text style={styles.sectionTitle}>My Spaces</Text>
+            </TouchableOpacity>
           </View>
 
           {mySpaces.length === 0 ? (
