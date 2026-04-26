@@ -3197,9 +3197,9 @@ export default function SpacesScreen() {
             <View style={styles.tableContainer}>
               {/* Table Header */}
               <View style={styles.tableHeader}>
-                <Text style={styles.tableHeaderText}>Space</Text>
-                <Text style={styles.tableHeaderText}>Status</Text>
-                <Text style={styles.tableHeaderText}>Next Check</Text>
+                <Text style={[styles.tableHeaderText, styles.tableHeaderColSpace]}>Space</Text>
+                <Text style={[styles.tableHeaderText, styles.tableHeaderColStatus]}>Status</Text>
+                <Text style={[styles.tableHeaderText, styles.tableHeaderColCheck]}>Check</Text>
               </View>
               {/* Table Rows */}
               {mySpaces.map((space, index) => {
@@ -3213,7 +3213,7 @@ export default function SpacesScreen() {
                     style={[styles.tableRow, index === mySpaces.length - 1 && styles.tableRowLast]}
                   >
                     <TouchableOpacity
-                      style={styles.tableCellSpace}
+                      style={[styles.tableCellSpace, styles.tableColSpace]}
                       onPress={() => handleSubspaceSelect(space)}
                       activeOpacity={0.7}
                     >
@@ -3221,11 +3221,13 @@ export default function SpacesScreen() {
                         {space.subspace}@{space.spaceName}
                       </Text>
                     </TouchableOpacity>
-                    <View style={styles.tableCellStatus}>
-                      <Text style={styles.tableCellStatusText}>{statusText}</Text>
+                    <View style={[styles.tableCellStatus, styles.tableColStatus]}>
+                      <Text style={styles.tableCellStatusText} numberOfLines={1}>
+                        {statusText}
+                      </Text>
                     </View>
-                    <View style={styles.tableCellNextCheck}>
-                      <Text style={styles.tableCellNextCheckText}>
+                    <View style={[styles.tableCellNextCheck, styles.tableColCheck]}>
+                      <Text style={styles.tableCellNextCheckText} numberOfLines={1}>
                         {showCountdown && timeUntilNextCheck !== null
                           ? `${timeUntilNextCheck} min`
                           : '-'}
@@ -3778,11 +3780,22 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
   },
   tableHeaderText: {
-    flex: 1,
     fontSize: 14,
     fontWeight: '600',
     color: colors.text,
     textTransform: 'uppercase',
+  },
+  /** ~64% of row; Space column gets most width. */
+  tableHeaderColSpace: {
+    flex: 4,
+    minWidth: 0,
+  },
+  tableHeaderColStatus: {
+    flex: 1,
+  },
+  tableHeaderColCheck: {
+    flex: 1,
+    textAlign: 'right',
   },
   tableRow: {
     flexDirection: 'row',
@@ -3793,8 +3806,17 @@ const styles = StyleSheet.create({
   tableRowLast: {
     borderBottomWidth: 0,
   },
-  tableCellSpace: {
+  tableColSpace: {
+    flex: 4,
+    minWidth: 0,
+  },
+  tableColStatus: {
     flex: 1,
+  },
+  tableColCheck: {
+    flex: 1,
+  },
+  tableCellSpace: {
     paddingVertical: 12,
     paddingHorizontal: 16,
     justifyContent: 'center',
@@ -3805,9 +3827,9 @@ const styles = StyleSheet.create({
     color: colors.primary,
   },
   tableCellStatus: {
-    flex: 1,
     paddingVertical: 12,
-    paddingHorizontal: 16,
+    paddingLeft: 8,
+    paddingRight: 8,
     justifyContent: 'center',
   },
   tableCellStatusText: {
@@ -3815,9 +3837,9 @@ const styles = StyleSheet.create({
     color: colors.textSecondary,
   },
   tableCellNextCheck: {
-    flex: 1,
     paddingVertical: 12,
-    paddingHorizontal: 16,
+    paddingLeft: 8,
+    paddingRight: 12,
     justifyContent: 'center',
   },
   tableCellNextCheckText: {
