@@ -33,10 +33,10 @@
     "@react-navigation/elements": "^2.6.3",
     "@react-navigation/native": "^7.1.8",
     "@reduxjs/toolkit": "^2.9.0",
-    "@tetherto/pear-wrk-wdk": "file:../pear-wrk-wdk",
+    "@tetherto/pear-wrk-wdk": "npm:@spacesops/pear-wrk-wdk@^1.0.0-beta.27",
     "@tetherto/wdk-pricing-bitfinex-http": "^1.0.0-beta.1",
     "@tetherto/wdk-pricing-provider": "^1.0.0-beta.1",
-    "@tetherto/wdk-react-native-provider": "file:../wdk-react-native-provider",
+    "@tetherto/wdk-react-native-provider": "npm:@spaceops/wdk-react-native-provider@^1.0.0-beta.29",
     "@tetherto/wdk-uikit-react-native": "^1.0.0-beta.2",
     "@ton/core": "^0.62.0",
     "b4a": "^1.7.2",
@@ -112,7 +112,7 @@
     "react-native": "0.81.4"
   },
   "overrides": {
-    "@spacesops/wdk-wallet-btc": "file:/Users/i830671/git/wdk-wallet-btc",
-    "@wdk/wallet-btc": "file:/Users/i830671/git/wdk-wallet-btc"
+    "@spacesops/wdk-wallet-btc": "npm:@spacesops/pear-wrk-wdk@^1.0.0-beta.15",
+    "@wdk/wallet-btc": "npm:@spacesops/pear-wrk-wdk@^1.0.0-beta.15"
   }
 }
