@@ -17,6 +17,44 @@ const pearWrkPathSpacesops = path.join(__dirname, '..', 'node_modules', '@spaces
 const pearWrkPathTetherto = path.join(__dirname, '..', 'node_modules', '@tetherto', 'pear-wrk-wdk');
 const pearWrkPath = fs.existsSync(pearWrkPathTetherto) ? pearWrkPathTetherto : pearWrkPathSpacesops;
 const pearWrkImportsFile = path.join(pearWrkPath, 'pack.imports.json');
+const projectRoot = path.join(__dirname, '..');
+
+/**
+ * pear-wrk-wdk postinstall runs create-ws-stubs across hoisted node_modules and
+ * can drop empty bufferutil/utf-8-validate next to @react-native/dev-middleware's ws.
+ * That breaks Expo CLI (ws expects bufferutil.unmask).
+ */
+function removePearWsStubsFromDevMiddleware () {
+  const bases = [
+    path.join(projectRoot, 'node_modules', 'expo', 'node_modules', '@react-native', 'dev-middleware', 'node_modules'),
+    path.join(projectRoot, 'node_modules', '@react-native', 'dev-middleware', 'node_modules'),
+  ];
+  for (const nm of bases) {
+    if (!fs.existsSync(nm)) continue;
+    for (const name of ['bufferutil', 'utf-8-validate']) {
+      const pkgDir = path.join(nm, name);
+      if (!fs.existsSync(pkgDir)) continue;
+      const pkgJson = path.join(pkgDir, 'package.json');
+      const indexJs = path.join(pkgDir, 'index.js');
+      try {
+        const meta = JSON.parse(fs.readFileSync(pkgJson, 'utf8'));
+        const body = fs.existsSync(indexJs) ? fs.readFileSync(indexJs, 'utf8').trim() : '';
+        const isPearStub =
+          meta.version === '1.0.0' &&
+          meta.main === 'index.js' &&
+          body === 'module.exports = {}';
+        if (isPearStub) {
+          fs.rmSync(pkgDir, { recursive: true, force: true });
+          console.log(`Removed pear ws stub from dev-middleware: ${name}`);
+        }
+      } catch (_) {
+        /* ignore */
+      }
+    }
+  }
+}
+
+removePearWsStubsFromDevMiddleware();
 
 // Fix secret manager bundle imports
 if (fs.existsSync(providerPath)) {
@@ -27,6 +65,9 @@ if (fs.existsSync(providerPath)) {
     bufferutil: 'bufferutil',
     'utf-8-validate': 'utf-8-validate',
     'sodium-native': 'sodium-native',
+    'bare-crypto': 'bare-crypto',
+    'bare-tcp': 'bare-tcp',
+    'bare-performance': 'bare-performance',
   };
 
   if (!fs.existsSync(providerImportsFile)) {
@@ -74,6 +115,7 @@ if (fs.existsSync(pearWrkPath)) {
     bufferutil: 'bufferutil',
     'utf-8-validate': 'utf-8-validate',
     'bare-crypto': 'bare-crypto',
+    'bare-performance': 'bare-performance',
     'bare-tcp': 'bare-tcp',
     'sodium-native': 'sodium-native',
   };
@@ -85,17 +127,23 @@ if (fs.existsSync(pearWrkPath)) {
     const existing = JSON.parse(fs.readFileSync(pearWrkImportsFile, 'utf8'));
     const updated = { ...existing, ...workerImportsConfig };
     fs.writeFileSync(pearWrkImportsFile, JSON.stringify(updated, null, 2) + '\n');
-    console.log('Updated pack.imports.json for worker bundle (added bare-crypto)');
+    console.log('Updated pack.imports.json for worker bundle (added bare-crypto/bare-performance)');
   }
   
-  // Remove nested bare-crypto and bare-tcp to ensure bundle uses root versions
+  // Remove nested bare-* modules to ensure bundle uses root versions
   // that match what's linked in the APK (react-native-bare-kit links from root node_modules)
   const nestedBareCrypto = path.join(pearWrkPath, 'node_modules', 'bare-crypto');
+  const nestedBarePerformance = path.join(pearWrkPath, 'node_modules', 'bare-performance');
   const nestedBareTcp = path.join(pearWrkPath, 'node_modules', 'bare-tcp');
   
   if (fs.existsSync(nestedBareCrypto)) {
     fs.rmSync(nestedBareCrypto, { recursive: true, force: true });
     console.log('Removed nested bare-crypto to use root version');
+  }
+
+  if (fs.existsSync(nestedBarePerformance)) {
+    fs.rmSync(nestedBarePerformance, { recursive: true, force: true });
+    console.log('Removed nested bare-performance to use root version');
   }
   
   if (fs.existsSync(nestedBareTcp)) {
