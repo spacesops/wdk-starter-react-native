@@ -123,10 +123,8 @@ The script (./scripts/watch-android-logs.sh) is ready to use. It filters for Rea
 nvm use v22.21.1
 rm -rf node_modules
 rm -f package-lock.json 
-npm install --ignore-scripts
 rm -rf android && rm -rf ios
 //npm run start:clear ???
-npm run prebuild:clean
 npm run postinstall
 npm run android
 
@@ -135,7 +133,9 @@ cd /Users/i830671/git/wdk-react-native-provider && npm run gen:worker-bundle
 
 Regenerate the WDK worklet bundle: Run 
 npm run gen:bundle
- after making changes to wdk-wallet-btc — this re-runs @tetherto/pear-wrk-wdk's gen:mobile-bundle script which should pick up the local override.
+ after making changes to wdk-wallet-btc — this re-runs @tetherto/pear-wrk-wdk's npm npm run prebuild:clean
+install --ignore-scripts
+gen:mobile-bundle script which should pick up the local override.
 
 
 npx expo start --clear
