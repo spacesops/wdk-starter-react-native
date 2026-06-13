@@ -5,7 +5,10 @@
   },
   "build": {
     "base": {
-      "node": "22.21.1"
+      "node": "22.21.1",
+      "env": {
+        "NPM_CONFIG_PRODUCTION": "false"
+      }
     },
     "development": {
       "extends": "base",

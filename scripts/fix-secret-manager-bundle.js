@@ -12,7 +12,6 @@ const { execSync } = require('child_process');
 const projectRoot = path.join(__dirname, '..');
 const providerPath = path.join(projectRoot, 'node_modules', '@tetherto', 'wdk-react-native-provider');
 const providerImportsFile = path.join(providerPath, 'pack.imports.json');
-const providerPackageJsonPath = path.join(providerPath, 'package.json');
 
 const pearWrkPathTetherto = path.join(projectRoot, 'node_modules', '@tetherto', 'pear-wrk-wdk');
 const pearWrkPathSpacesops = path.join(projectRoot, 'node_modules', '@spacesops', 'pear-wrk-wdk');
@@ -177,27 +176,35 @@ function getBundleSkew (bundlePath, addons = BARE_ADDONS) {
   return skew;
 }
 
-function patchProviderBundleScripts () {
-  if (!fs.existsSync(providerPackageJsonPath)) return;
+function getBarePackBin () {
+  const barePackBin = path.join(projectRoot, 'node_modules', '.bin', 'bare-pack');
+  if (!fs.existsSync(barePackBin)) {
+    throw new Error(
+      `bare-pack not found at ${barePackBin}. Ensure bare-pack is installed (production EAS builds need it in dependencies).`,
+    );
+  }
+  return barePackBin;
+}
 
-  const packageJson = JSON.parse(fs.readFileSync(providerPackageJsonPath, 'utf8'));
-  if (!packageJson.scripts) return;
+function runBarePack (bundlePath, importsPath, entryPath) {
+  const barePackBin = getBarePackBin();
+  const command = [
+    `"${barePackBin}"`,
+    getBarePackTargetFlags(),
+    '--linked',
+    `--imports "${importsPath}"`,
+    `--out "${bundlePath}"`,
+    `"${entryPath}"`,
+  ].join(' ');
 
-  const pearWrkImportsAbs = pearWrkImportsFile;
-  const pearWrkSrcAbs = path.join(pearWrkPath, 'src', 'wdk-worklet.js');
-  const secretManagerSrc = path.join(providerPath, 'src', 'worklet', 'wdk-secret-manager-worklet.js');
-
-  const barePackTargets = getBarePackTargetFlags();
-  const targetSummary = process.env.EAS_BUILD_PLATFORM || process.platform;
-
-  packageJson.scripts['gen:worker-bundle'] =
-    `npx bare-pack ${barePackTargets} --linked --imports "${pearWrkImportsAbs}" --out "${WORKER_BUNDLE_PATH}" "${pearWrkSrcAbs}"`;
-
-  packageJson.scripts['gen:secret-manager-bundle'] =
-    `npx bare-pack ${barePackTargets} --linked --imports "${providerImportsFile}" --out "${SECRET_MANAGER_BUNDLE_PATH}" "${secretManagerSrc}"`;
-
-  fs.writeFileSync(providerPackageJsonPath, JSON.stringify(packageJson, null, 2) + '\n');
-  console.log(`Patched provider gen:*-bundle scripts (${targetSummary}, absolute paths, --target flags)`);
+  execSync(command, {
+    stdio: 'inherit',
+    cwd: projectRoot,
+    env: {
+      ...process.env,
+      PATH: `${path.join(projectRoot, 'node_modules', '.bin')}${path.delimiter}${process.env.PATH || ''}`,
+    },
+  });
 }
 
 function updatePackImports () {
@@ -256,22 +263,9 @@ function removeNestedBareModules () {
       console.log(`Removed nested ${addon} to use root version`);
     }
   }
-
-  const pearWrkNodeModules = path.join(pearWrkPath, 'node_modules');
-  if (!fs.existsSync(pearWrkNodeModules)) {
-    try {
-      execSync('npm install --no-save', {
-        cwd: pearWrkPath,
-        stdio: 'pipe',
-      });
-      console.log('Installed dependencies for pear-wrk-wdk (needed for create-ws-stubs)');
-    } catch (error) {
-      console.warn('Failed to install dependencies for pear-wrk-wdk:', error.message);
-    }
-  }
 }
 
-function regenerateBundle (label, scriptName, bundlePath, addons) {
+function regenerateBundle (label, bundlePath, importsPath, entryPath, addons) {
   const skew = getBundleSkew(bundlePath, addons);
   if (skew.length === 0) {
     console.log(`${label} bundle bare-* versions match installed packages`);
@@ -284,14 +278,7 @@ function regenerateBundle (label, scriptName, bundlePath, addons) {
   );
 
   try {
-    execSync(`npm run ${scriptName}`, {
-      cwd: providerPath,
-      stdio: 'inherit',
-      env: {
-        ...process.env,
-        PATH: `${path.join(projectRoot, 'node_modules', '.bin')}${path.delimiter}${process.env.PATH || ''}`,
-      },
-    });
+    runBarePack(bundlePath, importsPath, entryPath);
   } catch (error) {
     throw new Error(`${label} bundle regeneration failed: ${error.message}`);
   }
@@ -311,16 +298,32 @@ function regenerateBundle (label, scriptName, bundlePath, addons) {
 
 removePearWsStubs();
 
-if (!fs.existsSync(providerPath)) {
-  console.log('@tetherto/wdk-react-native-provider not found, skipping bundle fixes');
-  process.exit(0);
+try {
+  if (!fs.existsSync(providerPath)) {
+    console.log('@tetherto/wdk-react-native-provider not found, skipping bundle fixes');
+    process.exit(0);
+  }
+
+  updatePackImports();
+  removeNestedBareModules();
+
+  regenerateBundle(
+    'Worker',
+    WORKER_BUNDLE_PATH,
+    pearWrkImportsFile,
+    path.join(pearWrkPath, 'src', 'wdk-worklet.js'),
+    BARE_ADDONS,
+  );
+  regenerateBundle(
+    'Secret manager',
+    SECRET_MANAGER_BUNDLE_PATH,
+    providerImportsFile,
+    path.join(providerPath, 'src', 'worklet', 'wdk-secret-manager-worklet.js'),
+    ['bare-crypto'],
+  );
+
+  console.log('Bundle configuration fixes applied');
+} catch (error) {
+  console.error(error.message || error);
+  process.exit(1);
 }
-
-updatePackImports();
-removeNestedBareModules();
-patchProviderBundleScripts();
-
-regenerateBundle('Worker', 'gen:worker-bundle', WORKER_BUNDLE_PATH, BARE_ADDONS);
-regenerateBundle('Secret manager', 'gen:secret-manager-bundle', SECRET_MANAGER_BUNDLE_PATH, ['bare-crypto']);
-
-console.log('Bundle configuration fixes applied');

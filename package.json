@@ -96,12 +96,12 @@
     "sodium-javascript": "^0.8.0",
     "sonner-native": "^0.21.1",
     "stream-browserify": "^3.0.0",
-    "stream-http": "^3.2.0"
+    "stream-http": "^3.2.0",
+    "bare-pack": "1.5.1"
   },
   "devDependencies": {
     "@types/b4a": "^1.6.5",
     "@types/react": "~19.1.0",
-    "bare-pack": "1.5.1",
     "eslint": "^9.25.0",
     "eslint-config-expo": "~10.0.0",
     "eslint-config-prettier": "^10.1.8",
