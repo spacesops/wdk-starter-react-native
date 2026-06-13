@@ -20,7 +20,7 @@ const pearWrkPath = fs.existsSync(pearWrkPathTetherto)
   : pearWrkPathSpacesops;
 const pearWrkImportsFile = path.join(pearWrkPath, 'pack.imports.json');
 
-const BARE_ADDONS = ['bare-crypto', 'bare-tcp', 'bare-tls', 'bare-url', 'bare-performance'];
+const BARE_ADDONS = ['bare-crypto', 'bare-tcp', 'bare-tls', 'bare-url'];
 
 const ANDROID_BARE_PACK_TARGETS = [
   'android-arm',
@@ -211,6 +211,43 @@ function getLedgerBitcoinShimPath () {
   return path.join(pearWrkPath, 'shims', 'ledger-bitcoin', 'index.js');
 }
 
+function ensureBarePerformanceShim () {
+  const src = path.join(projectRoot, 'node_modules', 'bare-performance');
+  const dest = path.join(pearWrkPath, 'shims', 'bare-performance');
+  if (!fs.existsSync(src)) {
+    throw new Error(`bare-performance not found at ${src}`);
+  }
+
+  fs.mkdirSync(path.join(pearWrkPath, 'shims'), { recursive: true });
+  fs.cpSync(src, dest, {
+    recursive: true,
+    filter: (entry) =>
+      !entry.includes(`${path.sep}prebuilds${path.sep}`)
+      && !entry.endsWith(`${path.sep}binding.c`)
+      && !entry.endsWith(`${path.sep}CMakeLists.txt`),
+  });
+
+  fs.copyFileSync(
+    path.join(__dirname, 'bare-performance-binding-stub.js'),
+    path.join(dest, 'binding.js'),
+  );
+
+  const pkgJsonPath = path.join(dest, 'package.json');
+  const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf8'));
+  delete pkg.addon;
+  fs.writeFileSync(pkgJsonPath, JSON.stringify(pkg, null, 2) + '\n');
+
+  return dest;
+}
+
+function replaceHoistedBarePerformanceWithShim () {
+  const shim = ensureBarePerformanceShim();
+  const target = path.join(projectRoot, 'node_modules', 'bare-performance');
+  fs.rmSync(target, { recursive: true, force: true });
+  fs.cpSync(shim, target, { recursive: true });
+  console.log('Replaced hoisted bare-performance with JS shim');
+}
+
 function updatePackImports () {
   const secretManagerImportsConfig = {
     http: 'bare-http1',
@@ -240,16 +277,18 @@ function updatePackImports () {
       throw new Error(`ledger-bitcoin shim not found at ${ledgerBitcoinShim}`);
     }
 
+    const barePerformanceShim = ensureBarePerformanceShim();
+
     const workerImportsConfig = {
       http: 'bare-http1',
       http2: 'bare-http1',
       bufferutil: 'bufferutil',
       'utf-8-validate': 'utf-8-validate',
       'bare-crypto': 'bare-crypto',
-      'bare-performance': 'bare-performance',
       'bare-tcp': 'bare-tcp',
       'sodium-native': 'sodium-native',
       'ledger-bitcoin': ledgerBitcoinShim,
+      'bare-performance': path.join(barePerformanceShim, 'index.js'),
     };
     const existing = fs.existsSync(pearWrkImportsFile)
       ? JSON.parse(fs.readFileSync(pearWrkImportsFile, 'utf8'))
@@ -258,7 +297,9 @@ function updatePackImports () {
       pearWrkImportsFile,
       JSON.stringify({ ...existing, ...workerImportsConfig }, null, 2) + '\n',
     );
-    console.log(`Updated pear-wrk-wdk pack.imports.json (ledger-bitcoin -> ${ledgerBitcoinShim})`);
+    console.log(
+      `Updated pear-wrk-wdk pack.imports.json (ledger-bitcoin, bare-performance shims)`,
+    );
   }
 }
 
@@ -317,6 +358,7 @@ try {
   }
 
   updatePackImports();
+  replaceHoistedBarePerformanceWithShim();
   removeNestedBareModules();
 
   regenerateBundle(

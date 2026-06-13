@@ -3,11 +3,7 @@ const getChainsConfig = () => {
     ethereum: {
       chainId: 1,
       blockchain: 'ethereum',
-      // Using LlamaRPC as primary provider (fast, reliable, free)
-      // Alternatives: https://ethereum.publicnode.com, https://1rpc.io/eth
-      // provider: 'https://ethereum.publicnode.com',
-      provider: 'https://1rpc.io/eth',
-      // provider: 'https://eth.llamarpc.com',
+      provider: 'https://ethereum.publicnode.com',
       bundlerUrl: 'https://api.candide.dev/public/v3/ethereum',
       paymasterUrl: 'https://api.candide.dev/public/v3/ethereum',
       paymasterAddress: '0x8b1f6cb5d062aa2ce8d581942bbb960420d875ba',
@@ -52,7 +48,7 @@ const getChainsConfig = () => {
     polygon: {
       chainId: 137,
       blockchain: 'polygon',
-      provider: 'https://1rpc.io/matic',
+      provider: 'https://polygon-bor.publicnode.com',
       bundlerUrl: 'https://api.candide.dev/public/v3/polygon',
       paymasterUrl: 'https://api.candide.dev/public/v3/polygon',
       paymasterAddress: '0x8b1f6cb5d062aa2ce8d581942bbb960420d875ba',
