@@ -1,16 +1,33 @@
 const { getDefaultConfig } = require('expo/metro-config');
+const fs = require('fs');
 const path = require('path');
 const { configureMetroForWDK } = require('@tetherto/wdk-react-native-provider/metro-polyfills');
 
-const config = getDefaultConfig(__dirname);
+const projectRoot = __dirname;
+const appNodeModules = path.resolve(projectRoot, 'node_modules');
 
-// Add watchFolders to watch the local wdk-wallet-btc package directory
-// This is required for Metro to properly watch files outside the project root
+function resolveLocal(relativePath) {
+  return path.resolve(projectRoot, relativePath);
+}
+
+function exists(relativePath) {
+  return fs.existsSync(resolveLocal(relativePath));
+}
+
+function existingPaths(...relativePaths) {
+  return relativePaths.filter(exists).map(resolveLocal);
+}
+
+const localProvider = '../wdk-react-native-provider';
+const localWalletBtc = '../wdk-wallet-btc';
+const localPearWrk = '../pear-wrk-wdk';
+
+const config = getDefaultConfig(projectRoot);
+
+// Optional local monorepo paths for development; omitted on EAS/npm installs.
 config.watchFolders = [
   ...(config.watchFolders || []),
-  path.resolve(__dirname, '../wdk-react-native-provider'),
-  path.resolve(__dirname, '../wdk-wallet-btc'),
-  path.resolve(__dirname, '../pear-wrk-wdk'),
+  ...existingPaths(localProvider, localWalletBtc, localPearWrk),
 ];
 
 const { transformer, resolver } = config;
@@ -25,43 +42,45 @@ config.resolver = {
   assetExts: resolver.assetExts.filter(ext => ext !== 'svg'),
   sourceExts: [...resolver.sourceExts, 'svg'],
   nodeModulesPaths: [
-    path.resolve(__dirname, 'node_modules'),
-    path.resolve(__dirname, '../wdk-react-native-provider/node_modules'),
-    path.resolve(__dirname, '../pear-wrk-wdk/node_modules'),
+    appNodeModules,
+    ...existingPaths(
+      `${localProvider}/node_modules`,
+      `${localPearWrk}/node_modules`,
+    ),
   ],
   alias: {
-    '@': path.resolve(__dirname, 'src'),
+    '@': path.resolve(projectRoot, 'src'),
   },
 };
 
 // Apply WDK polyfills configuration first (handles Node.js core module polyfills)
 const wdkConfig = configureMetroForWDK(config);
 
-// Ensure watchFolders is preserved after WDK config
-// This is critical for Metro to watch the local wdk-wallet-btc package
 wdkConfig.watchFolders = [
   ...(wdkConfig.watchFolders || []),
   ...(config.watchFolders || []),
 ];
 
-// Override node_modules resolution AFTER WDK config to use local wdk-wallet-btc package
-// This ensures our override isn't overwritten by WDK's config
-const appNodeModules = path.resolve(__dirname, 'node_modules');
-wdkConfig.resolver.extraNodeModules = {
+const extraNodeModules = {
   ...(wdkConfig.resolver.extraNodeModules || {}),
-  '@tetherto/pear-wrk-wdk': path.resolve(__dirname, '../pear-wrk-wdk'),
-  '@wdk/wallet-btc': path.resolve(__dirname, '../wdk-wallet-btc'),
-  '@spacesops/wdk-wallet-btc': path.resolve(__dirname, '../wdk-wallet-btc'),
   react: path.resolve(appNodeModules, 'react'),
   'react-native': path.resolve(appNodeModules, 'react-native'),
   'react/jsx-runtime': path.resolve(appNodeModules, 'react/jsx-runtime'),
   'react/jsx-dev-runtime': path.resolve(appNodeModules, 'react/jsx-dev-runtime'),
 };
 
-// Now wrap the WDK's resolveRequest with our custom alias logic
+if (exists(localPearWrk)) {
+  extraNodeModules['@tetherto/pear-wrk-wdk'] = resolveLocal(localPearWrk);
+}
+if (exists(localWalletBtc)) {
+  extraNodeModules['@wdk/wallet-btc'] = resolveLocal(localWalletBtc);
+  extraNodeModules['@spacesops/wdk-wallet-btc'] = resolveLocal(localWalletBtc);
+}
+
+wdkConfig.resolver.extraNodeModules = extraNodeModules;
+
 const wdkResolveRequest = wdkConfig.resolver.resolveRequest;
 
-// Modules that must always resolve to the app's single copy to avoid duplicate instance bugs
 const SINGLETON_MODULES = {
   react: path.resolve(appNodeModules, 'react/index.js'),
   'react/jsx-runtime': path.resolve(appNodeModules, 'react/jsx-runtime.js'),
@@ -70,15 +89,12 @@ const SINGLETON_MODULES = {
 };
 
 wdkConfig.resolver.resolveRequest = (context, moduleName, platform) => {
-  // Force singleton React/RN — prevents duplicate-instance hook crashes from
-  // locally-linked packages (e.g. wdk-react-native-provider) that carry their own node_modules/react
   if (Object.prototype.hasOwnProperty.call(SINGLETON_MODULES, moduleName)) {
     return { type: 'sourceFile', filePath: SINGLETON_MODULES[moduleName] };
   }
 
-  // Handle @/ alias
   if (moduleName.startsWith('@/')) {
-    const resolvedPath = moduleName.replace('@/', path.resolve(__dirname, 'src') + '/');
+    const resolvedPath = moduleName.replace('@/', path.resolve(projectRoot, 'src') + '/');
     try {
       return context.resolveRequest(context, resolvedPath, platform);
     } catch (e) {
@@ -86,17 +102,16 @@ wdkConfig.resolver.resolveRequest = (context, moduleName, platform) => {
     }
   }
 
-  // Handle local wdk-wallet-btc override for Metro bundler
-  if (moduleName === '@wdk/wallet-btc' || moduleName === '@spacesops/wdk-wallet-btc') {
-    const localPackagePath = path.resolve(__dirname, '../wdk-wallet-btc');
-    const indexPath = path.join(localPackagePath, 'index.js');
-    const fs = require('fs');
+  if (
+    (moduleName === '@wdk/wallet-btc' || moduleName === '@spacesops/wdk-wallet-btc') &&
+    exists(localWalletBtc)
+  ) {
+    const indexPath = path.join(resolveLocal(localWalletBtc), 'index.js');
     if (fs.existsSync(indexPath)) {
       return { type: 'sourceFile', filePath: indexPath };
     }
   }
 
-  // Delegate to WDK's resolveRequest
   return wdkResolveRequest(context, moduleName, platform);
 };
 

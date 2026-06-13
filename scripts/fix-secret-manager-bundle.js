@@ -21,40 +21,65 @@ const projectRoot = path.join(__dirname, '..');
 
 /**
  * pear-wrk-wdk postinstall runs create-ws-stubs across hoisted node_modules and
- * can drop empty bufferutil/utf-8-validate next to @react-native/dev-middleware's ws.
- * That breaks Expo CLI (ws expects bufferutil.unmask).
+ * drops empty bufferutil/utf-8-validate stubs. ws requires these only when they
+ * export real functions; empty stubs load successfully but crash at runtime
+ * (bu.unmask is not a function), breaking Expo CLI dev middleware.
  */
-function removePearWsStubsFromDevMiddleware () {
-  const bases = [
-    path.join(projectRoot, 'node_modules', 'expo', 'node_modules', '@react-native', 'dev-middleware', 'node_modules'),
-    path.join(projectRoot, 'node_modules', '@react-native', 'dev-middleware', 'node_modules'),
-  ];
-  for (const nm of bases) {
-    if (!fs.existsSync(nm)) continue;
-    for (const name of ['bufferutil', 'utf-8-validate']) {
-      const pkgDir = path.join(nm, name);
-      if (!fs.existsSync(pkgDir)) continue;
-      const pkgJson = path.join(pkgDir, 'package.json');
-      const indexJs = path.join(pkgDir, 'index.js');
-      try {
-        const meta = JSON.parse(fs.readFileSync(pkgJson, 'utf8'));
-        const body = fs.existsSync(indexJs) ? fs.readFileSync(indexJs, 'utf8').trim() : '';
-        const isPearStub =
-          meta.version === '1.0.0' &&
-          meta.main === 'index.js' &&
-          body === 'module.exports = {}';
-        if (isPearStub) {
-          fs.rmSync(pkgDir, { recursive: true, force: true });
-          console.log(`Removed pear ws stub from dev-middleware: ${name}`);
-        }
-      } catch (_) {
-        /* ignore */
-      }
-    }
+function isPearWsStub (pkgDir) {
+  const pkgJson = path.join(pkgDir, 'package.json');
+  const indexJs = path.join(pkgDir, 'index.js');
+  if (!fs.existsSync(pkgJson)) return false;
+  try {
+    const meta = JSON.parse(fs.readFileSync(pkgJson, 'utf8'));
+    const body = fs.existsSync(indexJs) ? fs.readFileSync(indexJs, 'utf8').trim() : '';
+    return meta.version === '1.0.0' && meta.main === 'index.js' && body === 'module.exports = {}';
+  } catch (_) {
+    return false;
   }
 }
 
-removePearWsStubsFromDevMiddleware();
+function removePearWsStub (pkgDir, label) {
+  if (!fs.existsSync(pkgDir) || !isPearWsStub(pkgDir)) return false;
+  fs.rmSync(pkgDir, { recursive: true, force: true });
+  console.log(`Removed pear ws stub (${label}): ${path.basename(pkgDir)}`);
+  return true;
+}
+
+function removePearWsStubs () {
+  const nodeModulesRoot = path.join(projectRoot, 'node_modules');
+  const stubNames = new Set(['bufferutil', 'utf-8-validate']);
+
+  function walk (dir) {
+    if (!fs.existsSync(dir)) return;
+
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (_) {
+      return;
+    }
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const fullPath = path.join(dir, entry.name);
+
+      // Keep intentional Bare bundle shims (pear-wrk-wdk, wdk-wallet-btc, etc.)
+      if (entry.name === 'shims') continue;
+
+      if (stubNames.has(entry.name)) {
+        const label = path.relative(nodeModulesRoot, fullPath) || 'root';
+        removePearWsStub(fullPath, label);
+        continue;
+      }
+
+      walk(fullPath);
+    }
+  }
+
+  walk(nodeModulesRoot);
+}
+
+removePearWsStubs();
 
 // Fix secret manager bundle imports
 if (fs.existsSync(providerPath)) {
@@ -192,6 +217,78 @@ if (fs.existsSync(providerPackageJsonPath)) {
     }
   }
 }
+
+function getBareCryptoVersion () {
+  const bareCryptoPkg = path.join(projectRoot, 'node_modules', 'bare-crypto', 'package.json');
+  if (!fs.existsSync(bareCryptoPkg)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(bareCryptoPkg, 'utf8')).version;
+  } catch (_) {
+    return null;
+  }
+}
+
+function getLinkedBareCryptoVersion (bundlePath) {
+  if (!fs.existsSync(bundlePath)) return null;
+  try {
+    const content = fs.readFileSync(bundlePath, 'utf8');
+    const match = content.match(/libbare-crypto\.(\d+\.\d+\.\d+)\.so/);
+    return match ? match[1] : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function ensureSecretManagerBundleMatchesBareCrypto () {
+  if (!fs.existsSync(providerPath)) return;
+
+  const bundlePath = path.join(
+    providerPath,
+    'lib',
+    'module',
+    'services',
+    'wdk-service',
+    'wdk-secret-manager-worklet.bundle.js',
+  );
+  const expectedVersion = getBareCryptoVersion();
+  const linkedVersion = getLinkedBareCryptoVersion(bundlePath);
+
+  if (!expectedVersion) {
+    console.log('bare-crypto not found, skipping secret manager bundle check');
+    return;
+  }
+
+  if (linkedVersion === expectedVersion) {
+    console.log(`Secret manager bundle already linked to bare-crypto ${expectedVersion}`);
+    return;
+  }
+
+  console.log(
+    linkedVersion
+      ? `Secret manager bundle links bare-crypto ${linkedVersion}, expected ${expectedVersion} — regenerating`
+      : `Secret manager bundle missing or unreadable — regenerating with bare-crypto ${expectedVersion}`,
+  );
+
+  const { execSync } = require('child_process');
+  try {
+    execSync('npm run gen:secret-manager-bundle', {
+      cwd: providerPath,
+      stdio: 'inherit',
+    });
+    const updatedVersion = getLinkedBareCryptoVersion(bundlePath);
+    if (updatedVersion === expectedVersion) {
+      console.log(`Regenerated secret manager bundle with bare-crypto ${expectedVersion}`);
+    } else {
+      console.warn(
+        `Secret manager bundle regeneration finished but links bare-crypto ${updatedVersion ?? 'unknown'}`,
+      );
+    }
+  } catch (error) {
+    console.warn('Failed to regenerate secret manager bundle:', error.message);
+  }
+}
+
+ensureSecretManagerBundleMatchesBareCrypto();
 
 console.log('Bundle configuration fixes applied');
 

@@ -44,8 +44,6 @@ app-example
 /android
 
 .env
-.npmrc
-
 wdk-wallet-btc/
 spacesops/
 wdk-react-native-provider/

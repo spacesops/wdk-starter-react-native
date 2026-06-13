@@ -2,6 +2,7 @@
   "expo": {
     "name": "Spaces",
     "slug": "spaces-wallet",
+    "owner": "koine",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
@@ -30,7 +31,11 @@
       "statusBar": {
         "style": "light",
         "backgroundColor": "#000000"
-      }
+      },
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO"
+      ]
     },
     "web": {
       "output": "static",
@@ -71,7 +76,8 @@
             "compileSdkVersion": 36,
             "buildToolsVersion": "36.0.0",
             "enableProguardInReleaseBuilds": true,
-            "enableShrinkResourcesInReleaseBuilds": true
+            "enableShrinkResourcesInReleaseBuilds": true,
+            "enableMinifyInReleaseBuilds": true
           }
         }
       ],
@@ -80,6 +86,13 @@
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
-    }
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "5df02f86-b279-4bbd-a63c-d5b2bd79d853"
+      }
+    },
+    "owner": "koine"
   }
 }
