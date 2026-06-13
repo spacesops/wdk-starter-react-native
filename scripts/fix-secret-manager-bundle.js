@@ -23,15 +23,35 @@ const pearWrkImportsFile = path.join(pearWrkPath, 'pack.imports.json');
 
 const BARE_ADDONS = ['bare-crypto', 'bare-tcp', 'bare-tls', 'bare-url', 'bare-performance'];
 
-const BARE_PACK_TARGETS = [
-  '--target ios-arm64',
-  '--target ios-arm64-simulator',
-  '--target ios-x64-simulator',
-  '--target android-arm',
-  '--target android-arm64',
-  '--target android-ia32',
-  '--target android-x64',
-].join(' ');
+const ANDROID_BARE_PACK_TARGETS = [
+  'android-arm',
+  'android-arm64',
+  'android-ia32',
+  'android-x64',
+];
+const IOS_BARE_PACK_TARGETS = [
+  'ios-arm64',
+  'ios-arm64-simulator',
+  'ios-x64-simulator',
+];
+
+function getBarePackTargetFlags () {
+  const easPlatform = process.env.EAS_BUILD_PLATFORM;
+  let targets;
+
+  if (easPlatform === 'android') {
+    targets = ANDROID_BARE_PACK_TARGETS;
+  } else if (easPlatform === 'ios') {
+    targets = IOS_BARE_PACK_TARGETS;
+  } else if (process.platform === 'darwin') {
+    targets = [...IOS_BARE_PACK_TARGETS, ...ANDROID_BARE_PACK_TARGETS];
+  } else {
+    // EAS/Linux local CI: iOS bare targets are unavailable outside macOS
+    targets = ANDROID_BARE_PACK_TARGETS;
+  }
+
+  return targets.map((target) => `--target ${target}`).join(' ');
+}
 
 const WORKER_BUNDLE_PATH = path.join(
   providerPath,
@@ -167,14 +187,17 @@ function patchProviderBundleScripts () {
   const pearWrkSrcAbs = path.join(pearWrkPath, 'src', 'wdk-worklet.js');
   const secretManagerSrc = path.join(providerPath, 'src', 'worklet', 'wdk-secret-manager-worklet.js');
 
+  const barePackTargets = getBarePackTargetFlags();
+  const targetSummary = process.env.EAS_BUILD_PLATFORM || process.platform;
+
   packageJson.scripts['gen:worker-bundle'] =
-    `npx bare-pack ${BARE_PACK_TARGETS} --linked --imports "${pearWrkImportsAbs}" --out "${WORKER_BUNDLE_PATH}" "${pearWrkSrcAbs}"`;
+    `npx bare-pack ${barePackTargets} --linked --imports "${pearWrkImportsAbs}" --out "${WORKER_BUNDLE_PATH}" "${pearWrkSrcAbs}"`;
 
   packageJson.scripts['gen:secret-manager-bundle'] =
-    `npx bare-pack ${BARE_PACK_TARGETS} --linked --imports "${providerImportsFile}" --out "${SECRET_MANAGER_BUNDLE_PATH}" "${secretManagerSrc}"`;
+    `npx bare-pack ${barePackTargets} --linked --imports "${providerImportsFile}" --out "${SECRET_MANAGER_BUNDLE_PATH}" "${secretManagerSrc}"`;
 
   fs.writeFileSync(providerPackageJsonPath, JSON.stringify(packageJson, null, 2) + '\n');
-  console.log('Patched provider gen:*-bundle scripts (absolute paths, --target flags)');
+  console.log(`Patched provider gen:*-bundle scripts (${targetSummary}, absolute paths, --target flags)`);
 }
 
 function updatePackImports () {
@@ -260,10 +283,18 @@ function regenerateBundle (label, scriptName, bundlePath, addons) {
     skew.map(({ addon, linked, installed }) => `${addon} ${linked} -> ${installed}`).join(', '),
   );
 
-  execSync(`npm run ${scriptName}`, {
-    cwd: providerPath,
-    stdio: 'inherit',
-  });
+  try {
+    execSync(`npm run ${scriptName}`, {
+      cwd: providerPath,
+      stdio: 'inherit',
+      env: {
+        ...process.env,
+        PATH: `${path.join(projectRoot, 'node_modules', '.bin')}${path.delimiter}${process.env.PATH || ''}`,
+      },
+    });
+  } catch (error) {
+    throw new Error(`${label} bundle regeneration failed: ${error.message}`);
+  }
 
   const remainingSkew = getBundleSkew(bundlePath, addons);
   if (remainingSkew.length === 0) {
