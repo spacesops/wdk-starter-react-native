@@ -7,11 +7,11 @@
     "start:clear": "expo start --dev-client --clear",
     "android": "npm run rebuild-wdk-bundle && expo run:android",
     "android:prod": "npm run rebuild-wdk-bundle && expo run:android --variant release",
-    "android:build:release": "npm run rebuild-wdk-bundle && cd android && ./gradlew assembleRelease && cd .. && APK_PATH=\"android/app/build/outputs/apk/release/app-release.apk\" && if [ -f \"$APK_PATH\" ]; then echo \"\" && echo \"\u2713 Android production APK built successfully!\" && echo \"\ud83d\udce6 APK Location: $(pwd)/$APK_PATH\" && echo \"\ud83d\udcca File size: $(du -h \"$APK_PATH\" | cut -f1)\" && echo \"\"; else echo \"\u274c Error: APK not found at $APK_PATH\"; exit 1; fi",
+    "android:build:release": "npm run rebuild-wdk-bundle && cd android && ./gradlew assembleRelease && cd .. && APK_PATH=\"android/app/build/outputs/apk/release/app-release.apk\" && if [ -f \"$APK_PATH\" ]; then echo \"\" && echo \"✓ Android production APK built successfully!\" && echo \"📦 APK Location: $(pwd)/$APK_PATH\" && echo \"📊 File size: $(du -h \"$APK_PATH\" | cut -f1)\" && echo \"\"; else echo \"❌ Error: APK not found at $APK_PATH\"; exit 1; fi",
     "ios": "expo run:ios",
     "ios:prod": "expo run:ios --configuration Release",
     "ios:prod:device": "expo run:ios --configuration Release --device",
-    "ios:testflight:prepare": "npm run prebuild && ./scripts/patch-ios-dev-team.sh && echo \"\u2713 iOS project prepared for TestFlight. Opening Xcode...\" && open ios/Spaces.xcworkspace",
+    "ios:testflight:prepare": "npm run prebuild && ./scripts/patch-ios-dev-team.sh && echo \"✓ iOS project prepared for TestFlight. Opening Xcode...\" && open ios/Spaces.xcworkspace",
     "web": "expo start --web",
     "lint": "expo lint",
     "lint:fix": "expo lint --fix",
@@ -41,7 +41,10 @@
     "@tetherto/wdk-react-native-provider": "npm:@spacesops/wdk-react-native-provider@^1.0.0-beta.30",
     "@tetherto/wdk-uikit-react-native": "^1.0.0-beta.2",
     "@ton/core": "^0.62.0",
+    "@wdk/wallet-btc": "npm:@spacesops/wdk-wallet-btc@^1.0.0-beta.15",
     "b4a": "^1.7.2",
+    "bare-pack": "1.5.1",
+    "bare-performance": "^2.0.0",
     "bip39": "^3.1.0",
     "browserify-zlib": "^0.2.0",
     "decimal.js": "^10.6.0",
@@ -74,7 +77,6 @@
     "react-dom": "19.1.0",
     "react-native": "0.81.4",
     "react-native-bare-kit": "^0.10.2",
-    "bare-performance": "^2.0.0",
     "react-native-chart-kit": "^6.12.0",
     "react-native-crypto": "^2.2.1",
     "react-native-device-info": "^14.1.1",
@@ -96,17 +98,16 @@
     "sodium-javascript": "^0.8.0",
     "sonner-native": "^0.21.1",
     "stream-browserify": "^3.0.0",
-    "stream-http": "^3.2.0",
-    "bare-pack": "1.5.1"
+    "stream-http": "^3.2.0"
   },
   "devDependencies": {
     "@types/b4a": "^1.6.5",
     "@types/react": "~19.1.0",
+    "eas-cli": "20.1.0",
     "eslint": "^9.25.0",
     "eslint-config-expo": "~10.0.0",
     "eslint-config-prettier": "^10.1.8",
     "eslint-plugin-prettier": "^5.5.4",
-    "eas-cli": "20.1.0",
     "prettier": "^3.6.2",
     "react-native-svg-transformer": "^1.5.1",
     "sharp-cli": "^5.2.0",
@@ -120,10 +121,7 @@
     "react-native": "0.81.4"
   },
   "overrides": {
-    "@spacesops/wdk-wallet-btc": "npm:@spacesops/pear-wrk-wdk@^1.0.0-beta.15",
-    "@wdk/wallet-btc": "npm:@spacesops/pear-wrk-wdk@^1.0.0-beta.15",
     "bare-pack": "1.5.1",
     "bare-crypto": "1.13.5"
-
   }
 }

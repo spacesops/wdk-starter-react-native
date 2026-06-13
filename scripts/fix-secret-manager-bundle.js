@@ -267,15 +267,17 @@ function removeNestedBareModules () {
 
 function regenerateBundle (label, bundlePath, importsPath, entryPath, addons) {
   const skew = getBundleSkew(bundlePath, addons);
-  if (skew.length === 0) {
+  if (!fs.existsSync(bundlePath)) {
+    console.log(`${label} bundle missing — regenerating`);
+  } else if (skew.length === 0) {
     console.log(`${label} bundle bare-* versions match installed packages`);
     return;
+  } else {
+    console.log(
+      `${label} bundle addon skew detected — regenerating:`,
+      skew.map(({ addon, linked, installed }) => `${addon} ${linked} -> ${installed}`).join(', '),
+    );
   }
-
-  console.log(
-    `${label} bundle addon skew detected — regenerating:`,
-    skew.map(({ addon, linked, installed }) => `${addon} ${linked} -> ${installed}`).join(', '),
-  );
 
   try {
     runBarePack(bundlePath, importsPath, entryPath);
