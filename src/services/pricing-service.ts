@@ -1,13 +1,12 @@
 import { AssetTicker } from '@tetherto/wdk-react-native-provider';
 import DecimalJS from 'decimal.js';
 
-/** Read at request time so EXPO_PUBLIC_SPACES_API_BASE_URL is always used. */
+/** Inlined at build time from EXPO_PUBLIC_SPACES_API_BASE_URL (must use direct process.env access). */
+const SPACES_API_BASE_URL =
+  process.env.EXPO_PUBLIC_SPACES_API_BASE_URL || 'http://192.168.1.111:7264';
+
 function getSpacesApiBaseUrl(): string {
-  const base =
-    typeof process !== 'undefined' && process.env?.EXPO_PUBLIC_SPACES_API_BASE_URL
-      ? process.env.EXPO_PUBLIC_SPACES_API_BASE_URL
-      : '';
-  return base || 'http://192.168.1.111:7264';
+  return SPACES_API_BASE_URL;
 }
 
 export function getPricingServiceHostname(): string {

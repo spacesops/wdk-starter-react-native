@@ -18,7 +18,7 @@ echo "Pushing environment variables from $ENV_FILE to EAS..."
 echo "  Environments: development, preview, production"
 echo ""
 
-npx eas-cli env:push \
+npx eas env:push \
   --path "$ENV_FILE" \
   --environment development \
   --environment preview \
