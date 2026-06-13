@@ -207,6 +207,10 @@ function runBarePack (bundlePath, importsPath, entryPath) {
   });
 }
 
+function getLedgerBitcoinShimPath () {
+  return path.join(pearWrkPath, 'shims', 'ledger-bitcoin', 'index.js');
+}
+
 function updatePackImports () {
   const secretManagerImportsConfig = {
     http: 'bare-http1',
@@ -231,6 +235,11 @@ function updatePackImports () {
   }
 
   if (fs.existsSync(pearWrkPath)) {
+    const ledgerBitcoinShim = getLedgerBitcoinShimPath();
+    if (!fs.existsSync(ledgerBitcoinShim)) {
+      throw new Error(`ledger-bitcoin shim not found at ${ledgerBitcoinShim}`);
+    }
+
     const workerImportsConfig = {
       http: 'bare-http1',
       http2: 'bare-http1',
@@ -240,6 +249,7 @@ function updatePackImports () {
       'bare-performance': 'bare-performance',
       'bare-tcp': 'bare-tcp',
       'sodium-native': 'sodium-native',
+      'ledger-bitcoin': ledgerBitcoinShim,
     };
     const existing = fs.existsSync(pearWrkImportsFile)
       ? JSON.parse(fs.readFileSync(pearWrkImportsFile, 'utf8'))
@@ -248,7 +258,7 @@ function updatePackImports () {
       pearWrkImportsFile,
       JSON.stringify({ ...existing, ...workerImportsConfig }, null, 2) + '\n',
     );
-    console.log('Updated pear-wrk-wdk pack.imports.json');
+    console.log(`Updated pear-wrk-wdk pack.imports.json (ledger-bitcoin -> ${ledgerBitcoinShim})`);
   }
 }
 
