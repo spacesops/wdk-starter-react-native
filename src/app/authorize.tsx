@@ -1,74 +1,150 @@
 import { useWallet } from '@tetherto/wdk-react-native-provider';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
-import { Fingerprint, Shield } from 'lucide-react-native';
-import React, { useEffect, useState } from 'react';
-import { ActivityIndicator, Alert, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { Shield } from 'lucide-react-native';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { ActivityIndicator, Alert, Pressable, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import parseWorkletError from '@/utils/parse-worklet-error';
 import { colors } from '@/constants/colors';
 import getErrorMessage from '@/utils/get-error-message';
+import {
+  findAddressDrift,
+  formatAddressDriftMessage,
+  loadStoredWalletAddresses,
+} from '@/utils/wallet-address-guard';
+
+/** Brief pause after WDK init before keychain biometric prompt (worklet settle). */
+const UNLOCK_READY_DELAY_MS = 450;
+
+function isBiometricUserCancel(message: string): boolean {
+  return message.includes('code: 10');
+}
+
+function isBiometricLockedOut(message: string): boolean {
+  return message.includes('code: 13');
+}
+
+function isBiometricTooManyAttempts(message: string): boolean {
+  return message.includes('code: 7');
+}
+
+function isSecureStorageUnlockError(message: string): boolean {
+  const lower = message.toLowerCase();
+  return (
+    lower.includes('secure storage') ||
+    lower.includes('biometric') ||
+    lower.includes('keychain') ||
+    lower.includes('could not read wallet') ||
+    lower.includes('could not load wallet seed')
+  );
+}
 
 export default function AuthorizeScreen() {
   const insets = useSafeAreaInsets();
   const router = useDebouncedNavigation();
-  const { wallet, unlockWallet } = useWallet();
-  const [isLoading, setIsLoading] = useState(false);
+  const { wallet, unlockWallet, isInitialized, isUnlocked } = useWallet();
+  const [isUnlocking, setIsUnlocking] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const unlockInFlightRef = useRef(false);
+  const hasAutoTriggeredRef = useRef(false);
 
-  useEffect(() => {
-    handleAuthorize();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  const handleAuthorize = useCallback(async () => {
+    if (unlockInFlightRef.current) {
+      return;
+    }
 
-  const handleAuthorize = async () => {
+    if (!isInitialized) {
+      return;
+    }
+
     if (!wallet) {
       Alert.alert('Error', 'No wallet found');
       router.replace('/onboarding');
       return;
     }
 
-    setIsLoading(true);
+    unlockInFlightRef.current = true;
+    setIsUnlocking(true);
     setError(null);
+
+    const addressesBeforeUnlock = await loadStoredWalletAddresses();
 
     try {
       const isDone = await unlockWallet();
-      if (isDone) {
-        router.replace('/wallet');
+      if (!isDone) {
+        setError('Could not unlock wallet. Tap the screen to try again.');
+        return;
       }
-    } catch (error) {
-      const message = getErrorMessage(error, 'Failed to unlock wallet');
 
-      // Code 10 = USER_CANCELED — user dismissed the prompt intentionally, not an error
-      if (message.includes('code: 10')) {
+      const addressesAfterUnlock = await loadStoredWalletAddresses();
+      const drift = findAddressDrift(addressesBeforeUnlock, addressesAfterUnlock);
+      if (drift.length > 0) {
+        console.warn('[Authorize] Address drift detected after unlock:', drift);
+        Alert.alert('Address mismatch', formatAddressDriftMessage(drift));
+      }
+
+      router.replace('/wallet');
+    } catch (unlockError) {
+      const message = getErrorMessage(unlockError, 'Failed to unlock wallet');
+
+      if (isBiometricUserCancel(message)) {
         setError(null);
         return;
       }
 
-      // Code 13 = biometrics locked out after too many attempts
-      if (message.includes('code: 13')) {
-        setError('Biometrics locked. Use your device PIN to unlock.');
+      if (isBiometricLockedOut(message)) {
+        setError('Biometrics locked. Use your device PIN, then tap the screen to try again.');
         return;
       }
 
-      // Code 7 = too many failed attempts
-      if (message.includes('code: 7')) {
-        setError('Too many attempts. Please try again in a moment.');
+      if (isBiometricTooManyAttempts(message)) {
+        setError('Too many attempts. Tap the screen to try again in a moment.');
         return;
       }
 
-      console.error('Failed to unlock wallet:', error);
-      setError('Authentication failed. Please try again.');
+      if (isSecureStorageUnlockError(message)) {
+        setError('Could not access your wallet keys. Tap the screen to try again.');
+        return;
+      }
+
+      console.error('Failed to unlock wallet:', unlockError);
+      setError('Authentication failed. Tap the screen to try again.');
     } finally {
-      setIsLoading(false);
+      unlockInFlightRef.current = false;
+      setIsUnlocking(false);
     }
-  };
+  }, [isInitialized, router, unlockWallet, wallet]);
 
-  const handleBiometricAuth = async () => {
-    handleAuthorize();
-  };
+  useEffect(() => {
+    if (isUnlocked) {
+      router.replace('/wallet');
+      return;
+    }
+
+    if (!isInitialized || !wallet || hasAutoTriggeredRef.current) {
+      return;
+    }
+
+    hasAutoTriggeredRef.current = true;
+    const timer = setTimeout(() => {
+      handleAuthorize();
+    }, UNLOCK_READY_DELAY_MS);
+
+    return () => clearTimeout(timer);
+  }, [handleAuthorize, isInitialized, isUnlocked, router, wallet]);
+
+  const isPreparing = !isInitialized || !wallet;
+  const showSpinner = isPreparing || isUnlocking;
 
   return (
-    <View style={[styles.container, { paddingTop: insets.top }]}>
+    <Pressable
+      style={[styles.container, { paddingTop: insets.top }]}
+      onPress={() => {
+        if (!isUnlocking && !isPreparing) {
+          handleAuthorize();
+        }
+      }}
+      disabled={isUnlocking || isPreparing}
+    >
       <View style={styles.content}>
         <View style={styles.iconContainer}>
           <Shield size={80} color={colors.primary} />
@@ -77,22 +153,13 @@ export default function AuthorizeScreen() {
         <Text style={styles.title}>Authorize Access</Text>
         <Text style={styles.subtitle}>Verify your identity to access your wallet</Text>
 
-        {isLoading ? (
+        {showSpinner && (
           <View style={styles.loadingContainer}>
             <ActivityIndicator size="large" color={colors.primary} />
-            <Text style={styles.loadingText}>Initializing wallet...</Text>
+            <Text style={styles.loadingText}>
+              {isPreparing ? 'Preparing wallet...' : 'Unlocking wallet...'}
+            </Text>
           </View>
-        ) : (
-          <>
-            <TouchableOpacity
-              style={styles.primaryButton}
-              onPress={handleBiometricAuth}
-              disabled={isLoading}
-            >
-              <Fingerprint size={24} color={colors.white} />
-              <Text style={styles.primaryButtonText}>Use Biometric</Text>
-            </TouchableOpacity>
-          </>
         )}
 
         {error && (
@@ -105,7 +172,7 @@ export default function AuthorizeScreen() {
       <View style={[styles.footer, { marginBottom: insets.bottom + 20 }]}>
         <Text style={styles.footerText}>Your wallet is encrypted and secured with your device</Text>
       </View>
-    </View>
+    </Pressable>
   );
 }
 
@@ -143,41 +210,6 @@ const styles = StyleSheet.create({
     color: colors.textSecondary,
     marginTop: 16,
     fontSize: 14,
-  },
-  primaryButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: colors.primary,
-    paddingHorizontal: 32,
-    paddingVertical: 16,
-    borderRadius: 12,
-    width: '100%',
-    marginBottom: 16,
-  },
-  primaryButtonText: {
-    color: colors.text,
-    fontSize: 16,
-    fontWeight: '600',
-    marginLeft: 12,
-  },
-  secondaryButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: colors.card,
-    paddingHorizontal: 32,
-    paddingVertical: 16,
-    borderRadius: 12,
-    width: '100%',
-    borderWidth: 1,
-    borderColor: colors.border,
-  },
-  secondaryButtonText: {
-    color: colors.primary,
-    fontSize: 16,
-    fontWeight: '600',
-    marginLeft: 12,
   },
   errorContainer: {
     marginTop: 20,

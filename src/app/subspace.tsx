@@ -26,6 +26,7 @@ import {
   fullPathToWalletRelativePath,
   getBitcoinTaprootPathPrefix,
 } from '@/utils/spaces-scan-paths';
+import { buildPaymentWatchRequestBody } from '@/utils/build-payment-watch-body';
 import { WDKSpaces, type UpdateOnchainHexParams } from '@/utils/wdk-spaces';
 import {
   conservativePointerPaymentFeeSats,
@@ -346,7 +347,7 @@ async function postWatchPaymentSpecOnce(
   const method = (spec.method || 'POST').toUpperCase();
   const start = Date.now();
   try {
-    const bodyObj = { ...(spec.body ?? {}), transaction_id: transactionId };
+    const bodyObj = buildPaymentWatchRequestBody(spec.body, transactionId);
     const res = await fetch(url, {
       method,
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },

@@ -220,4 +220,4 @@ If this subname has a **bundled** pointer row `456`, pointer steps use purchase 
 
 ## See also
 
-- **`PURCHASE.md`** — `purchase_type`, POST/DELETE/PUT on `/spaces/...`, and **`GET /api/purchases/:spaceName/:subspace/status`**
+- **`PURCHASE.md`** — `purchase_type`, POST/DELETE/PUT on `/spaces/...`, watch-payment / payment callback, Spaces Wallet client timeline, and **`GET /api/purchases/:spaceName/:subspace/status`**

@@ -15,7 +15,7 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { colors } from '@/constants/colors';
-import { pricingService, FiatCurrency } from '@/services/pricing-service';
+import { pricingService, FiatCurrency, getPricingServiceHostname } from '@/services/pricing-service';
 import {
   AssetTicker,
   NetworkType,
@@ -29,6 +29,8 @@ import {
   fullPathToWalletRelativePath,
   getBitcoinTaprootPathPrefix,
 } from '@/utils/spaces-scan-paths';
+import { buildPaymentWatchRequestBody } from '@/utils/build-payment-watch-body';
+import { resolveNextAvailableTaprootPath } from '@/utils/resolve-next-spaces-path';
 import { WDKSpaces } from '@/utils/wdk-spaces';
 import { registerPurchaseStatusPollStarter } from '@/utils/purchase-poll-bridge';
 import * as Clipboard from 'expo-clipboard';
@@ -191,14 +193,15 @@ async function postJobsWatchPayment(
   spec: PaymentWatchSpec,
   jobId: number,
   transactionId: string,
-  logLabel: string
+  logLabel: string,
+  scriptPubKeyHex?: string
 ): Promise<{ ok: boolean; purchaseId?: number }> {
   if (!spec.path) {
     return { ok: false };
   }
   const url = buildWatchPaymentRequestUrl(baseUrl, spec.path, jobId);
   const method = (spec.method || 'POST').toUpperCase();
-  const body = { ...(spec.body ?? {}), transaction_id: transactionId };
+  const body = buildPaymentWatchRequestBody(spec.body, transactionId, { scriptPubKeyHex });
   const start = Date.now();
   try {
     const res = await fetch(url, {
@@ -230,16 +233,18 @@ async function postWatchPaymentFallback(
   jobId: number,
   spaceNameLower: string,
   transactionId: string,
-  logLabel: string
+  logLabel: string,
+  scriptPubKeyHex?: string
 ): Promise<{ ok: boolean; purchaseId?: number }> {
   const b = baseUrl.replace(/\/$/, '');
   const url = `${b}/api/jobs/${jobId}/watch-payment?space=${encodeURIComponent(spaceNameLower)}`;
   const start = Date.now();
+  const body = buildPaymentWatchRequestBody(undefined, transactionId, { scriptPubKeyHex });
   try {
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ transaction_id: transactionId }),
+      body: JSON.stringify(body),
     });
     const ms = Date.now() - start;
     if (!res.ok) {
@@ -261,6 +266,193 @@ async function postWatchPaymentFallback(
     console.error(`[Spaces] watch-payment fallback [${logLabel}]`, e);
     return { ok: false };
   }
+}
+
+/** Server recognizes txids with this prefix as simulated (no on-chain payment). */
+const SIMULATED_TXID_PREFIX = 'decafcafe';
+
+function buildSimulatedTransactionId(jobId: number): string {
+  const prefix = SIMULATED_TXID_PREFIX;
+  const jobHex = jobId.toString(16).padStart(12, '0');
+  const timeHex = Date.now().toString(16).padStart(12, '0');
+  const tail = `${jobHex}${timeHex}`.slice(0, 64 - prefix.length);
+  return `${prefix}${tail}`.padEnd(64, '0').slice(0, 64);
+}
+
+type PostPurchaseWatchState = {
+  primary: PaymentWatchSpec | null;
+  pointer: PaymentWatchSpec | null;
+  primaryJobId: number | null;
+  pointerJobId: number | null;
+} | null;
+
+async function registerPurchasePaymentOnServer(params: {
+  baseUrl: string;
+  transactionId: string;
+  jobId: number;
+  spaceNameLower: string;
+  subspaceTrimmed: string;
+  handle: string;
+  paymentWatch: PostPurchaseWatchState;
+  pendingPurchaseId?: number;
+  /** First-time purchase: Taproot script pubkey for the reserved wallet path. */
+  scriptPubKeyHex?: string;
+  logLabel: string;
+}): Promise<{ purchaseId?: number; watchOk: boolean; callbackOk: boolean }> {
+  const {
+    baseUrl,
+    transactionId,
+    jobId,
+    spaceNameLower,
+    subspaceTrimmed,
+    handle,
+    paymentWatch,
+    pendingPurchaseId,
+    scriptPubKeyHex,
+    logLabel,
+  } = params;
+
+  let purchaseIdFromWatch: number | undefined;
+  let watchOk = false;
+  const w = paymentWatch;
+  const primaryJobId = w?.primaryJobId ?? jobId;
+
+  if (w?.primary && primaryJobId != null) {
+    const r = await postJobsWatchPayment(
+      baseUrl,
+      w.primary,
+      primaryJobId,
+      transactionId,
+      `${logLabel}-primary`,
+      scriptPubKeyHex
+    );
+    if (r.purchaseId != null) {
+      purchaseIdFromWatch = r.purchaseId;
+    }
+    watchOk = r.ok;
+    if (!r.ok) {
+      const fb = await postWatchPaymentFallback(
+        baseUrl,
+        primaryJobId,
+        spaceNameLower,
+        transactionId,
+        `${logLabel}-primary-fallback`,
+        scriptPubKeyHex
+      );
+      if (fb.purchaseId != null) {
+        purchaseIdFromWatch = fb.purchaseId;
+      }
+      watchOk = watchOk || fb.ok;
+    }
+  } else if (primaryJobId != null) {
+    const fb = await postWatchPaymentFallback(
+      baseUrl,
+      primaryJobId,
+      spaceNameLower,
+      transactionId,
+      `${logLabel}-primary`,
+      scriptPubKeyHex
+    );
+    if (fb.purchaseId != null) {
+      purchaseIdFromWatch = fb.purchaseId;
+    }
+    watchOk = fb.ok;
+  }
+
+  if (w?.pointer && w.pointerJobId != null) {
+    const pr = await postJobsWatchPayment(
+      baseUrl,
+      w.pointer,
+      w.pointerJobId,
+      transactionId,
+      `${logLabel}-pointer`,
+      scriptPubKeyHex
+    );
+    if (pr.purchaseId != null) {
+      purchaseIdFromWatch = pr.purchaseId;
+    }
+    watchOk = watchOk && pr.ok;
+    if (!pr.ok) {
+      const pfb = await postWatchPaymentFallback(
+        baseUrl,
+        w.pointerJobId,
+        spaceNameLower,
+        transactionId,
+        `${logLabel}-pointer-fallback`,
+        scriptPubKeyHex
+      );
+      if (pfb.purchaseId != null) {
+        purchaseIdFromWatch = pfb.purchaseId;
+      }
+      watchOk = watchOk || pfb.ok;
+    }
+  }
+
+  const callbackUrl = `${baseUrl.replace(/\/$/, '')}/api/payments/callback?tenant=${encodeURIComponent(spaceNameLower)}`;
+  const label = handle.includes('@') ? handle : `${subspaceTrimmed}@${spaceNameLower}`;
+
+  let purchaseIdForCallback = pendingPurchaseId;
+  if (purchaseIdForCallback == null) {
+    try {
+      const raw = await AsyncStorage.getItem(`spaces_purchase_${jobId}`);
+      if (raw) {
+        const fromStore = purchaseIdFromRecord(JSON.parse(raw) as Record<string, unknown>);
+        if (fromStore != null) {
+          purchaseIdForCallback = fromStore;
+        }
+      }
+    } catch (e) {
+      console.warn('[Spaces] payment callback: AsyncStorage read failed', e);
+    }
+  }
+  if (purchaseIdForCallback == null && purchaseIdFromWatch != null) {
+    purchaseIdForCallback = purchaseIdFromWatch;
+  }
+
+  let callbackOk = false;
+  if (purchaseIdForCallback != null) {
+    const cbStart = Date.now();
+    try {
+      const res = await fetch(callbackUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          transaction_id: transactionId,
+          label,
+          purchase_id: purchaseIdForCallback,
+          ...(scriptPubKeyHex?.trim() ? { script_pubkey: scriptPubKeyHex.trim() } : {}),
+        }),
+      });
+      const ms = Date.now() - cbStart;
+      if (!res.ok) {
+        const errText = await res.text();
+        console.error(
+          `[Spaces API] POST ${callbackUrl} - HTTP ${res.status} (${ms}ms) [${logLabel}]`,
+          errText
+        );
+      } else {
+        const bodyText = await res.text();
+        console.log(
+          `[Spaces API] POST ${callbackUrl} - Success (${ms}ms) [${logLabel}]`,
+          bodyText || '(empty body)'
+        );
+        callbackOk = true;
+      }
+    } catch (e) {
+      console.error(`[Spaces] POST payment callback failed [${logLabel}]:`, e);
+    }
+  } else {
+    console.warn(
+      `[Spaces] Skipping /api/payments/callback [${logLabel}]: missing purchase_id`,
+      { jobId, hasTxid: !!transactionId }
+    );
+  }
+
+  return {
+    purchaseId: purchaseIdForCallback ?? purchaseIdFromWatch,
+    watchOk,
+    callbackOk,
+  };
 }
 
 function pointerIdsFromPurchaseResponse(data: Record<string, unknown>): {
@@ -425,6 +617,50 @@ interface GetSpacesResponse {
   [key: string]: any;
 }
 
+function parseSpacesApiErrorMessage(errorText: string): string | null {
+  const trimmed = errorText.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = JSON.parse(trimmed) as { message?: unknown; error?: unknown };
+    if (typeof parsed.message === 'string' && parsed.message.trim()) {
+      return parsed.message.trim();
+    }
+    if (typeof parsed.error === 'string' && parsed.error.trim()) {
+      return parsed.error.trim();
+    }
+  } catch {
+    /* plain-text body */
+  }
+  return trimmed.length <= 240 ? trimmed : null;
+}
+
+function formatSpacesApiHttpError(status: number, errorText: string): string {
+  return parseSpacesApiErrorMessage(errorText) ?? `Request failed (HTTP ${status})`;
+}
+
+function shouldRefreshQuoteAfterSpacesApiError(message: string): boolean {
+  return /quote has been cancelled|quote.*cancelled|quote.*expired|invalid quote|quote not found/i.test(
+    message
+  );
+}
+
+class SpacesApiHttpError extends Error {
+  readonly httpStatus: number;
+  readonly refreshQuote: boolean;
+
+  constructor(httpStatus: number, errorText: string) {
+    const message = formatSpacesApiHttpError(httpStatus, errorText);
+    super(message);
+    this.name = 'SpacesApiHttpError';
+    this.httpStatus = httpStatus;
+    this.refreshQuote = shouldRefreshQuoteAfterSpacesApiError(message);
+  }
+}
+
+function throwSpacesApiHttpError(httpStatus: number, errorText: string): never {
+  throw new SpacesApiHttpError(httpStatus, errorText);
+}
+
 export default function SpacesScreen() {
   const insets = useSafeAreaInsets();
   const router = useDebouncedNavigation();
@@ -433,6 +669,13 @@ export default function SpacesScreen() {
   const [spaceName, setSpaceName] = useState<string>('');
   /** Avoid repeating the "select space name first" warning on every subspace keystroke. */
   const subspaceBeforeSpaceNameWarnedRef = useRef(false);
+  /** Throttle pricing-unavailable toasts during the 30s refresh interval. */
+  const pricingUnavailableToastAtRef = useRef(0);
+  /** Latest availability/quote refresh (for stale-quote recovery after POST/PUT failures). */
+  const refreshSpaceQuoteRef = useRef<(() => Promise<void>) | undefined>(undefined);
+  const handleSpacesPurchaseApiErrorRef = useRef<
+    (error: unknown, logContext: string) => void
+  >(() => {});
   /** Set when POST/PUT confirms a purchase so broadcast can POST /api/payments/callback even if mySpaces hasn’t re-rendered yet. */
   const pendingPaymentCallbackRef = useRef<{ jobId: number; purchaseId: number } | null>(null);
   /** From successful POST /spaces/... (PURCHASE.md `payment_watch` / `pointer_payment_watch`); used after broadcast. */
@@ -441,6 +684,13 @@ export default function SpacesScreen() {
     pointer: PaymentWatchSpec | null;
     primaryJobId: number | null;
     pointerJobId: number | null;
+  } | null>(null);
+  /** Taproot path + script pubkey reserved after PUT confirm (first-time purchase). */
+  const purchaseTaprootPathRef = useRef<{
+    fullPath: string;
+    relativePath: string;
+    scriptPubKeyHex: string;
+    address: string;
   } | null>(null);
   const [showDropdown, setShowDropdown] = useState(false);
   const [buttonState, setButtonState] = useState<'available' | 'taken' | 'loading' | null>(null);
@@ -513,6 +763,8 @@ export default function SpacesScreen() {
       hasSptr?: boolean; // Whether this purchase includes SPTR
       /** Taproot script pubkey hex (e.g. from Find Spaces scan); used for listnums-by-spk. */
       scriptPubKeyHex?: string;
+      /** BIP-86 full derivation path when reserved at purchase time. */
+      taprootDerivationPath?: string;
       /** Set on space details when purchase status was unknown; from GET /api/listnums-by-spk. */
       chainPresence?: 'on-chain' | 'off-chain';
       /** Last `nums` entry `data` when chainPresence is on-chain. */
@@ -768,7 +1020,7 @@ export default function SpacesScreen() {
         .filter((h): h is string => typeof h === 'string' && h.length > 0);
       if (scriptPubkeys.length > 0) {
         try {
-          const findHandlesUrl = `${SPACES_API_BASE_URL}/api/subsd/find-handles`;
+          const findHandlesUrl = `${SPACES_API_BASE_URL}/api/subsd/find-handles?app=${SPACES_APP_NAME}`;
           console.log('[Spaces] Find Spaces — POST', findHandlesUrl, { script_pubkeys: scriptPubkeys });
           const findRes = await fetch(findHandlesUrl, {
             method: 'POST',
@@ -1087,7 +1339,6 @@ export default function SpacesScreen() {
     console.log('[Spaces] Current jobId:', currentJobId);
     console.log('[Spaces] Current jobData:', currentJobData);
 
-    // Close the modal first
     setShowTxHexModal(false);
 
     if (!currentJobId || !currentJobData) {
@@ -1095,22 +1346,68 @@ export default function SpacesScreen() {
         currentJobId,
         currentJobData,
       });
-      toast.info('Simulation will be implemented soon');
+      toast.error('Cannot simulate: purchase job not ready. Complete the purchase flow first.');
       return;
     }
 
     const { handle, subspace: currentSubspace, spaceName: currentSpaceName } = currentJobData;
+    const spaceNameLower = currentSpaceName.toLowerCase();
+    const simulatedTxid = buildSimulatedTransactionId(currentJobId);
 
-    // Add subspace to My Spaces and start polling
+    console.log('[Spaces] Simulated payment txid:', simulatedTxid);
+
+    const spaceEntry = mySpaces.find(
+      (s) => s.subspace === currentSubspace && s.spaceName === spaceNameLower
+    );
+    const pendingPurchaseId =
+      spaceEntry?.purchaseId ??
+      (pendingPaymentCallbackRef.current?.jobId === currentJobId
+        ? pendingPaymentCallbackRef.current.purchaseId
+        : undefined);
+    const scriptPubKeyHex =
+      purchaseTaprootPathRef.current?.scriptPubKeyHex?.trim() ??
+      spaceEntry?.scriptPubKeyHex?.trim();
+
+    let registration: { purchaseId?: number; watchOk: boolean; callbackOk: boolean };
+    try {
+      registration = await registerPurchasePaymentOnServer({
+        baseUrl: SPACES_API_BASE_URL,
+        transactionId: simulatedTxid,
+        jobId: currentJobId,
+        spaceNameLower,
+        subspaceTrimmed: currentSubspace,
+        handle,
+        paymentWatch: postPurchaseWatchRef.current,
+        pendingPurchaseId,
+        scriptPubKeyHex,
+        logLabel: 'simulate',
+      });
+    } catch (error) {
+      console.error('[Spaces] Simulated payment registration failed:', error);
+      toast.error('Failed to register simulated payment with the server.');
+      return;
+    }
+
+    const { purchaseId, watchOk, callbackOk } = registration;
+    console.log('[Spaces] Simulated payment registration:', {
+      purchaseId,
+      watchOk,
+      callbackOk,
+      simulatedTxid,
+    });
+
     const newSpace = {
       subspace: currentSubspace,
-      spaceName: currentSpaceName,
+      spaceName: spaceNameLower,
       handle,
-      status: 'pending' as const,
+      status: 'processing' as UnifiedStatus,
       jobId: currentJobId,
+      ...(purchaseId != null ? { purchaseId } : {}),
+      ...(scriptPubKeyHex ? { scriptPubKeyHex } : {}),
+      ...(purchaseTaprootPathRef.current?.fullPath
+        ? { taprootDerivationPath: purchaseTaprootPathRef.current.fullPath }
+        : {}),
     };
-
-    console.log('[Spaces] Adding space to My Spaces:', newSpace);
 
     setMySpaces((prev) => {
       const existingIndex = prev.findIndex(
@@ -1118,20 +1415,23 @@ export default function SpacesScreen() {
       );
       if (existingIndex >= 0) {
         const updated = [...prev];
-        updated[existingIndex] = { ...updated[existingIndex], jobId: currentJobId };
+        updated[existingIndex] = { ...updated[existingIndex], ...newSpace };
         return updated;
       }
       return [...prev, newSpace];
     });
 
-    console.log('[Spaces] Starting polling for job:', currentJobId);
-
-    // Start polling
-    pollJobStatus(currentJobId, currentSpaceName, currentSubspace).catch((error) => {
+    pollJobStatus(currentJobId, spaceNameLower, currentSubspace).catch((error) => {
       console.error('[Spaces] Polling failed:', error);
     });
 
-    toast.info('Simulation started - monitoring job status');
+    if (watchOk && callbackOk) {
+      toast.success(`Simulation started (${simulatedTxid.slice(0, 16)}…)`);
+    } else if (watchOk || callbackOk) {
+      toast.info('Simulation partially registered — monitoring job status');
+    } else {
+      toast.error('Could not register simulated payment. Polling job status anyway.');
+    }
   };
 
   const handleBroadcast = async () => {
@@ -1174,155 +1474,69 @@ export default function SpacesScreen() {
 
       const currentSpaceNameLower = spaceName.toLowerCase();
       const currentSubspaceTrimmed = subspace.trim();
+      const broadcastHandle =
+        purchaseData?.handle ??
+        currentJobData?.handle ??
+        `${currentSubspaceTrimmed}@${currentSpaceNameLower}`;
 
-      // Register payment tx for watching (PURCHASE.md) — same txid as /api/payments/callback, after POST /spaces/... we stored payment_watch
-      let purchaseIdFromWatch: number | undefined;
-      if (hashStr) {
-        const w = postPurchaseWatchRef.current;
-        const primaryJobId = w?.primaryJobId ?? currentJobId;
-        if (w?.primary && primaryJobId != null) {
-          const r = await postJobsWatchPayment(
-            SPACES_API_BASE_URL,
-            w.primary,
-            primaryJobId,
-            hashStr,
-            'primary'
-          );
-          if (r.purchaseId != null) {
-            purchaseIdFromWatch = r.purchaseId;
-          }
-          if (!r.ok) {
-            const fb = await postWatchPaymentFallback(
-              SPACES_API_BASE_URL,
-              primaryJobId,
-              currentSpaceNameLower,
-              hashStr,
-              'primary-fallback'
-            );
-            if (fb.purchaseId != null) {
-              purchaseIdFromWatch = fb.purchaseId;
-            }
-            if (!fb.ok) {
-              toast.error('Could not register payment for watching. Polling may still work.');
-            }
-          }
-        } else if (primaryJobId != null) {
-          const fb = await postWatchPaymentFallback(
-            SPACES_API_BASE_URL,
-            primaryJobId,
-            currentSpaceNameLower,
-            hashStr,
-            'primary'
-          );
-          if (fb.purchaseId != null) {
-            purchaseIdFromWatch = fb.purchaseId;
-          }
-          if (!fb.ok) {
-            toast.error('Could not register payment for watching. Polling may still work.');
-          }
-        }
-        if (w?.pointer && w.pointerJobId != null) {
-          const pr = await postJobsWatchPayment(
-            SPACES_API_BASE_URL,
-            w.pointer,
-            w.pointerJobId,
-            hashStr,
-            'pointer'
-          );
-          if (pr.purchaseId != null) {
-            purchaseIdFromWatch = pr.purchaseId;
-          }
-          if (!pr.ok) {
-            const pfb = await postWatchPaymentFallback(
-              SPACES_API_BASE_URL,
-              w.pointerJobId,
-              currentSpaceNameLower,
-              hashStr,
-              'pointer-fallback'
-            );
-            if (pfb.purchaseId != null) {
-              purchaseIdFromWatch = pfb.purchaseId;
-            }
-          }
-        }
-      }
-
-      const callbackUrl = `${SPACES_API_BASE_URL}/api/payments/callback`;
-      const label = `${currentSubspaceTrimmed}@${currentSpaceNameLower}`;
-      const spaceEntry = mySpaces.find(
+      let purchaseIdFromRegistration: number | undefined;
+      const spaceEntryForPayment = mySpaces.find(
         (s) => s.subspace === currentSubspaceTrimmed && s.spaceName === currentSpaceNameLower
       );
-      let purchaseIdForCallback: number | undefined = spaceEntry?.purchaseId;
-      if (
-        purchaseIdForCallback == null &&
-        currentJobId != null &&
-        pendingPaymentCallbackRef.current != null &&
-        pendingPaymentCallbackRef.current.jobId === currentJobId
-      ) {
-        purchaseIdForCallback = pendingPaymentCallbackRef.current.purchaseId;
-      }
-      if (purchaseIdForCallback == null && currentJobId != null) {
-        try {
-          const raw = await AsyncStorage.getItem(`spaces_purchase_${currentJobId}`);
-          if (raw) {
-            const j = JSON.parse(raw) as Record<string, unknown>;
-            const fromStore = purchaseIdFromRecord(j);
-            if (fromStore != null) {
-              purchaseIdForCallback = fromStore;
-            }
-          }
-        } catch (e) {
-          console.warn('[Spaces] payment callback: AsyncStorage read failed', e);
+      const scriptPubKeyHex =
+        purchaseTaprootPathRef.current?.scriptPubKeyHex?.trim() ??
+        spaceEntryForPayment?.scriptPubKeyHex?.trim();
+
+      if (hashStr && currentJobId != null) {
+        const pendingPurchaseId =
+          spaceEntryForPayment?.purchaseId ??
+          (pendingPaymentCallbackRef.current?.jobId === currentJobId
+            ? pendingPaymentCallbackRef.current.purchaseId
+            : undefined);
+
+        const registration = await registerPurchasePaymentOnServer({
+          baseUrl: SPACES_API_BASE_URL,
+          transactionId: hashStr,
+          jobId: currentJobId,
+          spaceNameLower: currentSpaceNameLower,
+          subspaceTrimmed: currentSubspaceTrimmed,
+          handle: broadcastHandle,
+          paymentWatch: postPurchaseWatchRef.current,
+          pendingPurchaseId,
+          scriptPubKeyHex,
+          logLabel: 'broadcast',
+        });
+
+        purchaseIdFromRegistration = registration.purchaseId;
+
+        if (!registration.watchOk) {
+          toast.error('Could not register payment for watching. Polling may still work.');
         }
-      }
-      if (purchaseIdForCallback == null && purchaseIdFromWatch != null) {
-        purchaseIdForCallback = purchaseIdFromWatch;
-      }
-      if (hashStr && purchaseIdForCallback != null) {
-        const cbStart = Date.now();
-        try {
-          const res = await fetch(callbackUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              transaction_id: hashStr,
-              label,
-              purchase_id: purchaseIdForCallback,
-            }),
-          });
-          const ms = Date.now() - cbStart;
-          if (!res.ok) {
-            const errText = await res.text();
-            console.error(
-              `[Spaces API] POST ${callbackUrl} - HTTP ${res.status} (${ms}ms)`,
-              errText
-            );
-            toast.error('Payment was broadcast but the server could not be notified. Polling will continue.');
-          } else {
-            const bodyText = await res.text();
-            console.log(`[Spaces API] POST ${callbackUrl} - Success (${ms}ms)`, bodyText || '(empty body)');
-          }
-        } catch (e) {
-          console.error('[Spaces] POST payment callback failed:', e);
-          toast.error('Could not reach payment callback. Polling will continue.');
+        if (registration.watchOk && !registration.callbackOk && registration.purchaseId != null) {
+          toast.error('Payment was broadcast but the server could not be notified. Polling will continue.');
+        } else if (!registration.watchOk && !registration.callbackOk && registration.purchaseId == null) {
+          console.warn(
+            '[Spaces] Skipping /api/payments/callback: missing purchase_id (mySpaces/AsyncStorage) or transaction id',
+            { purchaseId: registration.purchaseId, hasHash: !!hashStr }
+          );
         }
-      } else {
-        console.warn(
-          '[Spaces] Skipping /api/payments/callback: missing purchase_id (mySpaces/AsyncStorage) or transaction id',
-          { purchaseId: purchaseIdForCallback, hasHash: !!hashStr }
-        );
       }
 
       // Add subspace to My Spaces and start polling if we have jobId
-      if (currentJobId && purchaseData) {
+      if (currentJobId && (purchaseData || currentJobData)) {
         const currentSpaceName = spaceName.toLowerCase();
         const currentSubspace = subspace.trim();
         const newSpace = {
           subspace: currentSubspace,
           spaceName: currentSpaceName,
-          handle: purchaseData.handle,
+          handle: broadcastHandle,
           status: 'processing' as const,
           jobId: currentJobId,
+          ...(purchaseIdFromRegistration != null ? { purchaseId: purchaseIdFromRegistration } : {}),
+          ...(scriptPubKeyHex ? { scriptPubKeyHex } : {}),
+          ...(purchaseTaprootPathRef.current?.fullPath
+            ? { taprootDerivationPath: purchaseTaprootPathRef.current.fullPath }
+            : {}),
         };
 
         setMySpaces((prev) => {
@@ -1335,23 +1549,25 @@ export default function SpacesScreen() {
               ...updated[existingIndex],
               jobId: currentJobId,
               status: 'processing',
+              ...(purchaseIdFromRegistration != null
+                ? { purchaseId: purchaseIdFromRegistration }
+                : {}),
+              ...(scriptPubKeyHex ? { scriptPubKeyHex } : {}),
+              ...(purchaseTaprootPathRef.current?.fullPath
+                ? { taprootDerivationPath: purchaseTaprootPathRef.current.fullPath }
+                : {}),
             };
             return updated;
           }
           return [...prev, newSpace];
         });
 
-        // Start polling
         pollJobStatus(currentJobId, currentSpaceName, currentSubspace).catch((error) => {
           console.error('[Spaces] Polling failed:', error);
         });
       }
 
-      // Close the modal
       setShowTxHexModal(false);
-
-      // Perform simulation after broadcasting (this will also start polling)
-      await handleSimulate();
     } catch (error) {
       console.error('[Spaces] Failed to broadcast transaction:', error);
       const errorMessage =
@@ -1422,7 +1638,7 @@ export default function SpacesScreen() {
           if (!response.ok) {
             const errorText = await response.text();
             console.error(`[Spaces API] PUT ${url} - HTTP error! status: ${response.status}`, errorText);
-            throw new Error(`HTTP error! status: ${response.status}`);
+            throwSpacesApiHttpError(response.status, errorText);
           }
 
           const data = await response.json();
@@ -1484,7 +1700,7 @@ export default function SpacesScreen() {
 
           if (priceSats !== null) {
             const blockFee = getBlockFee(selectedDuration, blockFee1, blockFee6, blockFee48);
-            if (blockFee !== null && btcPriceUSD !== null) {
+            if (blockFee !== null) {
               setButtonLabel(calculateTotalPrice(priceSats, blockFee1, blockFee6, blockFee48, selectedDuration, btcPriceUSD, takeOnchain, sptrPrice, sptrFee1, sptrFee6, sptrFee48));
             }
           }
@@ -1492,9 +1708,23 @@ export default function SpacesScreen() {
           toast.success(`Requested ${purchaseData.handle} for free!`);
         } catch (error) {
           console.error('[Spaces] Free coupon request failed:', error);
-          Alert.alert('Error', error instanceof Error ? error.message : 'Failed to process request');
-          setButtonState('available');
-          setIsButtonEnabled(true);
+          if (error instanceof SpacesApiHttpError && error.refreshQuote) {
+            handleSpacesPurchaseApiErrorRef.current(
+              error,
+              '[Spaces] Free coupon PUT failed (stale quote):'
+            );
+          } else {
+            Alert.alert(
+              'Error',
+              error instanceof SpacesApiHttpError
+                ? error.message
+                : error instanceof Error
+                  ? error.message
+                  : 'Failed to process request'
+            );
+            setButtonState('available');
+            setIsButtonEnabled(true);
+          }
         }
         return;
       }
@@ -1755,9 +1985,16 @@ export default function SpacesScreen() {
         }
 
         // Add subspace to My Spaces list with "purchasing" status
+        const subspaceTrimmed = subspace.trim();
+        const spaceNameLower = spaceName.toLowerCase();
+        const priorRowForPath = mySpaces.find(
+          (s) => s.subspace === subspaceTrimmed && s.spaceName === spaceNameLower
+        );
+        const needsTaprootPath = !priorRowForPath?.scriptPubKeyHex?.trim();
+
         const newSpace = {
-          subspace: subspace.trim(),
-          spaceName: spaceName.toLowerCase(),
+          subspace: subspaceTrimmed,
+          spaceName: spaceNameLower,
           handle: purchaseData.handle,
           status: 'purchasing' as const,
         };
@@ -1776,8 +2013,7 @@ export default function SpacesScreen() {
 
         // Register the purchase with the server before showing the broadcast modal so job_id / purchase_id exist
         // (otherwise the user could broadcast while the PUT is still in flight and the payment callback would lack purchase_id).
-        const spaceNameLower = spaceName.toLowerCase();
-        const url = `${SPACES_API_BASE_URL}/spaces/${spaceNameLower}/${subspace.trim()}?app=${SPACES_APP_NAME}&format=json`;
+        const url = `${SPACES_API_BASE_URL}/spaces/${spaceNameLower}/${subspaceTrimmed}?app=${SPACES_APP_NAME}&format=json`;
         const startTime = Date.now();
         console.log(`[Spaces API] PUT ${url}`);
 
@@ -1805,7 +2041,7 @@ export default function SpacesScreen() {
             `[Spaces API] PUT ${url} - HTTP error! status: ${response.status} (${duration}ms)`,
             errorText
           );
-          throw new Error(`HTTP error! status: ${response.status}`);
+          throwSpacesApiHttpError(response.status, errorText);
         }
 
         const data = await response.json();
@@ -1893,6 +2129,83 @@ export default function SpacesScreen() {
           console.log('[Spaces] Stored minimal purchase id in AsyncStorage:', storageKey);
         }
 
+        if (needsTaprootPath) {
+          const reserved = mySpaces
+            .filter(
+              (s) => !(s.subspace === subspaceTrimmed && s.spaceName === spaceNameLower)
+            )
+            .map((s) => s.scriptPubKeyHex)
+            .filter((spk): spk is string => Boolean(spk?.trim()));
+
+          console.log('[Spaces] Resolving next available Taproot path for first-time purchase…');
+          const nextPath = await resolveNextAvailableTaprootPath({
+            baseUrl: SPACES_API_BASE_URL,
+            reservedScriptPubKeys: reserved,
+          });
+
+          if (!nextPath) {
+            console.error('[Spaces] No available Taproot path for first-time purchase');
+            toast.error(
+              'Could not reserve a wallet path for this handle. Use Find Spaces or try again.'
+            );
+            setButtonState('available');
+            setIsButtonEnabled(true);
+            setIsConfirmationMode(false);
+            setPurchaseData(null);
+            postPurchaseWatchRef.current = null;
+            purchaseTaprootPathRef.current = null;
+            pendingPaymentCallbackRef.current = null;
+            return;
+          }
+
+          console.log('[Spaces] Reserved Taproot path for purchase:', {
+            fullPath: nextPath.fullPath,
+            scriptPubKeyHex: `${nextPath.scriptPubKeyHex.slice(0, 16)}…`,
+            address: nextPath.address,
+          });
+
+          purchaseTaprootPathRef.current = nextPath;
+
+          setMySpaces((prev) =>
+            prev.map((space) =>
+              space.subspace === subspaceTrimmed && space.spaceName === spaceNameLower
+                ? {
+                    ...space,
+                    scriptPubKeyHex: nextPath.scriptPubKeyHex,
+                    taprootDerivationPath: nextPath.fullPath,
+                    chainPresence: 'off-chain' as const,
+                  }
+                : space
+            )
+          );
+
+          if (data.job_id) {
+            const storageKey = `spaces_purchase_${data.job_id}`;
+            try {
+              const existingRaw = await AsyncStorage.getItem(storageKey);
+              const existing = existingRaw ? JSON.parse(existingRaw) : {};
+              await AsyncStorage.setItem(
+                storageKey,
+                JSON.stringify({
+                  ...existing,
+                  script_pubkey: nextPath.scriptPubKeyHex,
+                  taproot_derivation_path: nextPath.fullPath,
+                  taproot_receive_address: nextPath.address,
+                })
+              );
+            } catch (storageErr) {
+              console.warn('[Spaces] Failed to persist taproot path on purchase blob:', storageErr);
+            }
+          }
+        } else if (priorRowForPath?.scriptPubKeyHex?.trim()) {
+          purchaseTaprootPathRef.current = {
+            scriptPubKeyHex: priorRowForPath.scriptPubKeyHex.trim(),
+            fullPath: priorRowForPath.taprootDerivationPath ?? '',
+            relativePath: '',
+            address: '',
+          };
+        }
+
         setTxHex(transactionHex);
         setShowTxHexModal(true);
 
@@ -1905,7 +2218,7 @@ export default function SpacesScreen() {
         // Recalculate button label
         if (priceSats !== null) {
           const blockFee = getBlockFee(selectedDuration, blockFee1, blockFee6, blockFee48);
-          if (blockFee !== null && btcPriceUSD !== null) {
+          if (blockFee !== null) {
             const totalLabel = calculateTotalPrice(
               priceSats,
               blockFee1,
@@ -1923,6 +2236,14 @@ export default function SpacesScreen() {
           }
         }
       } catch (error) {
+        if (error instanceof SpacesApiHttpError && error.refreshQuote) {
+          handleSpacesPurchaseApiErrorRef.current(
+            error,
+            '[Spaces] Confirmation flow failed (stale quote):'
+          );
+          return;
+        }
+
         console.error('[Spaces] Error in confirmation flow:', error);
 
         // Enhanced error logging for insufficient balance
@@ -1957,7 +2278,11 @@ export default function SpacesScreen() {
 
         Alert.alert(
           'Error',
-          error instanceof Error ? error.message : 'Failed to process transaction'
+          error instanceof SpacesApiHttpError
+            ? error.message
+            : error instanceof Error
+              ? error.message
+              : 'Failed to process transaction'
         );
         setButtonState('available');
         setIsButtonEnabled(true);
@@ -2055,7 +2380,7 @@ export default function SpacesScreen() {
           `[Spaces API] POST ${url} - HTTP error! status: ${response.status} (${duration}ms)`,
           errorText
         );
-        throw new Error(`HTTP error! status: ${response.status}`);
+        throwSpacesApiHttpError(response.status, errorText);
       }
 
       const data = await response.json();
@@ -2119,12 +2444,10 @@ export default function SpacesScreen() {
       const endTime = Date.now();
       const duration = endTime - startTime;
 
-      console.error(`[Spaces API] POST ${url} - Failed (${duration}ms):`, error);
-
-      setButtonState(null);
-      setIsButtonEnabled(false);
-      setButtonLabel('Purchase');
-      Alert.alert('Error', error instanceof Error ? error.message : 'Failed to process purchase');
+      handleSpacesPurchaseApiErrorRef.current(
+        error,
+        `[Spaces API] POST ${url} - Failed (${duration}ms):`
+      );
     }
   };
 
@@ -2189,6 +2512,7 @@ export default function SpacesScreen() {
       setIsConfirmationMode(false);
       setPurchaseData(null);
       postPurchaseWatchRef.current = null;
+      purchaseTaprootPathRef.current = null;
 
       // Reset button state to initial
       setButtonState('available');
@@ -2197,7 +2521,7 @@ export default function SpacesScreen() {
       // Recalculate button label based on current price and duration
       if (priceSats !== null) {
         const blockFee = getBlockFee(selectedDuration, blockFee1, blockFee6, blockFee48);
-        if (blockFee !== null && btcPriceUSD !== null) {
+        if (blockFee !== null) {
           const totalLabel = calculateTotalPrice(
             priceSats,
             blockFee1,
@@ -2370,6 +2694,17 @@ export default function SpacesScreen() {
 
   // Initialize pricing service and fetch BTC price
   useEffect(() => {
+    const showPricingUnavailableToast = (force = false) => {
+      const now = Date.now();
+      if (!force && now - pricingUnavailableToastAtRef.current < 120_000) {
+        return;
+      }
+      pricingUnavailableToastAtRef.current = now;
+      toast.error(
+        `The pricing service (${getPricingServiceHostname()}) is temporarily unavailable. Please try again later.`
+      );
+    };
+
     const loadBtcPrice = async () => {
       try {
         // Initialize pricing service if not already initialized
@@ -2385,14 +2720,12 @@ export default function SpacesScreen() {
           // If not in cache, fetch it
           await pricingService.refreshExchangeRates();
           const refreshedPrice = pricingService.getExchangeRate(AssetTicker.BTC, FiatCurrency.USD);
-          if (refreshedPrice) {
-            setBtcPriceUSD(refreshedPrice);
-          }
+          setBtcPriceUSD(refreshedPrice ?? null);
         }
-      } catch (error) {
-        console.error('[Spaces] Failed to load BTC price:', error);
-        // Fallback to a default price if fetch fails
-        setBtcPriceUSD(89018);
+      } catch {
+        showPricingUnavailableToast(true);
+        const cachedPrice = pricingService.getExchangeRate(AssetTicker.BTC, FiatCurrency.USD);
+        setBtcPriceUSD(cachedPrice ?? null);
       }
     };
 
@@ -2408,8 +2741,8 @@ export default function SpacesScreen() {
             setBtcPriceUSD(refreshedPrice);
           }
         }
-      } catch (error) {
-        console.error('[Spaces] Failed to refresh BTC price:', error);
+      } catch {
+        showPricingUnavailableToast();
       }
     }, 30000); // 30 seconds
 
@@ -2489,150 +2822,133 @@ export default function SpacesScreen() {
   }, [subspace, spaceName]);
 
   // Check space availability when subspace or spaceName changes
-  useEffect(() => {
-    const checkAvailability = async () => {
-      // Only make request if both fields have values
-      if (!subspace.trim() || !spaceName) {
-        setButtonState(null);
-        setIsButtonEnabled(false);
-        setButtonLabel('Purchase');
-        setPriceSats(null);
-        setBlockFee1(null);
-        setBlockFee6(null);
-        setBlockFee48(null);
-        setSptrPrice(null);
-        setSptrFee1(null);
-        setSptrFee6(null);
-        setSptrFee48(null);
-        return;
+  const checkAvailability = useCallback(async () => {
+    // Only make request if both fields have values
+    if (!subspace.trim() || !spaceName) {
+      setButtonState(null);
+      setIsButtonEnabled(false);
+      setButtonLabel('Purchase');
+      setPriceSats(null);
+      setBlockFee1(null);
+      setBlockFee6(null);
+      setBlockFee48(null);
+      setSptrPrice(null);
+      setSptrFee1(null);
+      setSptrFee6(null);
+      setSptrFee48(null);
+      return;
+    }
+
+    setButtonState('loading');
+    setIsButtonEnabled(false);
+    setButtonLabel('Checking...');
+
+    const spaceNameLower = spaceName.toLowerCase();
+    const url = `${SPACES_API_BASE_URL}/spaces/${spaceNameLower}/${subspace.trim()}?app=${SPACES_APP_NAME}&format=json`;
+    const startTime = Date.now();
+    console.log(`[Spaces API] GET ${url}`);
+
+    try {
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+
+      const endTime = Date.now();
+      const duration = endTime - startTime;
+
+      if (!response.ok) {
+        let bodyPreview = '';
+        try {
+          bodyPreview = (await response.text()).slice(0, 500);
+        } catch {
+          /* ignore */
+        }
+        const hint =
+          response.status === 503 || response.status === 502
+            ? ' (server/CGI unavailable or overloaded — retry later)'
+            : '';
+        console.error(
+          `[Spaces API] GET ${url} - HTTP ${response.status} ${response.statusText}${hint} (${duration}ms)`,
+          bodyPreview ? `body: ${bodyPreview}` : 'empty body'
+        );
+        throw new Error(`HTTP error! status: ${response.status}`);
       }
 
-      setButtonState('loading');
-      setIsButtonEnabled(false);
-      setButtonLabel('Checking...');
+      const data: SpaceAvailabilityResponse = await response.json();
+      console.log(`[Spaces API] GET ${url} - Success (${duration}ms)`);
 
-      const spaceNameLower = spaceName.toLowerCase();
-      const url = `${SPACES_API_BASE_URL}/spaces/${spaceNameLower}/${subspace.trim()}?app=${SPACES_APP_NAME}&format=json`;
-      const startTime = Date.now();
-      console.log(`[Spaces API] GET ${url}`);
+      if (data.state === 'available') {
+        setButtonState('available');
+        setIsButtonEnabled(true);
+        setIsConfirmationMode(false); // Reset confirmation mode
+        setPurchaseData(null); // Clear previous purchase data
 
-      try {
-        const response = await fetch(url, {
-          method: 'GET',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-        });
+        // Store price and block fees if available
+        // The recalculation useEffect will update the button label
+        if (data.price !== undefined && data.price !== null) {
+          setPriceSats(data.price);
 
-        const endTime = Date.now();
-        const duration = endTime - startTime;
-
-        if (!response.ok) {
-          let bodyPreview = '';
-          try {
-            bodyPreview = (await response.text()).slice(0, 500);
-          } catch {
-            /* ignore */
-          }
-          const hint =
-            response.status === 503 || response.status === 502
-              ? ' (server/CGI unavailable or overloaded — retry later)'
-              : '';
-          console.error(
-            `[Spaces API] GET ${url} - HTTP ${response.status} ${response.statusText}${hint} (${duration}ms)`,
-            bodyPreview ? `body: ${bodyPreview}` : 'empty body'
-          );
-          throw new Error(`HTTP error! status: ${response.status}`);
-        }
-
-        const data: SpaceAvailabilityResponse = await response.json();
-        console.log(`[Spaces API] GET ${url} - Success (${duration}ms)`);
-
-        if (data.state === 'available') {
-          setButtonState('available');
-          setIsButtonEnabled(true);
-          setIsConfirmationMode(false); // Reset confirmation mode
-          setPurchaseData(null); // Clear previous purchase data
-
-          // Store price and block fees if available
-          // The recalculation useEffect will update the button label
-          if (data.price !== undefined && data.price !== null) {
-            setPriceSats(data.price);
-
-            // Store handle and quote_id (id field)
-            if (data.handle) {
-              setHandle(data.handle);
-              console.log('[Spaces] Stored handle:', data.handle);
-            } else {
-              setHandle(null);
-            }
-
-            if (data.id !== undefined && data.id !== null) {
-              setQuoteId(data.id);
-              console.log('[Spaces] Stored quoteId:', data.id);
-            } else {
-              setQuoteId(null);
-            }
-
-            // Block fees can be 0, so check for undefined/null specifically
-            const fee1Value =
-              data['1_block_fee'] !== undefined && data['1_block_fee'] !== null
-                ? data['1_block_fee']
-                : null;
-            const fee6Value =
-              data['6_block_fee'] !== undefined && data['6_block_fee'] !== null
-                ? data['6_block_fee']
-                : null;
-            const fee48Value =
-              data['48_block_fee'] !== undefined && data['48_block_fee'] !== null
-                ? data['48_block_fee']
-                : null;
-            setBlockFee1(fee1Value);
-            setBlockFee6(fee6Value);
-            setBlockFee48(fee48Value);
-
-            // Store SPTR price and fees (ensure they're numbers)
-            const sptrPriceValue =
-              data.sptr_price !== undefined && data.sptr_price !== null
-                ? Number(data.sptr_price)
-                : null;
-            const sptrFee1Value =
-              data['1_block_sptr_fee'] !== undefined && data['1_block_sptr_fee'] !== null
-                ? Number(data['1_block_sptr_fee'])
-                : null;
-            const sptrFee6Value =
-              data['6_block_sptr_fee'] !== undefined && data['6_block_sptr_fee'] !== null
-                ? Number(data['6_block_sptr_fee'])
-                : null;
-            const sptrFee48Value =
-              data['48_block_sptr_fee'] !== undefined && data['48_block_sptr_fee'] !== null
-                ? Number(data['48_block_sptr_fee'])
-                : null;
-            setSptrPrice(sptrPriceValue);
-            setSptrFee1(sptrFee1Value);
-            setSptrFee6(sptrFee6Value);
-            setSptrFee48(sptrFee48Value);
-            console.log(
-              `[Spaces] API response: price=${data.price}, handle=${data.handle}, id=${data.id}, 1_block_fee=${fee1Value}, 6_block_fee=${fee6Value}, 48_block_fee=${fee48Value}, sptr_price=${sptrPriceValue}, 1_block_sptr_fee=${sptrFee1Value}, 6_block_sptr_fee=${sptrFee6Value}, 48_block_sptr_fee=${sptrFee48Value}`
-            );
-            // Don't set button label here - let the recalculation useEffect handle it
+          // Store handle and quote_id (id field)
+          if (data.handle) {
+            setHandle(data.handle);
+            console.log('[Spaces] Stored handle:', data.handle);
           } else {
-            setPriceSats(null);
-            setBlockFee1(null);
-            setBlockFee6(null);
-            setBlockFee48(null);
-            setSptrPrice(null);
-            setSptrFee1(null);
-            setSptrFee6(null);
-            setSptrFee48(null);
             setHandle(null);
-            setQuoteId(null);
-            setButtonLabel('Purchase');
           }
-        } else if (data.state === 'taken') {
-          setButtonState('taken');
-          setIsButtonEnabled(false);
-          setButtonLabel('Taken');
+
+          if (data.id !== undefined && data.id !== null) {
+            setQuoteId(data.id);
+            console.log('[Spaces] Stored quoteId:', data.id);
+          } else {
+            setQuoteId(null);
+          }
+
+          // Block fees can be 0, so check for undefined/null specifically
+          const fee1Value =
+            data['1_block_fee'] !== undefined && data['1_block_fee'] !== null
+              ? data['1_block_fee']
+              : null;
+          const fee6Value =
+            data['6_block_fee'] !== undefined && data['6_block_fee'] !== null
+              ? data['6_block_fee']
+              : null;
+          const fee48Value =
+            data['48_block_fee'] !== undefined && data['48_block_fee'] !== null
+              ? data['48_block_fee']
+              : null;
+          setBlockFee1(fee1Value);
+          setBlockFee6(fee6Value);
+          setBlockFee48(fee48Value);
+
+          // Store SPTR price and fees (ensure they're numbers)
+          const sptrPriceValue =
+            data.sptr_price !== undefined && data.sptr_price !== null
+              ? Number(data.sptr_price)
+              : null;
+          const sptrFee1Value =
+            data['1_block_sptr_fee'] !== undefined && data['1_block_sptr_fee'] !== null
+              ? Number(data['1_block_sptr_fee'])
+              : null;
+          const sptrFee6Value =
+            data['6_block_sptr_fee'] !== undefined && data['6_block_sptr_fee'] !== null
+              ? Number(data['6_block_sptr_fee'])
+              : null;
+          const sptrFee48Value =
+            data['48_block_sptr_fee'] !== undefined && data['48_block_sptr_fee'] !== null
+              ? Number(data['48_block_sptr_fee'])
+              : null;
+          setSptrPrice(sptrPriceValue);
+          setSptrFee1(sptrFee1Value);
+          setSptrFee6(sptrFee6Value);
+          setSptrFee48(sptrFee48Value);
+          console.log(
+            `[Spaces] API response: price=${data.price}, handle=${data.handle}, id=${data.id}, 1_block_fee=${fee1Value}, 6_block_fee=${fee6Value}, 48_block_fee=${fee48Value}, sptr_price=${sptrPriceValue}, 1_block_sptr_fee=${sptrFee1Value}, 6_block_sptr_fee=${sptrFee6Value}, 48_block_sptr_fee=${sptrFee48Value}`
+          );
+          // Don't set button label here - let the recalculation useEffect handle it
+        } else {
           setPriceSats(null);
           setBlockFee1(null);
           setBlockFee6(null);
@@ -2641,40 +2957,14 @@ export default function SpacesScreen() {
           setSptrFee1(null);
           setSptrFee6(null);
           setSptrFee48(null);
-          setIsConfirmationMode(false);
-          setPurchaseData(null);
           setHandle(null);
           setQuoteId(null);
-        } else {
-          // Unknown state
-          setButtonState(null);
-          setIsButtonEnabled(false);
           setButtonLabel('Purchase');
-          setPriceSats(null);
-          setBlockFee1(null);
-          setBlockFee6(null);
-          setBlockFee48(null);
-          setIsConfirmationMode(false);
-          setPurchaseData(null);
-          setHandle(null);
-          setQuoteId(null);
         }
-      } catch (error) {
-        const endTime = Date.now();
-        const duration = endTime - startTime;
-
-        if (error instanceof TypeError && error.message.includes('Network request failed')) {
-          console.error(
-            `[Spaces API] GET ${url} - Network failure (${duration}ms):`,
-            error.message
-          );
-        } else {
-          console.error(`[Spaces API] GET ${url} - Failed (${duration}ms):`, error);
-        }
-
-        setButtonState(null);
+      } else if (data.state === 'taken') {
+        setButtonState('taken');
         setIsButtonEnabled(false);
-        setButtonLabel('Purchase');
+        setButtonLabel('Taken');
         setPriceSats(null);
         setBlockFee1(null);
         setBlockFee6(null);
@@ -2687,16 +2977,92 @@ export default function SpacesScreen() {
         setPurchaseData(null);
         setHandle(null);
         setQuoteId(null);
+      } else {
+        // Unknown state
+        setButtonState(null);
+        setIsButtonEnabled(false);
+        setButtonLabel('Purchase');
+        setPriceSats(null);
+        setBlockFee1(null);
+        setBlockFee6(null);
+        setBlockFee48(null);
+        setIsConfirmationMode(false);
+        setPurchaseData(null);
+        setHandle(null);
+        setQuoteId(null);
       }
-    };
+    } catch (error) {
+      const endTime = Date.now();
+      const duration = endTime - startTime;
 
-    // Debounce the API call
+      if (error instanceof TypeError && error.message.includes('Network request failed')) {
+        console.error(
+          `[Spaces API] GET ${url} - Network failure (${duration}ms):`,
+          error.message
+        );
+      } else {
+        console.error(`[Spaces API] GET ${url} - Failed (${duration}ms):`, error);
+      }
+
+      setButtonState(null);
+      setIsButtonEnabled(false);
+      setButtonLabel('Purchase');
+      setPriceSats(null);
+      setBlockFee1(null);
+      setBlockFee6(null);
+      setBlockFee48(null);
+      setSptrPrice(null);
+      setSptrFee1(null);
+      setSptrFee6(null);
+      setSptrFee48(null);
+      setIsConfirmationMode(false);
+      setPurchaseData(null);
+      setHandle(null);
+      setQuoteId(null);
+    }
+  }, [subspace, spaceName]);
+
+  useEffect(() => {
+    refreshSpaceQuoteRef.current = checkAvailability;
+  }, [checkAvailability]);
+
+  useEffect(() => {
     const timeoutId = setTimeout(() => {
-      checkAvailability();
+      void checkAvailability();
     }, 500); // Wait 500ms after user stops typing
 
     return () => clearTimeout(timeoutId);
-  }, [subspace, spaceName]);
+  }, [checkAvailability]);
+
+  const handleSpacesPurchaseApiError = useCallback((error: unknown, logContext: string) => {
+    console.error(logContext, error);
+
+    const message =
+      error instanceof SpacesApiHttpError
+        ? error.message
+        : error instanceof Error
+          ? error.message
+          : 'Failed to process purchase';
+    const refreshQuote = error instanceof SpacesApiHttpError && error.refreshQuote;
+
+    setIsConfirmationMode(false);
+    setPurchaseData(null);
+    postPurchaseWatchRef.current = null;
+    purchaseTaprootPathRef.current = null;
+
+    if (refreshQuote) {
+      Alert.alert('Quote unavailable', `${message}\n\nFetching a new quote…`);
+      void refreshSpaceQuoteRef.current?.();
+      return;
+    }
+
+    setButtonState(null);
+    setIsButtonEnabled(false);
+    setButtonLabel('Purchase');
+    Alert.alert('Error', message);
+  }, []);
+
+  handleSpacesPurchaseApiErrorRef.current = handleSpacesPurchaseApiError;
 
   // Persist mySpaces to AsyncStorage whenever it changes
   useEffect(() => {

@@ -21,13 +21,45 @@
       "distribution": "internal",
       "environment": "preview"
     },
+    "beta": {
+      "extends": "base",
+      "distribution": "store",
+      "autoIncrement": true,
+      "environment": "preview",
+      "android": {
+        "buildType": "app-bundle"
+      }
+    },
     "production": {
       "extends": "base",
       "autoIncrement": true,
-      "environment": "production"
+      "environment": "production",
+      "android": {
+        "buildType": "app-bundle"
+      }
     }
   },
   "submit": {
-    "production": {}
+    "beta": {
+      "android": {
+        "serviceAccountKeyPath": "./google-service-account.json",
+        "track": "internal",
+        "releaseStatus": "completed"
+      }
+    },
+    "open": {
+      "android": {
+        "serviceAccountKeyPath": "./google-service-account.json",
+        "track": "beta",
+        "releaseStatus": "completed"
+      }
+    },
+    "production": {
+      "android": {
+        "serviceAccountKeyPath": "./google-service-account.json",
+        "track": "production",
+        "releaseStatus": "completed"
+      }
+    }
   }
 }

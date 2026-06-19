@@ -170,6 +170,53 @@ By default, **no** tx watch is registered on purchase or confirm; the client mus
 
 On success, the confirm response may include **`payment_watches`** with `watch_id` / `transaction_id` per registered tx. If you omit these fields, the server logs a reminder to call **`watch-payment`** separately.
 
+### `POST /api/jobs/:jobId/watch-payment` body
+
+After the client broadcasts (or simulates) a payment tx, it registers the tx for monitoring:
+
+| Field | Required | Description |
+|--------|----------|-------------|
+| `transaction_id` | yes | 64-char hex txid |
+| `script_pubkey` | first-time purchase only | Taproot script pubkey hex for the **wallet receive path** reserved for this handle (see **Spaces Wallet client flow**). Omit on renewals when the server/job already knows the spk. |
+
+The POST purchase response includes a `payment_watch` template whose `body` may contain placeholder `transaction_id` / `script_pubkey` fields. **Spaces Wallet** strips those placeholders from the template and sets `transaction_id` (and `script_pubkey` when applicable) at registration time via `buildPaymentWatchRequestBody` (`src/utils/build-payment-watch-body.ts`).
+
+### `POST /api/payments/callback`
+
+Query parameter **`tenant`** (space name, lowercased) is **required**.
+
+Example body for a first-time subname purchase:
+
+```json
+{
+  "transaction_id": "<64-hex txid>",
+  "label": "unknown@tabconf",
+  "purchase_id": 45,
+  "script_pubkey": "<taproot script pubkey hex>"
+}
+```
+
+For renewals or handles that already have an assigned wallet path, omit `script_pubkey` when the server already has it on the purchase/job row.
+
+## Spaces Wallet client flow
+
+This repo implements the subname purchase UI in `src/app/spaces.tsx`. The end-to-end timeline:
+
+| Step | Action | Notes |
+|------|--------|-------|
+| 1 | `GET /spaces/:space/:subspace?format=json` | Quote: `handle`, `quote_id`, fees — no wallet `script_pubkey` yet |
+| 2 | `POST /spaces/...` | Returns `taproot_address`, `job_id`, `payment_watch` (stored in `postPurchaseWatchRef`) |
+| 3 | Compose tx | P2TR + OP_RETURN memo = handle; show confirmation UI |
+| 4 | `PUT /spaces/...` | `{ "quote_id", "purchase_type": "subname" }` → `job_id`, `purchase_id` |
+| **4.5** | **Reserve wallet path** | **First-time only** (no `scriptPubKeyHex` on the My Spaces row): call `resolveNextAvailableTaprootPath` (`src/utils/resolve-next-spaces-path.ts`) — scans BIP-86 paths from `buildSpacesScanDerivationPaths()`, derives spks via WDK, skips paths on-chain (`GET /api/listnums-by-spk`) or already assigned to other handles. Stores `scriptPubKeyHex` + `taprootDerivationPath` on the row and in AsyncStorage (`spaces_purchase_{job_id}`). |
+| 5 | Broadcast or Simulate | Register payment: `POST watch-payment` + `POST /api/payments/callback?tenant=...` with `transaction_id` and `script_pubkey` (first-time). Then poll unified/job status. |
+
+**Environment:** `EXPO_PUBLIC_SPACES_ACCOUNT_NUMBER` and `EXPO_PUBLIC_SPACES_ACCOUNT_GAP` control which BIP-86 receive paths are scanned (see `.env.example`).
+
+**Find Spaces:** Handles discovered via scan already have `scriptPubKeyHex` on the My Spaces row; step 4.5 is skipped and the existing spk is reused at step 5.
+
+**Simulate:** Dev-only path builds a dummy 64-hex txid (`decafcafe…` prefix) and runs the same watch-payment + callback registration as broadcast.
+
 ## Unified status (polling)
 
 **`GET /api/purchases/:spaceName/:subspace/status`**
@@ -187,6 +234,8 @@ Query parameter **`purchase_type`** (default **`subname`**):
 - **`GET /api/purchases/:spaceName/:subspace/status`** — unified status
 - **`PUT /api/purchases/:purchaseId/status/:statusType`** — operator lifecycle updates (see `PURCHASE_STATUS_UPDATE.md`)
 - **`POST /api/jobs/:jobId/watch-payment`** — register payment tx watch (subname / job-keyed)
+- **`POST /api/payments/callback?tenant=:spaceName`** — notify server of an on-chain payment (see **Spaces Wallet client flow** above)
+- **`GET /api/listnums-by-spk?script_pubkey=:hex`** — check whether a Taproot script pubkey is already on-chain (used when reserving a wallet path)
 - **`POST /api/purchases/:purchaseId/watch-pointer-payment`** — same behavior for **pointer** purchases only, keyed by `purchase_id` (standalone: `purchase_id` from the POST response; bundled: `pointer_purchase_id`). Query `space` and JSON body `transaction_id` as on the job route.
 - **`POST /api/purchases/watch-pointer-payment-by-handle`** — pointer only; resolves the open pointer purchase for **`handle`** (`subname@space`, must match `?space=`) and registers the same Spaced watch + callback. Body: `handle`, `transaction_id`. For workflows where the subname is discovered on-chain or registered elsewhere, so the client has the handle but not `purchase_id`.
 

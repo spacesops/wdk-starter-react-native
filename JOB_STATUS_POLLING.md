@@ -527,6 +527,20 @@ For a purchase with `conf_target=6` (6-block confirmation):
 
 ## Integration with Purchase Flow
 
+### Spaces Wallet client timeline
+
+The app in `src/app/spaces.tsx` follows this sequence (see **`PURCHASE.md` → Spaces Wallet client flow** for API detail):
+
+1. **GET quote** — availability and `quote_id`
+2. **POST purchase** — payment address, `job_id`, `payment_watch` spec
+3. **Compose tx** — unsigned hex with handle memo
+4. **PUT confirm** — `{ quote_id, purchase_type: "subname" }` → `purchase_id`
+5. **Reserve Taproot path** (first-time only) — next off-chain BIP-86 path + `script_pubkey` via `resolveNextAvailableTaprootPath`
+6. **Broadcast / Simulate** — `POST /api/jobs/:jobId/watch-payment` and `POST /api/payments/callback?tenant=:space` with `transaction_id` (+ `script_pubkey` on first purchase)
+7. **Poll** — `GET /api/purchases/:spaceName/:subspace/status` (or job status fallback) until terminal state
+
+Polling should start after step 6. Status moves from `pending_payment` → `processing` once the server accepts the payment registration.
+
 ### Complete Purchase Flow Example
 
 ```javascript
@@ -546,9 +560,39 @@ const purchaseResponse = await fetch('/spaces/tabconf/unknown?format=json', {
 const purchase = await purchaseResponse.json();
 const jobId = purchase.job_id; // Extract job_id from response
 
-// 2. User sends payment to purchase.taproot_address
+// 2. Confirm purchase (PUT) — required before payment registration in Spaces Wallet
+await fetch('/spaces/tabconf/unknown?format=json', {
+  method: 'PUT',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ quote_id: 2, purchase_type: 'subname' })
+});
 
-// 3. Poll for status
+// 2.5 First-time purchase: reserve wallet Taproot path + script_pubkey
+// (see resolveNextAvailableTaprootPath in src/utils/resolve-next-spaces-path.ts)
+
+// 3. User sends payment to purchase.taproot_address (or simulate in dev)
+
+// 4. Register payment watch + callback
+await fetch(`/api/jobs/${jobId}/watch-payment?space=tabconf`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    transaction_id: '<64-hex txid>',
+    script_pubkey: '<taproot spk hex>' // first-time only
+  })
+});
+await fetch('/api/payments/callback?tenant=tabconf', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    transaction_id: '<64-hex txid>',
+    label: 'unknown@tabconf',
+    purchase_id: purchase.purchase_id,
+    script_pubkey: '<taproot spk hex>' // first-time only
+  })
+});
+
+// 5. Poll for status
 const result = await pollJobStatus(jobId, 'tabconf', {
   initialDelay: 2000,
   maxDelay: 300000,
@@ -577,6 +621,7 @@ if (result.job.status === 'confirmed') {
 
 - Verify payment was sent to the correct address
 - Check that the PUT confirmation endpoint was called
+- For first-time purchases, confirm `script_pubkey` was sent with watch-payment / callback
 - Ensure blockchain monitoring is active
 
 ### Block Height Unavailable
@@ -596,6 +641,9 @@ if (result.job.status === 'confirmed') {
 - `POST /spaces/:spaceName/:subspace` - Initiate purchase (returns `job_id`)
 - `PUT /spaces/:spaceName/:subspace` - Confirm purchase (updates job status to `processing`)
 - `DELETE /spaces/:spaceName/:subspace` - Cancel purchase (updates job status to `cancelled`)
+- `POST /api/jobs/:jobId/watch-payment` - Register payment tx for monitoring (`transaction_id`, optional `script_pubkey` on first purchase)
+- `POST /api/payments/callback?tenant=:spaceName` - Notify server of payment (requires `tenant` query param)
+- `GET /api/purchases/:spaceName/:subspace/status` - Unified purchase status (preferred for polling)
 
 ## Future Enhancements
 

@@ -155,6 +155,8 @@ type SpaceItem = {
   purchaseId?: number; // Subname purchase ID
   sptrPurchaseId?: number; // SPTR purchase ID
   hasSptr?: boolean; // Whether this purchase includes SPTR
+  scriptPubKeyHex?: string; // Taproot script pubkey (Find Spaces scan or reserved at purchase)
+  taprootDerivationPath?: string; // Full BIP-86 path when reserved at first-time purchase
 };
 ```
 
@@ -168,7 +170,15 @@ The frontend polling logic:
 
 ### Purchase Flow
 
-When `sptr=true`:
+When a user buys a new subname in **Spaces Wallet** (`src/app/spaces.tsx`):
+
+1. POST purchase returns `job_id` and `payment_watch` spec
+2. PUT confirm returns `purchase_id` and moves job to `pending_payment`
+3. **First-time purchase:** client reserves the next available off-chain Taproot path and stores `scriptPubKeyHex` on the My Spaces row (between PUT confirm and broadcast)
+4. After broadcast (or simulate), client calls watch-payment and `/api/payments/callback?tenant=...` with `transaction_id` and `script_pubkey` (first-time only)
+5. Polling begins; unified status progresses from `pending_payment` → `processing` → …
+
+When `sptr=true` (bundled pointer):
 - Stores both `jobId` (subname) and `sptrJobId` (SPTR) in space data
 - Stores both `purchaseId` and `sptrPurchaseId`
 - Sets `hasSptr: true`

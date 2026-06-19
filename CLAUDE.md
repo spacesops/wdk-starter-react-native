@@ -61,6 +61,8 @@ src/
 - **Pricing**: Bitfinex HTTP integration via `@tetherto/wdk-pricing-bitfinex-http`
 - **Navigation**: Debounced navigation hook prevents double-taps
 - **Spaces API**: Connects to a Spaces protocol backend for namespace operations (configurable URL)
+- **Subname purchase flow** (`src/app/spaces.tsx`): GET quote → POST purchase → compose tx → PUT confirm → reserve Taproot path (first-time) → broadcast/simulate with watch-payment + payment callback → poll unified status. See `PURCHASE.md` and `JOB_STATUS_POLLING.md`.
+- **Purchase utilities**: `src/utils/resolve-next-spaces-path.ts` (next off-chain BIP-86 path), `src/utils/build-payment-watch-body.ts` (watch-payment JSON body), `src/utils/spaces-scan-paths.ts` (derivation path config)
 
 ## Environment Variables
 
@@ -69,6 +71,7 @@ See `.env.example`:
 - `EXPO_PUBLIC_WDK_INDEXER_API_KEY` — WDK API key
 - `EXPO_PUBLIC_TRON_API_KEY` / `EXPO_PUBLIC_TRON_API_SECRET` — Tron network credentials
 - `EXPO_PUBLIC_SPACES_API_BASE_URL` — Spaces protocol API (defaults to local dev)
+- `EXPO_PUBLIC_SPACES_ACCOUNT_NUMBER` / `EXPO_PUBLIC_SPACES_ACCOUNT_GAP` — BIP-86 Taproot receive paths scanned for Find Spaces and first-time purchase path reservation
 
 ## Build & Dev
 
