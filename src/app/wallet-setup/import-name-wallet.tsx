@@ -1,14 +1,23 @@
 import avatarOptions, { setAvatar } from '@/config/avatar-options';
-import { CommonActions, useNavigation } from '@react-navigation/native';
 import { useWallet } from '@tetherto/wdk-react-native-provider';
 import { useLocalSearchParams } from 'expo-router';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
+import { useKeyboard } from '@/hooks/use-keyboard';
+import {
+  clearPendingImportMnemonic,
+  consumePendingImportMnemonic,
+} from '@/utils/import-mnemonic-session';
+import { logImportError, logImportStep } from '@/utils/import-wallet-logger';
+import getErrorMessage from '@/utils/get-error-message';
+import * as bip39 from 'bip39';
 import { ChevronLeft } from 'lucide-react-native';
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { colors } from '@/constants/colors';
 import {
   ActivityIndicator,
   Alert,
+  InteractionManager,
+  Keyboard,
   KeyboardAvoidingView,
   Platform,
   ScrollView,
@@ -16,50 +25,98 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
+  TouchableWithoutFeedback,
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { toast } from 'sonner-native';
 
+function parseMnemonicParam(raw: string | string[] | undefined): string {
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (!value) {
+    return '';
+  }
+  return value.split(',').join(' ');
+}
+
 export default function ImportNameWalletScreen() {
   const router = useDebouncedNavigation();
-  const navigation = useNavigation();
-  const params = useLocalSearchParams();
+  const params = useLocalSearchParams<{ mnemonic?: string | string[]; seedPhrase?: string | string[] }>();
   const insets = useSafeAreaInsets();
+  const keyboard = useKeyboard();
   const { createWallet } = useWallet();
   const [walletName, setWalletName] = useState('');
   const [selectedAvatar, setSelectedAvatar] = useState(avatarOptions[0]);
   const [isImporting, setIsImporting] = useState(false);
+  const [sessionMnemonic] = useState(() => consumePendingImportMnemonic());
 
-  // Get the seed phrase from navigation params
-  const seedPhrase = params.seedPhrase ? decodeURIComponent(params.seedPhrase as string) : '';
+  const seedPhrase = useMemo(() => {
+    if (sessionMnemonic) {
+      return sessionMnemonic;
+    }
+    return (
+      parseMnemonicParam(params.mnemonic) ||
+      parseMnemonicParam(params.seedPhrase)
+    );
+  }, [params.mnemonic, params.seedPhrase, sessionMnemonic]);
+
+  useEffect(() => {
+    logImportStep('name screen mounted', {
+      hasSeed: seedPhrase.length > 0,
+      wordCount: seedPhrase ? seedPhrase.split(/\s+/).length : 0,
+    });
+    if (!seedPhrase) {
+      logImportError('name screen mount', 'missing mnemonic');
+    }
+    return () => {
+      clearPendingImportMnemonic();
+    };
+  }, [seedPhrase]);
 
   const handleNext = async () => {
+    Keyboard.dismiss();
+
     if (!seedPhrase) {
       Alert.alert('Error', 'No seed phrase provided. Please go back and enter your seed phrase.');
       return;
     }
 
+    if (!bip39.validateMnemonic(seedPhrase)) {
+      Alert.alert(
+        'Invalid Seed Phrase',
+        'This recovery phrase is not valid. Go back and check your words.',
+        [{ text: 'OK' }]
+      );
+      return;
+    }
+
     setIsImporting(true);
+    logImportStep('createWallet starting', { walletName });
 
     try {
-      // Use the context's createWallet method which handles everything including unlocking
       await createWallet({ name: walletName, mnemonic: seedPhrase });
+      logImportStep('createWallet finished');
+
       await setAvatar(selectedAvatar.id);
+      logImportStep('avatar saved');
 
       toast.success('Your wallet has been imported successfully.');
 
-      navigation.dispatch(
-        CommonActions.reset({
-          index: 0,
-          routes: [{ name: 'wallet' }],
-        })
-      );
-    } catch (error: any) {
-      console.error('Import wallet error:', error);
+      // Let WDK worklet + wallet context effects settle before navigation (matches authorize screen).
+      await new Promise<void>(resolve => setTimeout(resolve, 450));
+
+      await new Promise<void>(resolve => {
+        InteractionManager.runAfterInteractions(() => resolve());
+      });
+
+      logImportStep('navigating to wallet');
+      router.dismissTo('/wallet');
+      logImportStep('navigation dispatched');
+    } catch (error: unknown) {
+      logImportError('createWallet', error);
       Alert.alert(
         'Import Failed',
-        error.message || 'Failed to import wallet. Please check your seed phrase and try again.',
+        getErrorMessage(error, 'Failed to import wallet. Please check your seed phrase and try again.'),
         [{ text: 'OK' }]
       );
     } finally {
@@ -70,85 +127,101 @@ export default function ImportNameWalletScreen() {
   const isNextDisabled = walletName.length === 0 || isImporting;
 
   return (
-    <View style={[styles.container, { paddingTop: insets.top }]}>
-      <View style={styles.header}>
-        <TouchableOpacity onPress={() => router.back()} style={styles.backButton}>
-          <ChevronLeft size={24} color={colors.primary} />
-          <Text style={styles.backText}>Back</Text>
-        </TouchableOpacity>
-      </View>
-
-      <KeyboardAvoidingView
-        style={styles.content}
-        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-      >
-        <ScrollView showsVerticalScrollIndicator={false}>
-          <Text style={styles.title}>Name Your Wallet</Text>
-          <Text style={styles.subtitle}>This name is just for you and can be changed later.</Text>
-
-          <View style={styles.inputSection}>
-            <Text style={styles.label}>Wallet Name*</Text>
-            <View style={styles.inputContainer}>
-              <Text style={styles.inputIcon}>💼</Text>
-              <TextInput
-                style={styles.input}
-                value={walletName}
-                onChangeText={setWalletName}
-                placeholder="e.g., Investment Stash"
-                placeholderTextColor={colors.textTertiary}
-                autoCapitalize="words"
-              />
-            </View>
+    <KeyboardAvoidingView
+      style={[styles.container, { paddingTop: insets.top }]}
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+    >
+      <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
+        <View style={styles.inner}>
+          <View style={styles.header}>
+            <TouchableOpacity onPress={() => router.back()} style={styles.backButton}>
+              <ChevronLeft size={24} color={colors.primary} />
+              <Text style={styles.backText}>Back</Text>
+            </TouchableOpacity>
           </View>
 
-          <View style={styles.avatarSection}>
-            <Text style={styles.sectionTitle}>Choose an avatar</Text>
-            <View style={styles.avatarGrid}>
-              {avatarOptions.map(avatar => (
-                <TouchableOpacity
-                  key={avatar.id}
-                  style={[
-                    styles.avatarItem,
-                    { backgroundColor: avatar.color },
-                    selectedAvatar.id === avatar.id && styles.selectedAvatar,
-                  ]}
-                  onPress={() => setSelectedAvatar(avatar)}
-                >
-                  <Text style={styles.avatarEmoji}>{avatar.emoji}</Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-          </View>
-        </ScrollView>
-      </KeyboardAvoidingView>
+          <ScrollView
+            style={styles.content}
+            contentContainerStyle={styles.scrollContent}
+            keyboardShouldPersistTaps="handled"
+            keyboardDismissMode="on-drag"
+            showsVerticalScrollIndicator={false}
+          >
+            <Text style={styles.title}>Name Your Wallet</Text>
+            <Text style={styles.subtitle}>This name is just for you and can be changed later.</Text>
 
-      <View style={[styles.footer, { paddingBottom: insets.bottom + 20 }]}>
-        <TouchableOpacity
-          style={[styles.nextButton, isNextDisabled && styles.nextButtonDisabled]}
-          onPress={handleNext}
-          disabled={isNextDisabled}
-        >
-          {isImporting ? (
-            <View style={styles.loadingContainer}>
-              <ActivityIndicator size="small" color={colors.textTertiary} />
-              <Text
-                style={[
-                  styles.nextButtonText,
-                  isNextDisabled && styles.nextButtonTextDisabled,
-                  { marginLeft: 8 },
-                ]}
-              >
-                Importing...
-              </Text>
+            <View style={styles.inputSection}>
+              <Text style={styles.label}>Wallet Name*</Text>
+              <View style={styles.inputContainer}>
+                <Text style={styles.inputIcon}>💼</Text>
+                <TextInput
+                  style={styles.input}
+                  value={walletName}
+                  onChangeText={setWalletName}
+                  placeholder="e.g., Investment Stash"
+                  placeholderTextColor={colors.textTertiary}
+                  autoCapitalize="words"
+                  returnKeyType="done"
+                  blurOnSubmit
+                  onSubmitEditing={Keyboard.dismiss}
+                />
+              </View>
             </View>
-          ) : (
-            <Text style={[styles.nextButtonText, isNextDisabled && styles.nextButtonTextDisabled]}>
-              Import Wallet
-            </Text>
-          )}
-        </TouchableOpacity>
-      </View>
-    </View>
+
+            <View style={styles.avatarSection}>
+              <Text style={styles.sectionTitle}>Choose an avatar</Text>
+              <View style={styles.avatarGrid}>
+                {avatarOptions.map(avatar => (
+                  <TouchableOpacity
+                    key={avatar.id}
+                    style={[
+                      styles.avatarItem,
+                      { backgroundColor: avatar.color },
+                      selectedAvatar.id === avatar.id && styles.selectedAvatar,
+                    ]}
+                    onPress={() => setSelectedAvatar(avatar)}
+                  >
+                    <Text style={styles.avatarEmoji}>{avatar.emoji}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </View>
+          </ScrollView>
+
+          <View
+            style={[
+              styles.footer,
+              { paddingBottom: (keyboard.isVisible ? 12 : insets.bottom + 20) },
+            ]}
+          >
+            <TouchableOpacity
+              style={[styles.nextButton, isNextDisabled && styles.nextButtonDisabled]}
+              onPress={handleNext}
+              disabled={isNextDisabled}
+            >
+              {isImporting ? (
+                <View style={styles.loadingContainer}>
+                  <ActivityIndicator size="small" color={colors.textTertiary} />
+                  <Text
+                    style={[
+                      styles.nextButtonText,
+                      isNextDisabled && styles.nextButtonTextDisabled,
+                      { marginLeft: 8 },
+                    ]}
+                  >
+                    Importing...
+                  </Text>
+                </View>
+              ) : (
+                <Text style={[styles.nextButtonText, isNextDisabled && styles.nextButtonTextDisabled]}>
+                  Import Wallet
+                </Text>
+              )}
+            </TouchableOpacity>
+          </View>
+        </View>
+      </TouchableWithoutFeedback>
+    </KeyboardAvoidingView>
   );
 }
 
@@ -156,6 +229,9 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: colors.background,
+  },
+  inner: {
+    flex: 1,
   },
   header: {
     paddingHorizontal: 20,
@@ -172,7 +248,11 @@ const styles = StyleSheet.create({
   },
   content: {
     flex: 1,
+  },
+  scrollContent: {
+    flexGrow: 1,
     paddingHorizontal: 20,
+    paddingBottom: 16,
   },
   title: {
     fontSize: 32,

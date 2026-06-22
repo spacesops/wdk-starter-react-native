@@ -92,5 +92,23 @@ export function useDebouncedNavigation(delay = 300) {
     [router, delay]
   );
 
-  return { push, replace, back, dismissAll };
+  const dismissTo = useCallback(
+    (path: string | { pathname: string; params?: Record<string, any> }) => {
+      if (isNavigatingRef.current) {
+        return;
+      }
+
+      isNavigatingRef.current = true;
+      router.dismissTo(path as any);
+
+      const timeoutId = setTimeout(() => {
+        isNavigatingRef.current = false;
+        timeoutIdsRef.current.delete(timeoutId);
+      }, delay);
+      timeoutIdsRef.current.add(timeoutId);
+    },
+    [router, delay]
+  );
+
+  return { push, replace, back, dismissAll, dismissTo };
 }

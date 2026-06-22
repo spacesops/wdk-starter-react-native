@@ -45,6 +45,13 @@
         "serviceAccountKeyPath": "./google-service-account.json",
         "track": "internal",
         "releaseStatus": "completed"
+      },
+      "ios": {
+        "ascAppId": "6758681065",
+        "appleTeamId": "YDF9P54VLB",
+        "ascApiKeyPath": "./AuthKey_23A8WY5349.p8",
+        "ascApiKeyId": "23A8WY5349",
+        "ascApiKeyIssuerId": "69a6de6e-55aa-47e3-e053-5b8c7c11a4d1"
       }
     },
     "open": {
@@ -52,6 +59,13 @@
         "serviceAccountKeyPath": "./google-service-account.json",
         "track": "beta",
         "releaseStatus": "completed"
+      },
+      "ios": {
+        "ascAppId": "6758681065",
+        "appleTeamId": "YDF9P54VLB",
+        "ascApiKeyPath": "./AuthKey_23A8WY5349.p8",
+        "ascApiKeyId": "23A8WY5349",
+        "ascApiKeyIssuerId": "69a6de6e-55aa-47e3-e053-5b8c7c11a4d1"
       }
     },
     "production": {
@@ -59,6 +73,13 @@
         "serviceAccountKeyPath": "./google-service-account.json",
         "track": "production",
         "releaseStatus": "completed"
+      },
+      "ios": {
+        "ascAppId": "6758681065",
+        "appleTeamId": "YDF9P54VLB",
+        "ascApiKeyPath": "./AuthKey_23A8WY5349.p8",
+        "ascApiKeyId": "23A8WY5349",
+        "ascApiKeyIssuerId": "69a6de6e-55aa-47e3-e053-5b8c7c11a4d1"
       }
     }
   }

@@ -43,7 +43,9 @@ function getBarePackTargetFlags () {
   } else if (easPlatform === 'ios') {
     targets = IOS_BARE_PACK_TARGETS;
   } else if (process.platform === 'darwin') {
-    targets = [...IOS_BARE_PACK_TARGETS, ...ANDROID_BARE_PACK_TARGETS];
+    // iOS device/simulator builds need .framework linked refs; mixing Android
+    // targets embeds linked:libbare-*.so and breaks worklets on iOS at runtime.
+    targets = IOS_BARE_PACK_TARGETS;
   } else {
     // EAS/Linux local CI: iOS bare targets are unavailable outside macOS
     targets = ANDROID_BARE_PACK_TARGETS;
@@ -154,6 +156,38 @@ function getLinkedAddonVersions (bundlePath) {
   }
 
   return linked;
+}
+
+function bundleHasIosLinkedFrameworks (bundlePath) {
+  if (!fs.existsSync(bundlePath)) return false;
+  try {
+    return /\.framework\//.test(fs.readFileSync(bundlePath, 'utf8'));
+  } catch (_) {
+    return false;
+  }
+}
+
+function bundleHasAndroidLinkedSo (bundlePath) {
+  if (!fs.existsSync(bundlePath)) return false;
+  try {
+    return /linked:libbare-[a-z-]+\.\d+\.\d+\.\d+\.so/.test(fs.readFileSync(bundlePath, 'utf8'));
+  } catch (_) {
+    return false;
+  }
+}
+
+function bundleNeedsPlatformLinkedFormat (bundlePath) {
+  const easPlatform = process.env.EAS_BUILD_PLATFORM;
+
+  if (easPlatform === 'ios' || (easPlatform !== 'android' && process.platform === 'darwin')) {
+    return !bundleHasIosLinkedFrameworks(bundlePath);
+  }
+
+  if (easPlatform === 'android' || process.platform !== 'darwin') {
+    return !bundleHasAndroidLinkedSo(bundlePath);
+  }
+
+  return false;
 }
 
 function getBundleSkew (bundlePath, addons = BARE_ADDONS) {
@@ -318,11 +352,14 @@ function removeNestedBareModules () {
 
 function regenerateBundle (label, bundlePath, importsPath, entryPath, addons) {
   const skew = getBundleSkew(bundlePath, addons);
+  const wrongLinkedFormat = bundleNeedsPlatformLinkedFormat(bundlePath);
   if (!fs.existsSync(bundlePath)) {
     console.log(`${label} bundle missing — regenerating`);
-  } else if (skew.length === 0) {
+  } else if (skew.length === 0 && !wrongLinkedFormat) {
     console.log(`${label} bundle bare-* versions match installed packages`);
     return;
+  } else if (wrongLinkedFormat) {
+    console.log(`${label} bundle linked-addon format does not match this platform — regenerating`);
   } else {
     console.log(
       `${label} bundle addon skew detected — regenerating:`,

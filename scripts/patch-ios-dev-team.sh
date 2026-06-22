@@ -9,8 +9,23 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Change to project root
 cd "$PROJECT_ROOT"
 
-PROJECT_FILE="ios/Spaces.xcodeproj/project.pbxproj"
 ENV_FILE=".env"
+
+# Expo prebuild names the Xcode project after expo.name in app.json (e.g. SpacesWallet).
+APP_NAME="$(node -p "require('./app.json').expo.name" 2>/dev/null || true)"
+if [ -z "$APP_NAME" ]; then
+  XCODEPROJ="$(find ios -maxdepth 1 -name '*.xcodeproj' -print -quit 2>/dev/null || true)"
+  if [ -n "$XCODEPROJ" ]; then
+    APP_NAME="$(basename "$XCODEPROJ" .xcodeproj)"
+  fi
+fi
+
+if [ -z "$APP_NAME" ]; then
+  echo "Error: Could not determine iOS app name. Run 'expo prebuild' first."
+  exit 1
+fi
+
+PROJECT_FILE="ios/${APP_NAME}.xcodeproj/project.pbxproj"
 
 # Check if IOS_DEVELOPMENT_TEAM is already in .env
 if [ -f "$ENV_FILE" ] && grep -q "^IOS_DEVELOPMENT_TEAM=" "$ENV_FILE"; then

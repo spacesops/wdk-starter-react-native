@@ -1,6 +1,9 @@
 import { SeedPhrase } from '@/components/SeedPhrase';
 import * as Clipboard from 'expo-clipboard';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
+import { logImportError, logImportStep } from '@/utils/import-wallet-logger';
+import { setPendingImportMnemonic } from '@/utils/import-mnemonic-session';
+import * as bip39 from 'bip39';
 import { ChevronLeft, Download, FileText, ScanText } from 'lucide-react-native';
 import React, { useState } from 'react';
 import { colors } from '@/constants/colors';
@@ -111,11 +114,20 @@ export default function ImportWalletScreen() {
       return;
     }
 
-    // Navigate to name wallet screen with the seed phrase
-    router.push({
-      pathname: './import-name-wallet',
-      params: { seedPhrase: encodeURIComponent(seedPhrase) },
-    });
+    // Validate BIP39 checksum (basic format check alone is not enough)
+    if (!bip39.validateMnemonic(seedPhrase)) {
+      Alert.alert(
+        'Invalid Seed Phrase',
+        'This does not look like a valid recovery phrase. Check spelling, word order, and word count (12 or 24).',
+        [{ text: 'OK' }]
+      );
+      return;
+    }
+
+    logImportStep('seed validated, navigating to name screen', { wordCount: secretWords.length });
+
+    setPendingImportMnemonic(seedPhrase);
+    router.push({ pathname: './import-name-wallet' });
   };
 
   return (
