@@ -1,11 +1,16 @@
 import { SeedPhrase } from '@/components/SeedPhrase';
 import * as Clipboard from 'expo-clipboard';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
-import { logImportError, logImportStep } from '@/utils/import-wallet-logger';
-import { setPendingImportMnemonic } from '@/utils/import-mnemonic-session';
+import {
+  consumeScannedImportWords,
+  setPendingImportMnemonic,
+} from '@/utils/import-mnemonic-session';
+import { TWELVE_WORD_COUNT } from '@/utils/parse-twelve-word-mnemonic';
+import { logImportStep } from '@/utils/import-wallet-logger';
 import * as bip39 from 'bip39';
+import { useFocusEffect } from '@react-navigation/native';
 import { ChevronLeft, Download, FileText, ScanText } from 'lucide-react-native';
-import React, { useState } from 'react';
+import React, { useCallback, useState } from 'react';
 import { colors } from '@/constants/colors';
 import {
   Alert,
@@ -23,7 +28,20 @@ import { toast } from 'sonner-native';
 export default function ImportWalletScreen() {
   const router = useDebouncedNavigation();
   const insets = useSafeAreaInsets();
-  const [secretWords, setSecretWords] = useState<string[]>(Array(12).fill(''));
+  const [secretWords, setSecretWords] = useState<string[]>(Array(TWELVE_WORD_COUNT).fill(''));
+
+  useFocusEffect(
+    useCallback(() => {
+      const scannedWords = consumeScannedImportWords();
+      if (!scannedWords) {
+        return;
+      }
+
+      setSecretWords(scannedWords);
+      toast.success('12 words loaded from QR code');
+      logImportStep('seed loaded from QR scan');
+    }, [])
+  );
 
   const handleWordChange = (index: number, text: string) => {
     const newWords = [...secretWords];
@@ -40,18 +58,18 @@ export default function ImportWalletScreen() {
         return;
       }
 
-      const words = clipboardContent.trim().split(/\s+/).slice(0, 12);
+      const words = clipboardContent.trim().split(/\s+/).slice(0, TWELVE_WORD_COUNT);
 
-      if (words.length < 12) {
+      if (words.length < TWELVE_WORD_COUNT) {
         toast.error(
-          `Invalid Phrase! Found only ${words.length} words in clipboard. Please ensure you have exactly 12 words.`
+          `Invalid Phrase! Found only ${words.length} words in clipboard. Please ensure you have exactly ${TWELVE_WORD_COUNT} words.`
         );
         return;
       }
 
       const newWords = [...secretWords];
       words.forEach((word, index) => {
-        if (index < 12) {
+        if (index < TWELVE_WORD_COUNT) {
           newWords[index] = word.toLowerCase().trim();
         }
       });
@@ -65,9 +83,13 @@ export default function ImportWalletScreen() {
   };
 
   const handleScanText = () => {
-    Alert.alert('Scan Text', 'Camera functionality would open here to scan QR code or text', [
-      { text: 'OK' },
-    ]);
+    router.push({
+      pathname: '/scan-qr',
+      params: {
+        returnRoute: '/wallet-setup/import-wallet',
+        scanMode: 'mnemonic',
+      },
+    });
   };
 
   const isFormValid = () => {
@@ -80,8 +102,8 @@ export default function ImportWalletScreen() {
       .split(' ')
       .filter(word => word.length > 0);
 
-    // Check if we have exactly 12 or 24 words
-    if (words.length !== 12 && words.length !== 24) {
+    // Check if we have exactly 12 words
+    if (words.length !== TWELVE_WORD_COUNT) {
       return false;
     }
 
@@ -118,7 +140,7 @@ export default function ImportWalletScreen() {
     if (!bip39.validateMnemonic(seedPhrase)) {
       Alert.alert(
         'Invalid Seed Phrase',
-        'This does not look like a valid recovery phrase. Check spelling, word order, and word count (12 or 24).',
+        'This does not look like a valid recovery phrase. Check spelling, word order, and word count (12 words).',
         [{ text: 'OK' }]
       );
       return;

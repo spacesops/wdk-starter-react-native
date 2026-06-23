@@ -1,8 +1,11 @@
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { useLocalSearchParams } from 'expo-router';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
+import { setScannedImportWords } from '@/utils/import-mnemonic-session';
+import { parseTwelveWordMnemonic } from '@/utils/parse-twelve-word-mnemonic';
+import * as bip39 from 'bip39';
 import { X } from 'lucide-react-native';
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import { Alert, Dimensions, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { colors } from '@/constants/colors';
@@ -13,19 +16,80 @@ const qrSize = screenWidth * 0.7;
 export default function ScanQRScreen() {
   const insets = useSafeAreaInsets();
   const router = useDebouncedNavigation();
-  const { returnRoute, ...params } = useLocalSearchParams();
+  const { returnRoute, scanMode, ...params } = useLocalSearchParams();
+  const isMnemonicMode = scanMode === 'mnemonic';
   const [permission, requestPermission] = useCameraPermissions();
   const [scanned, setScanned] = useState(false);
 
+  const copy = useMemo(
+    () =>
+      isMnemonicMode
+        ? {
+            permissionBody:
+              'Please allow camera access to scan a QR code containing your 12-word recovery phrase.',
+            title: 'Scan QR code with your recovery phrase.',
+            subtitle: 'Hold your phone up to the QR code. Only 12-word phrases are supported.',
+            scanLabel: 'Scan recovery phrase',
+            invalidTitle: 'Invalid QR Code',
+            invalidBody:
+              'The scanned QR code must contain exactly 12 lowercase words separated by spaces.',
+            invalidChecksumBody:
+              'This does not look like a valid 12-word recovery phrase. Check spelling and word order.',
+          }
+        : {
+            permissionBody:
+              'Please allow camera access to scan QR codes for wallet addresses.',
+            title: 'Scan QR code to make payment.',
+            subtitle: 'Hold your phone up to the QR code.',
+            scanLabel: 'Scan address',
+            invalidTitle: 'Invalid QR Code',
+            invalidBody: 'The scanned QR code does not contain a valid address.',
+            invalidChecksumBody: '',
+          },
+    [isMnemonicMode]
+  );
+
   const handleBarCodeScanned = useCallback(
-    ({ type, data }: { type: string; data: string }) => {
+    ({ data }: { type: string; data: string }) => {
       if (scanned) return;
 
       setScanned(true);
 
-      // Validate if it's a valid address format (basic validation)
+      if (isMnemonicMode) {
+        const words = parseTwelveWordMnemonic(data);
+        if (!words) {
+          Alert.alert(copy.invalidTitle, copy.invalidBody, [
+            {
+              text: 'Try Again',
+              onPress: () => setScanned(false),
+            },
+          ]);
+          return;
+        }
+
+        const mnemonic = words.join(' ');
+        if (!bip39.validateMnemonic(mnemonic)) {
+          Alert.alert(copy.invalidTitle, copy.invalidChecksumBody, [
+            {
+              text: 'Try Again',
+              onPress: () => setScanned(false),
+            },
+          ]);
+          return;
+        }
+
+        setScannedImportWords(words);
+
+        if (returnRoute) {
+          router.replace({ pathname: returnRoute as any });
+        } else {
+          router.back();
+        }
+        return;
+      }
+
       if (!data || data.length < 10) {
-        Alert.alert('Invalid QR Code', 'The scanned QR code does not contain a valid address.', [
+        Alert.alert(copy.invalidTitle, copy.invalidBody, [
           {
             text: 'Try Again',
             onPress: () => setScanned(false),
@@ -34,21 +98,19 @@ export default function ScanQRScreen() {
         return;
       }
 
-      // Navigate back with the scanned address
       if (returnRoute) {
         router.replace({
           pathname: returnRoute as any,
           params: { scannedAddress: data, ...params },
         });
       } else {
-        // Fallback - navigate to send flow starting with token selection
         router.replace({
           pathname: '/send/select-token',
           params: { scannedAddress: data, ...params },
         });
       }
     },
-    [scanned, router, returnRoute, params]
+    [scanned, router, returnRoute, params, isMnemonicMode, copy]
   );
 
   const handleClose = useCallback(() => {
@@ -58,12 +120,9 @@ export default function ScanQRScreen() {
   const handleRequestPermission = useCallback(async () => {
     const result = await requestPermission();
     if (!result.granted) {
-      Alert.alert(
-        'Camera Permission Required',
-        'Please allow camera access to scan QR codes for wallet addresses.'
-      );
+      Alert.alert('Camera Permission Required', copy.permissionBody);
     }
-  }, [requestPermission]);
+  }, [requestPermission, copy.permissionBody]);
 
   // Show loading while checking permission
   if (permission === null) {
@@ -94,9 +153,7 @@ export default function ScanQRScreen() {
         </View>
         <View style={styles.centerContent}>
           <Text style={styles.centerTitle}>Camera Permission Required</Text>
-          <Text style={styles.centerText}>
-            Please allow camera access to scan QR codes for wallet addresses.
-          </Text>
+          <Text style={styles.centerText}>{copy.permissionBody}</Text>
           <TouchableOpacity style={styles.permissionButton} onPress={handleRequestPermission}>
             <Text style={styles.permissionButtonText}>Enable Camera</Text>
           </TouchableOpacity>
@@ -117,8 +174,8 @@ export default function ScanQRScreen() {
 
       {/* Title Section */}
       <View style={styles.titleSection}>
-        <Text style={styles.title}>Scan QR code to make payment.</Text>
-        <Text style={styles.subtitle}>Hold your phone up to the QR code.</Text>
+        <Text style={styles.title}>{copy.title}</Text>
+        <Text style={styles.subtitle}>{copy.subtitle}</Text>
       </View>
 
       {/* Camera View */}
@@ -135,7 +192,7 @@ export default function ScanQRScreen() {
             </View>
 
             <View style={styles.scanInfo}>
-              <Text style={styles.scanLabel}>Scan address</Text>
+              <Text style={styles.scanLabel}>{copy.scanLabel}</Text>
             </View>
           </View>
         </CameraView>
