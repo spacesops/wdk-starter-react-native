@@ -34,22 +34,28 @@ const IOS_BARE_PACK_TARGETS = [
   'ios-x64-simulator',
 ];
 
-function getBarePackTargetFlags () {
-  const easPlatform = process.env.EAS_BUILD_PLATFORM;
-  let targets;
-
-  if (easPlatform === 'android') {
-    targets = ANDROID_BARE_PACK_TARGETS;
-  } else if (easPlatform === 'ios') {
-    targets = IOS_BARE_PACK_TARGETS;
-  } else if (process.platform === 'darwin') {
-    // iOS device/simulator builds need .framework linked refs; mixing Android
-    // targets embeds linked:libbare-*.so and breaks worklets on iOS at runtime.
-    targets = IOS_BARE_PACK_TARGETS;
-  } else {
-    // EAS/Linux local CI: iOS bare targets are unavailable outside macOS
-    targets = ANDROID_BARE_PACK_TARGETS;
+function getBarePackPlatform () {
+  const explicit = process.env.BARE_PACK_PLATFORM;
+  if (explicit === 'android' || explicit === 'ios') {
+    return explicit;
   }
+
+  const easPlatform = process.env.EAS_BUILD_PLATFORM;
+  if (easPlatform === 'android' || easPlatform === 'ios') {
+    return easPlatform;
+  }
+
+  if (process.platform === 'darwin') {
+    return 'ios';
+  }
+
+  return 'android';
+}
+
+function getBarePackTargetFlags () {
+  const platform = getBarePackPlatform();
+  const targets =
+    platform === 'android' ? ANDROID_BARE_PACK_TARGETS : IOS_BARE_PACK_TARGETS;
 
   return targets.map((target) => `--target ${target}`).join(' ');
 }
@@ -177,17 +183,29 @@ function bundleHasAndroidLinkedSo (bundlePath) {
 }
 
 function bundleNeedsPlatformLinkedFormat (bundlePath) {
-  const easPlatform = process.env.EAS_BUILD_PLATFORM;
+  const platform = getBarePackPlatform();
 
-  if (easPlatform === 'ios' || (easPlatform !== 'android' && process.platform === 'darwin')) {
+  if (platform === 'ios') {
     return !bundleHasIosLinkedFrameworks(bundlePath);
   }
 
-  if (easPlatform === 'android' || process.platform !== 'darwin') {
-    return !bundleHasAndroidLinkedSo(bundlePath);
+  return !bundleHasAndroidLinkedSo(bundlePath);
+}
+
+/** Only rewrite bundles for platform mismatch during explicit platform builds. */
+function shouldRegenerateForPlatformMismatch (bundlePath) {
+  if (!(process.env.BARE_PACK_PLATFORM || process.env.EAS_BUILD_PLATFORM)) {
+    return false;
   }
 
-  return false;
+  const platform = getBarePackPlatform();
+
+  if (platform === 'android') {
+    // Mixed .framework + .so bundles can still resolve iOS addons first on Android.
+    return !bundleHasAndroidLinkedSo(bundlePath) || bundleHasIosLinkedFrameworks(bundlePath);
+  }
+
+  return !bundleHasIosLinkedFrameworks(bundlePath);
 }
 
 function getBundleSkew (bundlePath, addons = BARE_ADDONS) {
@@ -352,14 +370,16 @@ function removeNestedBareModules () {
 
 function regenerateBundle (label, bundlePath, importsPath, entryPath, addons) {
   const skew = getBundleSkew(bundlePath, addons);
-  const wrongLinkedFormat = bundleNeedsPlatformLinkedFormat(bundlePath);
+  const wrongLinkedFormat = shouldRegenerateForPlatformMismatch(bundlePath);
   if (!fs.existsSync(bundlePath)) {
     console.log(`${label} bundle missing — regenerating`);
   } else if (skew.length === 0 && !wrongLinkedFormat) {
     console.log(`${label} bundle bare-* versions match installed packages`);
     return;
   } else if (wrongLinkedFormat) {
-    console.log(`${label} bundle linked-addon format does not match this platform — regenerating`);
+    console.log(
+      `${label} bundle linked-addon format does not match ${getBarePackPlatform()} — regenerating`,
+    );
   } else {
     console.log(
       `${label} bundle addon skew detected — regenerating:`,
