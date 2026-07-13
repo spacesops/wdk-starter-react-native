@@ -33,8 +33,8 @@
     "typecheck": "tsc --noEmit",
     "gen:bundle": "npm --prefix node_modules/@tetherto/pear-wrk-wdk run gen:mobile-bundle",
     "rebuild-wdk-bundle": "./scripts/rebuild-wdk-bundle.sh",
-    "postinstall": "node scripts/fix-secret-manager-bundle.js && node scripts/patch-wdk-unlock-guard.js",
-    "eas-build-post-install": "node scripts/fix-secret-manager-bundle.js && node scripts/patch-wdk-unlock-guard.js",
+    "postinstall": "node scripts/patch-pear-wrk-taproot-keys.js && node scripts/fix-secret-manager-bundle.js && node scripts/patch-wdk-unlock-guard.js && node scripts/patch-react-native-libveritas.js",
+    "eas-build-post-install": "node scripts/patch-pear-wrk-taproot-keys.js && node scripts/fix-secret-manager-bundle.js && node scripts/patch-wdk-unlock-guard.js && node scripts/patch-react-native-libveritas.js",
     "prebuild": "expo prebuild",
     "prebuild:clean": "expo prebuild --clean",
     "env:push:eas": "./scripts/push-env-to-eas.sh",
@@ -49,6 +49,7 @@
     "@react-navigation/elements": "^2.6.3",
     "@react-navigation/native": "^7.1.8",
     "@reduxjs/toolkit": "^2.9.0",
+    "@spacesprotocol/react-native-libveritas": "^0.2.0",
     "@tetherto/pear-wrk-wdk": "npm:@spacesops/pear-wrk-wdk@^1.0.0-beta.30",
     "@tetherto/wdk-pricing-bitfinex-http": "^1.0.0-beta.1",
     "@tetherto/wdk-pricing-provider": "^1.0.0-beta.1",
@@ -112,7 +113,8 @@
     "sodium-javascript": "^0.8.0",
     "sonner-native": "^0.21.1",
     "stream-browserify": "^3.0.0",
-    "stream-http": "^3.2.0"
+    "stream-http": "^3.2.0",
+    "uniffi-bindgen-react-native": "^0.29.3-1"
   },
   "devDependencies": {
     "@types/b4a": "^1.6.5",

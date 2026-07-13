@@ -2,6 +2,7 @@ import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
 import { ChevronLeft } from 'lucide-react-native';
 import {
   ActivityIndicator,
+  Platform,
   StyleProp,
   StyleSheet,
   Text,
@@ -13,12 +14,13 @@ import { colors } from '@/constants/colors';
 
 interface HeaderProps {
   title: string;
+  subtitle?: string;
   isLoading?: boolean;
   style?: StyleProp<ViewStyle>;
 }
 
 const Header = (params: HeaderProps) => {
-  const { title, isLoading = false, style } = params;
+  const { title, subtitle, isLoading = false, style } = params;
   const router = useDebouncedNavigation();
 
   const handleBack = () => {
@@ -32,7 +34,14 @@ const Header = (params: HeaderProps) => {
         <Text style={styles.backText}>Back</Text>
       </TouchableOpacity>
       <View style={styles.titleContainer}>
-        <Text style={styles.title}>{title}</Text>
+        <View style={styles.titleBlock}>
+          <Text style={styles.title}>{title}</Text>
+          {subtitle ? (
+            <Text style={styles.subtitle} selectable>
+              {subtitle}
+            </Text>
+          ) : null}
+        </View>
         {isLoading ? (
           <View style={styles.loadingContainer}>
             <ActivityIndicator size="small" color={colors.primary} />
@@ -71,14 +80,27 @@ const styles = StyleSheet.create({
     color: colors.text,
     textAlign: 'center',
   },
+  subtitle: {
+    fontSize: 12,
+    fontWeight: '400',
+    color: colors.textSecondary,
+    textAlign: 'center',
+    marginTop: 4,
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+  },
   spacer: {
     width: 60,
   },
   titleContainer: {
     position: 'relative',
+    flex: 1,
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
+    justifyContent: 'center',
+  },
+  titleBlock: {
+    alignItems: 'center',
+    maxWidth: '100%',
   },
   loadingContainer: {
     position: 'absolute',

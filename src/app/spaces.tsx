@@ -1,13 +1,15 @@
 import Header from '@/components/header';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
-import { AtSign, Check, ChevronDown, ChevronRight, ChevronUp, Circle, Copy, Info } from 'lucide-react-native';
+import { AtSign, Check, ChevronDown, ChevronRight, ChevronUp, Circle, Copy, Info, Search } from 'lucide-react-native';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useFocusEffect } from '@react-navigation/native';
 import {
+  ActivityIndicator,
   Alert,
   Modal,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   TouchableOpacity,
@@ -33,6 +35,17 @@ import { buildPaymentWatchRequestBody } from '@/utils/build-payment-watch-body';
 import { resolveNextAvailableTaprootPath } from '@/utils/resolve-next-spaces-path';
 import { WDKSpaces } from '@/utils/wdk-spaces';
 import { registerPurchaseStatusPollStarter } from '@/utils/purchase-poll-bridge';
+import {
+  formatAnchorsJsonForLibveritas,
+  getAnchorsJSON,
+  type AnchorsResponse,
+} from '@/utils/get-anchors-json';
+import {
+  formatZoneAttributeLabel,
+  formatZoneAttributeValue,
+  orderZoneAttributes,
+  type VerifiedZoneSummary,
+} from '@/utils/extract-zone-attributes';
 import * as Clipboard from 'expo-clipboard';
 import { toast } from 'sonner-native';
 
@@ -137,6 +150,216 @@ async function fetchListnumsChainSnapshot(
   }
 }
 
+/** Unified statuses at or after on-chain payment confirmation. */
+const PAYMENT_CONFIRMED_OR_LATER = new Set<string>([
+  'confirmed',
+  'proof_created',
+  'proof_batched',
+  'proof_committed',
+  'certificate_pending',
+  'certificate_delivered',
+  'sptr_creating',
+  'sptr_created',
+  'sptr_delivered',
+]);
+
+/** Unified statuses at or after proof committed in the purchase pipeline. */
+const PROOF_COMMITTED_OR_LATER = new Set<string>([
+  'proof_committed',
+  'certificate_pending',
+  'certificate_delivered',
+  'sptr_creating',
+  'sptr_created',
+  'sptr_delivered',
+]);
+
+/**
+ * GET /api/subsd/spaces/@{space}/handles/{subspace}
+ * `staged` = payment confirmed; `committed` = batch commitment on-chain. Keep monitoring.
+ */
+async function fetchSubsHandleRecord(
+  baseUrl: string,
+  spaceName: string,
+  subspace: string
+): Promise<{
+  subsStatus: string | null;
+  scriptPubkeyHex: string | null;
+  commitmentRoot: string | null;
+} | null> {
+  const b = baseUrl.replace(/\/$/, '');
+  const spaceSlug = `@${spaceName.toLowerCase()}`;
+  const url = `${b}/api/subsd/spaces/${encodeURIComponent(spaceSlug)}/handles/${encodeURIComponent(subspace.trim())}`;
+  try {
+    const res = await fetch(url, { headers: { Accept: 'application/json' } });
+    const text = await res.text();
+    let body: unknown;
+    try {
+      body = text ? JSON.parse(text) : null;
+    } catch {
+      body = null;
+    }
+    if (!res.ok) {
+      console.warn('[Spaces] subs handle', { url, status: res.status, body });
+      return null;
+    }
+    const o = body && typeof body === 'object' ? (body as Record<string, unknown>) : {};
+    const subsStatus = typeof o.status === 'string' ? o.status.trim().toLowerCase() : null;
+    const scriptPubkeyHex =
+      typeof o.script_pubkey === 'string' && o.script_pubkey.trim()
+        ? o.script_pubkey.trim().toLowerCase()
+        : null;
+    const commitmentRoot =
+      typeof o.commitment_root === 'string' && o.commitment_root.trim()
+        ? o.commitment_root.trim().toLowerCase()
+        : null;
+    console.log('[Spaces] subs handle', { url, subsStatus, scriptPubkeyHex, commitmentRoot });
+    return { subsStatus, scriptPubkeyHex, commitmentRoot };
+  } catch (e) {
+    console.warn('[Spaces] subs handle', url, e);
+    return null;
+  }
+}
+
+type SubsHandleSnapshot = {
+  subsStatus: string | null;
+  scriptPubkeyHex: string | null;
+  commitmentRoot: string | null;
+};
+
+/** Track commitment_root for committed handles; flag when root changes on a later check. */
+function subsCommitmentFieldsFromUpdate(
+  prev: { subsCommitmentRoot?: string | null },
+  subs: SubsHandleSnapshot | null | undefined
+): {
+  subsHandleStatus?: string | null;
+  subsCommitmentRoot?: string | null;
+  subsCommitmentRootConfirming?: boolean;
+} {
+  if (!subs) {
+    return {};
+  }
+
+  if (subs.subsStatus === 'committed' && subs.commitmentRoot) {
+    const prevRoot = prev.subsCommitmentRoot ?? null;
+    const nextRoot = subs.commitmentRoot;
+    return {
+      subsHandleStatus: subs.subsStatus,
+      subsCommitmentRoot: nextRoot,
+      subsCommitmentRootConfirming: Boolean(prevRoot && prevRoot !== nextRoot),
+    };
+  }
+
+  if (subs.subsStatus !== 'committed') {
+    return {
+      subsHandleStatus: subs.subsStatus,
+      subsCommitmentRoot: null,
+      subsCommitmentRootConfirming: false,
+    };
+  }
+
+  return { subsHandleStatus: subs.subsStatus };
+}
+
+type TenantQuoteSnapshot = {
+  found: boolean;
+  paymentConfirmed: boolean | null;
+};
+
+/**
+ * GET /tenant-quotes?space={space}&handle={subspace}
+ * Used when handle is off-chain to detect awaiting payment vs staged.
+ */
+async function fetchTenantQuoteRecord(
+  baseUrl: string,
+  spaceName: string,
+  subspace: string
+): Promise<TenantQuoteSnapshot | null> {
+  const b = baseUrl.replace(/\/$/, '');
+  const url = `${b}/tenant-quotes?space=${encodeURIComponent(spaceName.toLowerCase())}&handle=${encodeURIComponent(subspace.trim())}`;
+  try {
+    const res = await fetch(url, { headers: { Accept: 'application/json' } });
+    const text = await res.text();
+    let body: unknown;
+    try {
+      body = text ? JSON.parse(text) : null;
+    } catch {
+      body = null;
+    }
+    if (!res.ok) {
+      console.warn('[Spaces] tenant-quotes', { url, status: res.status, body });
+      return null;
+    }
+    const o = body && typeof body === 'object' ? (body as Record<string, unknown>) : {};
+    const found = o.found === true || o.success === true;
+    const state =
+      o.state && typeof o.state === 'object' ? (o.state as Record<string, unknown>) : null;
+    const paymentConfirmed =
+      state && typeof state.payment_confirmed === 'boolean' ? state.payment_confirmed : null;
+    console.log('[Spaces] tenant-quotes', { url, found, paymentConfirmed });
+    return { found, paymentConfirmed };
+  } catch (e) {
+    console.warn('[Spaces] tenant-quotes', url, e);
+    return null;
+  }
+}
+
+function tenantQuoteFieldsFromUpdate(
+  row: {
+    subsHandleStatus?: string | null;
+    status: string;
+  },
+  subs: SubsHandleSnapshot | null | undefined,
+  tenantQuote: TenantQuoteSnapshot | null | undefined,
+  isOffChain: boolean
+): {
+  tenantQuotePaymentConfirmed?: boolean | null;
+  subsHandleStatus?: string | null;
+  status?: string;
+} {
+  if (!isOffChain || !tenantQuote?.found || tenantQuote.paymentConfirmed === null) {
+    return {};
+  }
+
+  if (tenantQuote.paymentConfirmed === false) {
+    return {
+      tenantQuotePaymentConfirmed: false,
+      status: 'pending_payment',
+    };
+  }
+
+  const subsStatus = subs?.subsStatus ?? row.subsHandleStatus;
+  if (subsStatus === 'committed' || subsStatus === 'staged') {
+    return { tenantQuotePaymentConfirmed: true };
+  }
+
+  return {
+    tenantQuotePaymentConfirmed: true,
+    subsHandleStatus: 'staged',
+  };
+}
+
+function mergeStatusWithSubsHandle(
+  current: string | null | undefined,
+  subsStatus: string | null | undefined
+): string | null {
+  if (!subsStatus) {
+    return current ?? null;
+  }
+  if (subsStatus === 'committed') {
+    if (current && PROOF_COMMITTED_OR_LATER.has(current)) {
+      return current;
+    }
+    return 'proof_committed';
+  }
+  if (subsStatus === 'staged') {
+    if (current && PAYMENT_CONFIRMED_OR_LATER.has(current)) {
+      return current;
+    }
+    return 'confirmed';
+  }
+  return current ?? null;
+}
+
 /** POST purchase response may use `pointer_*` (current API) or legacy `sptr_*`. */
 /** @see PURCHASE.md — `payment_watch.path` with `{jobId}`; body includes `transaction_id` after broadcast. */
 type PaymentWatchSpec = {
@@ -171,6 +394,67 @@ function purchaseIdFromResponseBodyText(text: string): number | undefined {
   } catch {
     return undefined;
   }
+}
+
+function feeForDuration(
+  duration: string,
+  fee1: number | null,
+  fee6: number | null,
+  fee48: number | null
+): number | null {
+  switch (duration) {
+    case '~10 mins':
+      return fee1;
+    case '~1 hour':
+      return fee6;
+    case '~8 hours':
+      return fee48;
+    default:
+      return fee1;
+  }
+}
+
+/** Satoshis the wallet should pay (coupon discount on price only; block_fee never discounted). */
+function resolvePurchasePaymentAmountSats(params: {
+  serverTotalPrice: number;
+  priceSats: number | null;
+  discountPercent: number | null;
+  completelyFree: boolean;
+  selectedDuration: string;
+  blockFee1: number | null;
+  blockFee6: number | null;
+  blockFee48: number | null;
+  takeOnchain: boolean;
+  sptrPrice: number | null;
+  sptrFee1: number | null;
+  sptrFee6: number | null;
+  sptrFee48: number | null;
+}): number {
+  if (params.completelyFree) return 0;
+  if (params.discountPercent === null || params.priceSats === null) {
+    return params.serverTotalPrice;
+  }
+
+  const blockFee = feeForDuration(
+    params.selectedDuration,
+    params.blockFee1,
+    params.blockFee6,
+    params.blockFee48
+  ) ?? 0;
+  const discountedPrice = Math.floor((params.priceSats * (100 - params.discountPercent)) / 100);
+  let total = blockFee + discountedPrice;
+  if (params.takeOnchain && params.sptrPrice !== null) {
+    const sptrFee = feeForDuration(
+      params.selectedDuration,
+      params.sptrFee1,
+      params.sptrFee6,
+      params.sptrFee48
+    );
+    if (sptrFee !== null) {
+      total += params.sptrPrice + sptrFee;
+    }
+  }
+  return total;
 }
 
 function buildWatchPaymentRequestUrl(
@@ -593,7 +877,7 @@ function parseFindHandlesResponse(body: unknown): FindHandlesSpaceRow[] {
 }
 
 interface SpaceAvailabilityResponse {
-  state: 'available' | 'taken';
+  state: 'available' | 'taken' | 'unavailable';
   price?: number; // Price in sats
   '1_block_fee'?: number; // Block fee for ~10 mins in sats
   '6_block_fee'?: number; // Block fee for ~1 hour in sats
@@ -693,7 +977,9 @@ export default function SpacesScreen() {
     address: string;
   } | null>(null);
   const [showDropdown, setShowDropdown] = useState(false);
-  const [buttonState, setButtonState] = useState<'available' | 'taken' | 'loading' | null>(null);
+  const [buttonState, setButtonState] = useState<
+    'available' | 'taken' | 'reserved' | 'loading' | null
+  >(null);
   const [isButtonEnabled, setIsButtonEnabled] = useState(false);
   const [buttonLabel, setButtonLabel] = useState('Purchase');
   const [selectedDuration, setSelectedDuration] = useState<string>('~8 hours');
@@ -776,6 +1062,14 @@ export default function SpacesScreen() {
        * Set to `pointer` for Take on-chain / standalone pointer purchases.
        */
       unifiedStatusPurchaseType?: 'subname' | 'pointer';
+      /** Raw status from GET /api/subsd/spaces/@{space}/handles/{subspace} (e.g. `staged`). */
+      subsHandleStatus?: string | null;
+      /** Latest commitment_root when subs status is `committed`. */
+      subsCommitmentRoot?: string | null;
+      /** True when commitment_root changed since the prior check. */
+      subsCommitmentRootConfirming?: boolean;
+      /** `state.payment_confirmed` from GET /tenant-quotes when off-chain. */
+      tenantQuotePaymentConfirmed?: boolean | null;
     }[]
   >([]);
   const [jobPollingState, setJobPollingState] = useState<
@@ -803,7 +1097,25 @@ export default function SpacesScreen() {
   };
 
   const [isFindPurchaseExpanded, setIsFindPurchaseExpanded] = useState(true);
+  const [isMySpacesExpanded, setIsMySpacesExpanded] = useState(true);
+  const [isQuerySubspaceExpanded, setIsQuerySubspaceExpanded] = useState(false);
+  const anchorsJsonRef = useRef<AnchorsResponse | null>(null);
+  const anchorsJsonStringRef = useRef<string | null>(null);
+  const anchorsPeerUrlRef = useRef<string | null>(null);
+  const anchorsPeerUrlsRef = useRef<string[]>([]);
+  const queryResponseRef = useRef<ArrayBuffer | null>(null);
+  const verifyResultRef = useRef<unknown | null>(null);
+  const querySearchInFlightRef = useRef(false);
+  const [anchorsServerHostname, setAnchorsServerHostname] = useState<string | null>(null);
+  const [anchorsReady, setAnchorsReady] = useState(false);
+  const [querySpacesName, setQuerySpacesName] = useState('');
+  const [isQuerySearchInFlight, setIsQuerySearchInFlight] = useState(false);
+  const [queryVerifiedZones, setQueryVerifiedZones] = useState<VerifiedZoneSummary[]>([]);
+  const [queryVerifyError, setQueryVerifyError] = useState<string | null>(null);
+  const [queryRequestedHandleFound, setQueryRequestedHandleFound] = useState<boolean | null>(null);
+  const [queryNoDns, setQueryNoDns] = useState(false);
   const [isAboutSpacesExpanded, setIsAboutSpacesExpanded] = useState(false);
+  const [isRefreshingMySpacesStatuses, setIsRefreshingMySpacesStatuses] = useState(false);
 
   const handleSubspaceSelect = (space: {
     subspace: string;
@@ -820,13 +1132,144 @@ export default function SpacesScreen() {
     });
   };
 
+  const loadQueryAnchors = useCallback(async (noDns: boolean) => {
+    try {
+      const result = await getAnchorsJSON({ noDns });
+      if (!result) {
+        anchorsJsonRef.current = null;
+        anchorsJsonStringRef.current = null;
+        anchorsPeerUrlRef.current = null;
+        anchorsPeerUrlsRef.current = [];
+        verifyResultRef.current = null;
+        setQueryVerifiedZones([]);
+        setQueryVerifyError(null);
+        setQueryRequestedHandleFound(null);
+        setAnchorsServerHostname(null);
+        setAnchorsReady(false);
+        console.warn(
+          `[Spaces] getAnchorsJSON returned no anchor entries${noDns ? ' (No-DNS mode)' : ''}`
+        );
+        return;
+      }
+
+      anchorsJsonRef.current = result.anchors;
+      anchorsJsonStringRef.current = formatAnchorsJsonForLibveritas(result.anchors);
+      anchorsPeerUrlRef.current = result.peerUrl;
+      anchorsPeerUrlsRef.current = result.peerUrls;
+      setAnchorsServerHostname(result.serverHostname);
+      setAnchorsReady(true);
+      console.log('[Spaces] anchors servers:', result.serverHostname);
+      console.log('[Spaces] query peers:', result.peerUrls.join(' | '));
+      if (result.anchors.entries[0]) {
+        console.log(
+          '[Spaces] anchors first entry:',
+          JSON.stringify(result.anchors.entries[0], null, 2)
+        );
+      }
+    } catch (error) {
+      anchorsJsonRef.current = null;
+      anchorsJsonStringRef.current = null;
+      anchorsPeerUrlRef.current = null;
+      anchorsPeerUrlsRef.current = [];
+      verifyResultRef.current = null;
+      setQueryVerifiedZones([]);
+      setQueryVerifyError(null);
+      setQueryRequestedHandleFound(null);
+      setAnchorsServerHostname(null);
+      setAnchorsReady(false);
+      console.warn('[Spaces] getAnchorsJSON failed', error);
+    }
+  }, []);
+
+  const handleQuerySubspaceExpanded = useCallback(() => {
+    console.log('[Spaces] Query Subspace section expanded');
+    void loadQueryAnchors(queryNoDns);
+  }, [loadQueryAnchors, queryNoDns]);
+
+  const handleQueryNoDnsChange = useCallback(
+    (enabled: boolean) => {
+      setQueryNoDns(enabled);
+      if (isQuerySubspaceExpanded) {
+        void loadQueryAnchors(enabled);
+      }
+    },
+    [isQuerySubspaceExpanded, loadQueryAnchors]
+  );
+
+  const handleQuerySpacesSearch = useCallback(async () => {
+    const peerUrls = anchorsPeerUrlsRef.current;
+    const spacesName = querySpacesName.trim();
+    if (peerUrls.length === 0 || !spacesName || querySearchInFlightRef.current) {
+      return;
+    }
+
+    querySearchInFlightRef.current = true;
+    setIsQuerySearchInFlight(true);
+    setQueryVerifiedZones([]);
+    setQueryVerifyError(null);
+    setQueryRequestedHandleFound(null);
+
+    try {
+      const anchorsJsonString = anchorsJsonStringRef.current;
+      if (!anchorsJsonString) {
+        verifyResultRef.current = null;
+        setQueryVerifyError('Anchors unavailable — expand Query Subspace again.');
+        console.warn('[Spaces] verify skipped: anchors JSON unavailable');
+        return;
+      }
+
+      console.log('[Spaces] loading libveritas for verification…');
+      const { resolveSpacesQuery } = await import('@/utils/resolve-spaces-query');
+      const resolved = await resolveSpacesQuery(peerUrls, anchorsJsonString, spacesName, {
+        noDns: queryNoDns,
+      });
+      verifyResultRef.current = resolved.raw;
+      setQueryVerifiedZones(resolved.zones);
+      setQueryRequestedHandleFound(resolved.requestedHandleFound);
+      setQueryVerifyError(
+        resolved.requestedHandleFound
+          ? null
+          : resolved.warning ??
+              `Verified parent chain only. ${spacesName} is not yet available from this relay with a full certificate chain.`
+      );
+      console.log(
+        `[Spaces] verify success: q=${spacesName}, zones=${resolved.zones.length}, requestedFound=${resolved.requestedHandleFound}, queryParts=${resolved.queryUrlParts.join(' | ')}`
+      );
+    } catch (error) {
+      queryResponseRef.current = null;
+      verifyResultRef.current = null;
+      setQueryVerifiedZones([]);
+      setQueryRequestedHandleFound(null);
+      setQueryVerifyError(
+        error instanceof Error
+          ? error.message
+          : 'Query or verification failed'
+      );
+      console.warn(`[Spaces] query failure: q=${spacesName}`, error);
+    } finally {
+      querySearchInFlightRef.current = false;
+      setIsQuerySearchInFlight(false);
+    }
+  }, [querySpacesName, queryNoDns]);
+
+  const handleQuerySubspaceCollapsed = useCallback(() => {
+    console.log('[Spaces] Query Subspace section collapsed');
+  }, []);
+
+  const toggleQuerySubspaceExpanded = useCallback(() => {
+    if (isQuerySubspaceExpanded) {
+      handleQuerySubspaceCollapsed();
+      setIsQuerySubspaceExpanded(false);
+    } else {
+      handleQuerySubspaceExpanded();
+      setIsQuerySubspaceExpanded(true);
+    }
+  }, [isQuerySubspaceExpanded, handleQuerySubspaceExpanded, handleQuerySubspaceCollapsed]);
+
 
   const getSpaceStatus = (subspace: string, spaceName: string): string => {
     const space = mySpaces.find((s) => s.subspace === subspace && s.spaceName === spaceName);
     if (!space) return 'Unknown';
-
-    if (space.chainPresence === 'on-chain') return 'On-chain';
-    if (space.chainPresence === 'off-chain') return 'Off-chain';
 
     const statusMap: Record<UnifiedStatus, string> = {
       pending_payment: 'Awaiting Payment',
@@ -847,7 +1290,31 @@ export default function SpacesScreen() {
       discovered: 'Discovered',
     };
 
-    return statusMap[space.status] || 'Unknown';
+    if (space.chainPresence === 'on-chain') return 'On-chain';
+    if (
+      space.subsHandleStatus === 'committed' &&
+      space.subsCommitmentRootConfirming
+    ) {
+      return 'Confirming';
+    }
+    if (space.subsHandleStatus === 'committed') return 'Committed';
+    if (space.subsHandleStatus === 'staged') return 'Staged';
+    if (space.chainPresence !== 'on-chain' && space.tenantQuotePaymentConfirmed === false) {
+      return 'Awaiting Payment';
+    }
+    if (
+      space.chainPresence !== 'on-chain' &&
+      space.tenantQuotePaymentConfirmed === true &&
+      space.subsHandleStatus !== 'committed'
+    ) {
+      return 'Staged';
+    }
+
+    const unifiedLabel = statusMap[space.status];
+    if (unifiedLabel) return unifiedLabel;
+    if (space.chainPresence !== 'on-chain') return 'Off-chain';
+
+    return 'Unknown';
   };
 
   const getTimeUntilNextCheck = (subspace: string, spaceName: string): number | null => {
@@ -869,108 +1336,195 @@ export default function SpacesScreen() {
       toast.info('No spaces in My Spaces');
       return;
     }
-    const [unifiedRows, listnumsRows] = await Promise.all([
-      Promise.all(
-        mySpaces.map(async (space) => {
-          const r = await fetchUnifiedHandleStatus(
+    if (isRefreshingMySpacesStatuses) {
+      return;
+    }
+
+    setIsRefreshingMySpacesStatuses(true);
+    try {
+      const [unifiedRows, listnumsRows, subsRows] = await Promise.all([
+        Promise.all(
+          mySpaces.map(async (space) => {
+            const r = await fetchUnifiedHandleStatus(
+              SPACES_API_BASE_URL,
+              space.spaceName,
+              space.subspace,
+              space.unifiedStatusPurchaseType
+            );
+            return {
+              key: `${space.subspace}\0${space.spaceName.toLowerCase()}`,
+              unifiedStatus: r.unifiedStatus,
+              noServerPurchase: r.noServerPurchase,
+            };
+          })
+        ),
+        Promise.all(
+          mySpaces.map(async (space) => {
+            const key = `${space.subspace}\0${space.spaceName.toLowerCase()}`;
+            const spk = space.scriptPubKeyHex?.trim();
+            if (!spk) {
+              return { key, listnumsSnapshot: null as null };
+            }
+            const listnumsSnapshot = await fetchListnumsChainSnapshot(SPACES_API_BASE_URL, spk);
+            return { key, listnumsSnapshot };
+          })
+        ),
+        Promise.all(
+          mySpaces.map(async (space) => {
+            const key = `${space.subspace}\0${space.spaceName.toLowerCase()}`;
+            const subsSnapshot = await fetchSubsHandleRecord(
+              SPACES_API_BASE_URL,
+              space.spaceName,
+              space.subspace
+            );
+            return { key, subsSnapshot };
+          })
+        ),
+      ]);
+
+      const byKey = new Map<string, string>();
+      let noServerPurchaseCount = 0;
+      let otherFailureCount = 0;
+      for (const r of unifiedRows) {
+        if (r.unifiedStatus) {
+          byKey.set(r.key, r.unifiedStatus);
+        } else if (r.noServerPurchase) {
+          noServerPurchaseCount += 1;
+        } else {
+          otherFailureCount += 1;
+        }
+      }
+
+      const listnumsByKey = new Map<
+        string,
+        { onChain: boolean; listnumsLastDataHex?: string; priorTxid?: string }
+      >();
+      let onChainFromListnums = 0;
+      for (const r of listnumsRows) {
+        if (r.listnumsSnapshot) {
+          listnumsByKey.set(r.key, r.listnumsSnapshot);
+          if (r.listnumsSnapshot.onChain) {
+            onChainFromListnums += 1;
+          }
+        }
+      }
+
+      const subsByKey = new Map<string, SubsHandleSnapshot>();
+      for (const r of subsRows) {
+        if (r.subsSnapshot) {
+          subsByKey.set(r.key, r.subsSnapshot);
+        }
+      }
+
+      const offChainForTenantQuote = mySpaces.filter((space) => {
+        const k = `${space.subspace}\0${space.spaceName.toLowerCase()}`;
+        const snap = listnumsByKey.get(k);
+        if (snap) {
+          return !snap.onChain;
+        }
+        return space.chainPresence !== 'on-chain';
+      });
+
+      const tenantQuoteRows = await Promise.all(
+        offChainForTenantQuote.map(async (space) => {
+          const key = `${space.subspace}\0${space.spaceName.toLowerCase()}`;
+          const tenantQuote = await fetchTenantQuoteRecord(
             SPACES_API_BASE_URL,
             space.spaceName,
-            space.subspace,
-            space.unifiedStatusPurchaseType
+            space.subspace
           );
-          return {
-            key: `${space.subspace}\0${space.spaceName.toLowerCase()}`,
-            unifiedStatus: r.unifiedStatus,
-            noServerPurchase: r.noServerPurchase,
-          };
+          return { key, tenantQuote };
         })
-      ),
-      Promise.all(
-        mySpaces.map(async (space) => {
-          const key = `${space.subspace}\0${space.spaceName.toLowerCase()}`;
-          const spk = space.scriptPubKeyHex?.trim();
-          if (!spk) {
-            return { key, listnumsSnapshot: null as null };
-          }
-          const listnumsSnapshot = await fetchListnumsChainSnapshot(SPACES_API_BASE_URL, spk);
-          return { key, listnumsSnapshot };
-        })
-      ),
-    ]);
+      );
 
-    const byKey = new Map<string, string>();
-    let noServerPurchaseCount = 0;
-    let otherFailureCount = 0;
-    for (const r of unifiedRows) {
-      if (r.unifiedStatus) {
-        byKey.set(r.key, r.unifiedStatus);
-      } else if (r.noServerPurchase) {
-        noServerPurchaseCount += 1;
-      } else {
-        otherFailureCount += 1;
-      }
-    }
-
-    const listnumsByKey = new Map<
-      string,
-      { onChain: boolean; listnumsLastDataHex?: string; priorTxid?: string }
-    >();
-    let onChainFromListnums = 0;
-    for (const r of listnumsRows) {
-      if (r.listnumsSnapshot) {
-        listnumsByKey.set(r.key, r.listnumsSnapshot);
-        if (r.listnumsSnapshot.onChain) {
-          onChainFromListnums += 1;
+      const tenantQuoteByKey = new Map<string, TenantQuoteSnapshot>();
+      for (const r of tenantQuoteRows) {
+        if (r.tenantQuote) {
+          tenantQuoteByKey.set(r.key, r.tenantQuote);
         }
       }
-    }
 
-    setMySpaces((prev) =>
-      prev.map((row) => {
+      setMySpaces((prev) =>
+        prev.map((row) => {
+          const k = `${row.subspace}\0${row.spaceName.toLowerCase()}`;
+          const st = byKey.get(k);
+          const snap = listnumsByKey.get(k);
+          const subs = subsByKey.get(k);
+          const mergedStatus = mergeStatusWithSubsHandle(st, subs?.subsStatus);
+          let next = row;
+          if (mergedStatus) {
+            next = { ...next, status: mergedStatus as UnifiedStatus };
+          }
+          if (subs?.scriptPubkeyHex && !next.scriptPubKeyHex?.trim()) {
+            next = { ...next, scriptPubKeyHex: subs.scriptPubkeyHex };
+          }
+          if (subs) {
+            next = {
+              ...next,
+              ...subsCommitmentFieldsFromUpdate(next, subs),
+            };
+          }
+          if (snap) {
+            if (snap.onChain) {
+              next = {
+                ...next,
+                chainPresence: 'on-chain',
+                listnumsLastDataHex: snap.listnumsLastDataHex,
+                priorTxid: snap.priorTxid,
+                tenantQuotePaymentConfirmed: null,
+              };
+            } else {
+              next = {
+                ...next,
+                chainPresence: 'off-chain',
+                listnumsLastDataHex: undefined,
+                priorTxid: undefined,
+              };
+            }
+          }
+          const isOffChain = next.chainPresence !== 'on-chain';
+          const tenantQuote = tenantQuoteByKey.get(k);
+          if (isOffChain) {
+            if (tenantQuote) {
+              next = {
+                ...next,
+                ...tenantQuoteFieldsFromUpdate(next, subs, tenantQuote, true),
+              };
+            } else {
+              next = { ...next, tenantQuotePaymentConfirmed: null };
+            }
+          }
+          return next;
+        })
+      );
+
+      let statusUpdateCount = 0;
+      for (const row of mySpaces) {
         const k = `${row.subspace}\0${row.spaceName.toLowerCase()}`;
-        const st = byKey.get(k);
-        const snap = listnumsByKey.get(k);
-        let next = row;
-        if (st) {
-          next = { ...next, status: st as UnifiedStatus };
+        if (mergeStatusWithSubsHandle(byKey.get(k), subsByKey.get(k)?.subsStatus)) {
+          statusUpdateCount += 1;
         }
-        if (snap) {
-          if (snap.onChain) {
-            next = {
-              ...next,
-              chainPresence: 'on-chain',
-              listnumsLastDataHex: snap.listnumsLastDataHex,
-              priorTxid: snap.priorTxid,
-            };
-          } else {
-            next = {
-              ...next,
-              chainPresence: 'off-chain',
-              listnumsLastDataHex: undefined,
-              priorTxid: undefined,
-            };
-          }
-        }
-        return next;
-      })
-    );
-    const n = byKey.size;
-    if (n > 0) {
-      toast.success(
-        n === mySpaces.length
-          ? 'Handle status updated'
-          : `Updated ${n} of ${mySpaces.length} handles`
-      );
-    } else if (onChainFromListnums > 0) {
-      toast.success(
-        onChainFromListnums === mySpaces.length
-          ? 'On-chain status updated'
-          : `On-chain: ${onChainFromListnums} of ${mySpaces.length} handle(s) (by script key)`
-      );
-    } else if (otherFailureCount > 0) {
-      toast.error('Could not fetch handle status. Check your connection or server.');
+      }
+      const n = statusUpdateCount;
+      if (n > 0) {
+        toast.success(
+          n === mySpaces.length
+            ? 'Handle status updated'
+            : `Updated ${n} of ${mySpaces.length} handles`
+        );
+      } else if (onChainFromListnums > 0) {
+        toast.success(
+          onChainFromListnums === mySpaces.length
+            ? 'On-chain status updated'
+            : `On-chain: ${onChainFromListnums} of ${mySpaces.length} handle(s) (by script key)`
+        );
+      } else if (otherFailureCount > 0) {
+        toast.error('Could not fetch handle status. Check your connection or server.');
+      }
+    } finally {
+      setIsRefreshingMySpacesStatuses(false);
     }
-  }, [mySpaces]);
+  }, [mySpaces, isRefreshingMySpacesStatuses]);
 
   const handleCopyTxHex = async () => {
     try {
@@ -1130,6 +1684,7 @@ export default function SpacesScreen() {
     const purchaseTypeQuery =
       unifiedStatusPurchaseType === 'pointer' ? PURCHASE_TYPE_POINTER : PURCHASE_TYPE_SUBNAME;
     let pointerPaymentConfirmToastShown = false;
+    let subsPaymentConfirmToastShown = false;
     const paymentConfirmedOrLater = new Set<string>([
       'confirmed',
       'proof_created',
@@ -1159,13 +1714,35 @@ export default function SpacesScreen() {
       }));
     };
 
-    const updateSpaceStatus = (status: UnifiedStatus) => {
+    const updateSpaceStatus = (
+      status: UnifiedStatus,
+      subsSnapshot?: SubsHandleSnapshot | null,
+      tenantQuote?: TenantQuoteSnapshot | null
+    ) => {
       setMySpaces((prev) =>
-        prev.map((space) =>
-          space.subspace === subspace && space.spaceName === spaceName.toLowerCase()
-            ? { ...space, status: status, jobId, unifiedStatusPurchaseType }
-            : space
-        )
+        prev.map((space) => {
+          if (space.subspace !== subspace || space.spaceName !== spaceName.toLowerCase()) {
+            return space;
+          }
+          const isOffChain = space.chainPresence !== 'on-chain';
+          const tenantFields =
+            isOffChain && tenantQuote
+              ? tenantQuoteFieldsFromUpdate(space, subsSnapshot, tenantQuote, true)
+              : isOffChain && tenantQuote === null
+                ? { tenantQuotePaymentConfirmed: null as null }
+                : {};
+          return {
+            ...space,
+            status: (tenantFields.status as UnifiedStatus | undefined) ?? status,
+            jobId,
+            unifiedStatusPurchaseType,
+            ...(subsSnapshot?.scriptPubkeyHex && !space.scriptPubKeyHex?.trim()
+              ? { scriptPubKeyHex: subsSnapshot.scriptPubkeyHex }
+              : {}),
+            ...(subsSnapshot ? subsCommitmentFieldsFromUpdate(space, subsSnapshot) : {}),
+            ...tenantFields,
+          };
+        })
       );
     };
 
@@ -1212,9 +1789,47 @@ export default function SpacesScreen() {
             throw new Error(data.message || 'Failed to fetch job status');
           }
 
+          const subsSnapshot = await fetchSubsHandleRecord(
+            SPACES_API_BASE_URL,
+            spaceName,
+            subspace
+          );
+          const spaceRow = mySpaces.find(
+            (s) => s.subspace === subspace && s.spaceName === spaceName.toLowerCase()
+          );
+          const tenantQuote =
+            spaceRow?.chainPresence !== 'on-chain'
+              ? await fetchTenantQuoteRecord(SPACES_API_BASE_URL, spaceName, subspace)
+              : null;
+          if (subsSnapshot?.subsStatus) {
+            unifiedStatus = mergeStatusWithSubsHandle(
+              unifiedStatus,
+              subsSnapshot.subsStatus
+            ) as UnifiedStatus | null;
+            if (subsSnapshot.subsStatus === 'staged') {
+              console.log(
+                `[Spaces] subs handle staged → payment confirmed for ${subspace}@${spaceName}`
+              );
+            }
+            if (subsSnapshot.subsStatus === 'committed') {
+              console.log(
+                `[Spaces] subs handle committed for ${subspace}@${spaceName}`
+              );
+            }
+          }
+
           // Use unified status if available, otherwise map from job status
           if (unifiedStatus) {
-            updateSpaceStatus(unifiedStatus);
+            updateSpaceStatus(unifiedStatus, subsSnapshot, tenantQuote);
+            if (
+              unifiedStatusPurchaseType !== 'pointer' &&
+              !subsPaymentConfirmToastShown &&
+              subsSnapshot?.subsStatus === 'staged' &&
+              unifiedStatus === 'confirmed'
+            ) {
+              subsPaymentConfirmToastShown = true;
+              toast.success('Payment confirmed on-chain');
+            }
             if (unifiedStatusPurchaseType === 'pointer') {
               const pointerTerminal: UnifiedStatus[] = [
                 'certificate_delivered',
@@ -1241,8 +1856,24 @@ export default function SpacesScreen() {
               expired: 'expired',
               cancelled: 'cancelled',
             };
-            const mappedStatus = statusMap[job.status] || 'pending_payment';
-            updateSpaceStatus(mappedStatus);
+            let mappedStatus = statusMap[job.status] || 'pending_payment';
+            const mergedFromSubs = mergeStatusWithSubsHandle(
+              mappedStatus,
+              subsSnapshot?.subsStatus
+            );
+            if (mergedFromSubs) {
+              mappedStatus = mergedFromSubs as UnifiedStatus;
+            }
+            updateSpaceStatus(mappedStatus, subsSnapshot, tenantQuote);
+            if (
+              !subsPaymentConfirmToastShown &&
+              subsSnapshot?.subsStatus === 'staged' &&
+              mappedStatus === 'confirmed'
+            ) {
+              subsPaymentConfirmToastShown = true;
+              toast.success('Payment confirmed on-chain');
+            }
+            unifiedStatus = mappedStatus;
           }
 
           // Check for terminal states
@@ -1733,6 +2364,22 @@ export default function SpacesScreen() {
       setIsButtonEnabled(false);
       setButtonLabel('Composing Transaction...');
 
+      const paymentAmountSats = resolvePurchasePaymentAmountSats({
+        serverTotalPrice: purchaseData.total_price,
+        priceSats,
+        discountPercent,
+        completelyFree,
+        selectedDuration,
+        blockFee1,
+        blockFee6,
+        blockFee48,
+        takeOnchain,
+        sptrPrice,
+        sptrFee1,
+        sptrFee6,
+        sptrFee48,
+      });
+
       try {
         // Get Bitcoin account through WDKService
         if (!wallet) {
@@ -1774,7 +2421,9 @@ export default function SpacesScreen() {
         console.log('[Spaces] Bitcoin address:', bitcoinAddress);
         console.log('[Spaces] Composing transaction:', {
           to: purchaseData.taproot_address,
-          value: purchaseData.total_price,
+          value: paymentAmountSats,
+          originalTotalPrice: purchaseData.total_price,
+          couponDiscountPercent: discountPercent,
           scriptType,
         });
 
@@ -1808,7 +2457,7 @@ export default function SpacesScreen() {
           const quoteOptions = {
             network: NetworkType.SEGWIT,
             accountIndex: 0,
-            amount: purchaseData.total_price / 100000000,
+            amount: paymentAmountSats / 100000000,
             recipientAddress: purchaseData.taproot_address,
             asset: AssetTicker.BTC,
             memo: purchaseData.handle,
@@ -1827,7 +2476,7 @@ export default function SpacesScreen() {
           const balanceSats = balanceBTC * 100000000;
 
           // Estimate transaction fee to check if we have enough balance
-          const requestedSats = purchaseData.total_price;
+          const requestedSats = paymentAmountSats;
           let estimatedFeeSats = 0;
           let totalRequiredSats = requestedSats;
           try {
@@ -1883,7 +2532,7 @@ export default function SpacesScreen() {
           const quoteOptions = {
             network: NetworkType.SEGWIT,
             accountIndex: 0,
-            amount: purchaseData.total_price / 100000000,
+            amount: paymentAmountSats / 100000000,
             recipientAddress: purchaseData.taproot_address,
             asset: AssetTicker.BTC,
           };
@@ -1901,50 +2550,44 @@ export default function SpacesScreen() {
           const balanceSats = balanceBTC * 100000000;
 
           // Estimate transaction fee to check if we have enough balance
-          let estimatedFee = 0;
-          let totalRequired = quoteOptions.amount;
+          let estimatedFeeSats = 0;
+          let totalRequiredSats = paymentAmountSats;
           try {
             const feeQuote = await WDKService.quoteSendByNetwork(
               quoteOptions.network,
               quoteOptions.accountIndex,
-              quoteOptions.amount / 100000000, // Convert to BTC for quote
+              quoteOptions.amount,
               quoteOptions.recipientAddress,
               quoteOptions.asset
             );
-            // Fee is returned in base units (BTC), convert to satoshis
-            estimatedFee = feeQuote * 100000000;
-            totalRequired = quoteOptions.amount + estimatedFee;
+            estimatedFeeSats = Math.round(feeQuote * 100000000);
+            totalRequiredSats = paymentAmountSats + estimatedFeeSats;
           } catch (feeError) {
             console.warn('[Spaces] Could not estimate fee, using amount only:', feeError);
-            // If fee estimation fails, we'll let the transaction attempt proceed
-            // and it will fail with a more specific error
           }
 
           console.log('[Spaces] Balance check:', {
             balanceBTC: balanceBTC.toFixed(8),
             balanceSats: Math.round(balanceSats),
-            requestedAmount: quoteOptions.amount,
-            requestedAmountBTC: (quoteOptions.amount / 100000000).toFixed(8),
-            estimatedFee: Math.round(estimatedFee),
-            estimatedFeeBTC: (estimatedFee / 100000000).toFixed(8),
-            totalRequired: Math.round(totalRequired),
-            totalRequiredBTC: (totalRequired / 100000000).toFixed(8),
-            sufficient: balanceSats >= totalRequired,
+            requestedAmountSats: paymentAmountSats,
+            requestedAmountBTC: quoteOptions.amount.toFixed(8),
+            estimatedFeeSats,
+            totalRequiredSats,
+            sufficient: balanceSats >= totalRequiredSats,
           });
 
-          if (balanceSats < totalRequired) {
-            const shortfall = totalRequired - balanceSats;
+          if (balanceSats < totalRequiredSats) {
+            const shortfall = totalRequiredSats - balanceSats;
             console.error('[Spaces] Insufficient balance (including fees):', {
               balanceBTC: balanceBTC.toFixed(8),
               balanceSats: Math.round(balanceSats),
-              requestedAmount: quoteOptions.amount,
-              estimatedFee: Math.round(estimatedFee),
-              totalRequired: Math.round(totalRequired),
+              requestedAmountSats: paymentAmountSats,
+              estimatedFeeSats,
+              totalRequiredSats,
               shortfall: Math.round(shortfall),
-              shortfallBTC: (shortfall / 100000000).toFixed(8),
             });
             throw new Error(
-              `Insufficient balance. Have ${Math.round(balanceSats)} sats, need ${Math.round(totalRequired)} sats (${quoteOptions.amount} amount + ${Math.round(estimatedFee)} fee, shortfall: ${Math.round(shortfall)} sats)`
+              `Insufficient balance. Have ${Math.round(balanceSats)} sats, need ${totalRequiredSats} sats (${paymentAmountSats} amount + ${estimatedFeeSats} fee, shortfall: ${shortfall} sats)`
             );
           }
 
@@ -1968,7 +2611,7 @@ export default function SpacesScreen() {
             scriptType: 'P2TR',
             network: NetworkType.SEGWIT,
             accountIndex: 0,
-            amount: purchaseData.total_price,
+            amount: paymentAmountSats,
             recipientAddress: purchaseData.taproot_address,
             asset: AssetTicker.BTC,
             memo: purchaseData.handle,
@@ -1978,7 +2621,7 @@ export default function SpacesScreen() {
             scriptType: 'P2WPKH',
             network: NetworkType.SEGWIT,
             accountIndex: 0,
-            amount: purchaseData.total_price,
+            amount: paymentAmountSats,
             recipientAddress: purchaseData.taproot_address,
             asset: AssetTicker.BTC,
           });
@@ -2254,7 +2897,21 @@ export default function SpacesScreen() {
           // Convert balance from BTC to satoshis (balance.value is in BTC, multiply by 100M)
           const balanceBTC = btcBalance ? parseFloat(btcBalance.value) : 0;
           const balanceSats = balanceBTC * 100000000;
-          const requestedAmount = purchaseData?.total_price || 0;
+          const requestedAmount = resolvePurchasePaymentAmountSats({
+            serverTotalPrice: purchaseData?.total_price ?? 0,
+            priceSats,
+            discountPercent,
+            completelyFree,
+            selectedDuration,
+            blockFee1,
+            blockFee6,
+            blockFee48,
+            takeOnchain,
+            sptrPrice,
+            sptrFee1,
+            sptrFee6,
+            sptrFee48,
+          });
 
           console.error('[Spaces] Insufficient balance details:', {
             errorMessage: error.message,
@@ -2287,20 +2944,36 @@ export default function SpacesScreen() {
         setButtonState('available');
         setIsButtonEnabled(true);
         // Restore button label
-        if (purchaseData && btcPriceUSD !== null) {
-          const formattedSats = purchaseData.total_price.toLocaleString();
-          const satsPerBitcoin = 100000000;
-          const usdAmount = (purchaseData.total_price / satsPerBitcoin) * btcPriceUSD;
-          const formattedUSD = usdAmount.toLocaleString('en-US', {
-            minimumFractionDigits: 2,
-            maximumFractionDigits: 2,
+        if (purchaseData) {
+          const displayTotal = resolvePurchasePaymentAmountSats({
+            serverTotalPrice: purchaseData.total_price,
+            priceSats,
+            discountPercent,
+            completelyFree,
+            selectedDuration,
+            blockFee1,
+            blockFee6,
+            blockFee48,
+            takeOnchain,
+            sptrPrice,
+            sptrFee1,
+            sptrFee6,
+            sptrFee48,
           });
-          setButtonLabel(
-            `Send ${formattedSats} sats = $${formattedUSD} for ${purchaseData.handle}`
-          );
-        } else if (purchaseData) {
-          const formattedSats = purchaseData.total_price.toLocaleString();
-          setButtonLabel(`Send ${formattedSats} sats for ${purchaseData.handle}`);
+          const formattedSats = displayTotal.toLocaleString();
+          if (btcPriceUSD !== null) {
+            const satsPerBitcoin = 100000000;
+            const usdAmount = (displayTotal / satsPerBitcoin) * btcPriceUSD;
+            const formattedUSD = usdAmount.toLocaleString('en-US', {
+              minimumFractionDigits: 2,
+              maximumFractionDigits: 2,
+            });
+            setButtonLabel(
+              `Send ${formattedSats} sats = $${formattedUSD} for ${purchaseData.handle}`
+            );
+          } else {
+            setButtonLabel(`Send ${formattedSats} sats for ${purchaseData.handle}`);
+          }
         }
       }
       return;
@@ -2419,8 +3092,31 @@ export default function SpacesScreen() {
       });
       setIsConfirmationMode(true);
 
-      // Calculate USD equivalent for button label
-      const totalPrice = data.total_price;
+      const postDiscountPercent =
+        typeof data.discount_percent === 'number' ? data.discount_percent : discountPercent;
+      const postCompletelyFree = !!data.completely_free || completelyFree;
+      if (typeof data.discount_percent === 'number') {
+        setDiscountPercent(data.discount_percent);
+      }
+      if (data.completely_free) {
+        setCompletelyFree(true);
+      }
+
+      const totalPrice = resolvePurchasePaymentAmountSats({
+        serverTotalPrice: data.total_price,
+        priceSats,
+        discountPercent: postDiscountPercent,
+        completelyFree: postCompletelyFree,
+        selectedDuration,
+        blockFee1,
+        blockFee6,
+        blockFee48,
+        takeOnchain,
+        sptrPrice,
+        sptrFee1,
+        sptrFee6,
+        sptrFee48,
+      });
       const formattedSats = totalPrice.toLocaleString();
 
       if (btcPriceUSD !== null) {
@@ -2663,17 +3359,21 @@ export default function SpacesScreen() {
   // Calculate displayed total with coupon discount applied to price only (block_fee never discounted)
   const getDiscountedTotal = useCallback((): number | null => {
     if (!purchaseData || priceSats === null) return null;
-    if (completelyFree) return 0;
-    if (discountPercent === null) return purchaseData.total_price;
-
-    const blockFee = getBlockFee(selectedDuration, blockFee1, blockFee6, blockFee48) ?? 0;
-    const discountedPrice = Math.floor(priceSats * (100 - discountPercent) / 100);
-    let total = blockFee + discountedPrice;
-    if (takeOnchain && sptrPrice !== null) {
-      const sptrFee = getSptrFee(selectedDuration, sptrFee1, sptrFee6, sptrFee48);
-      if (sptrFee !== null) total += sptrPrice + sptrFee;
-    }
-    return total;
+    return resolvePurchasePaymentAmountSats({
+      serverTotalPrice: purchaseData.total_price,
+      priceSats,
+      discountPercent,
+      completelyFree,
+      selectedDuration,
+      blockFee1,
+      blockFee6,
+      blockFee48,
+      takeOnchain,
+      sptrPrice,
+      sptrFee1,
+      sptrFee6,
+      sptrFee48,
+    });
   }, [
     completelyFree,
     discountPercent,
@@ -2688,8 +3388,6 @@ export default function SpacesScreen() {
     sptrFee1,
     sptrFee6,
     sptrFee48,
-    getBlockFee,
-    getSptrFee,
   ]);
 
   // Initialize pricing service and fetch BTC price
@@ -2965,6 +3663,22 @@ export default function SpacesScreen() {
         setButtonState('taken');
         setIsButtonEnabled(false);
         setButtonLabel('Taken');
+        setPriceSats(null);
+        setBlockFee1(null);
+        setBlockFee6(null);
+        setBlockFee48(null);
+        setSptrPrice(null);
+        setSptrFee1(null);
+        setSptrFee6(null);
+        setSptrFee48(null);
+        setIsConfirmationMode(false);
+        setPurchaseData(null);
+        setHandle(null);
+        setQuoteId(null);
+      } else if (data.state === 'unavailable') {
+        setButtonState('reserved');
+        setIsButtonEnabled(false);
+        setButtonLabel('Reserved');
         setPriceSats(null);
         setBlockFee1(null);
         setBlockFee6(null);
@@ -3260,10 +3974,21 @@ export default function SpacesScreen() {
       return;
     }
 
-    const displayTotal =
-      discountPercent !== null && priceSats !== null
-        ? (getDiscountedTotal() ?? purchaseData.total_price)
-        : purchaseData.total_price;
+    const displayTotal = resolvePurchasePaymentAmountSats({
+      serverTotalPrice: purchaseData.total_price,
+      priceSats,
+      discountPercent,
+      completelyFree,
+      selectedDuration,
+      blockFee1,
+      blockFee6,
+      blockFee48,
+      takeOnchain,
+      sptrPrice,
+      sptrFee1,
+      sptrFee6,
+      sptrFee48,
+    });
 
     const formattedSats = displayTotal.toLocaleString();
 
@@ -3277,7 +4002,7 @@ export default function SpacesScreen() {
     } else {
       setButtonLabel(`Send ${formattedSats} sats for ${purchaseData.handle}`);
     }
-  }, [completelyFree, discountPercent, couponStatus, isConfirmationMode, purchaseData, btcPriceUSD, priceSats, getDiscountedTotal]);
+  }, [completelyFree, discountPercent, couponStatus, isConfirmationMode, purchaseData, btcPriceUSD, priceSats, selectedDuration, blockFee1, blockFee6, blockFee48, takeOnchain, sptrPrice, sptrFee1, sptrFee6, sptrFee48]);
 
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
@@ -3539,18 +4264,24 @@ export default function SpacesScreen() {
 
         {/* Spaces List Section */}
         <View style={styles.section}>
-          <View style={styles.sectionHeader}>
-            <AtSign size={20} color={colors.primary} />
-            <TouchableOpacity
-              onPress={handleRefreshAllMySpacesStatuses}
-              activeOpacity={1}
-              accessibilityRole="button"
-              accessibilityLabel="My Spaces, refresh all handle statuses"
-            >
-              <Text style={styles.sectionTitle}>My Spaces</Text>
-            </TouchableOpacity>
-          </View>
+          <TouchableOpacity
+            style={styles.collapsibleHeader}
+            onPress={() => setIsMySpacesExpanded(!isMySpacesExpanded)}
+            activeOpacity={0.7}
+          >
+            <View style={styles.collapsibleHeaderLeft}>
+              {isMySpacesExpanded ? (
+                <ChevronDown size={20} color={colors.textSecondary} />
+              ) : (
+                <ChevronRight size={20} color={colors.textSecondary} />
+              )}
+              <AtSign size={20} color={colors.primary} />
+              <Text style={styles.collapsibleHeaderText}>My Spaces</Text>
+            </View>
+          </TouchableOpacity>
 
+          {isMySpacesExpanded && (
+            <>
           {mySpaces.length === 0 ? (
             <View style={styles.infoCard}>
               <Text style={styles.emptyText}>No spaces yet</Text>
@@ -3564,8 +4295,28 @@ export default function SpacesScreen() {
               {/* Table Header */}
               <View style={styles.tableHeader}>
                 <Text style={[styles.tableHeaderText, styles.tableHeaderColSpace]}>Space</Text>
-                <Text style={[styles.tableHeaderText, styles.tableHeaderColStatus]}>Status</Text>
-                <Text style={[styles.tableHeaderText, styles.tableHeaderColCheck]}>Check</Text>
+                <TouchableOpacity
+                  style={[styles.tableHeaderColStatus, styles.tableHeaderStatusButton]}
+                  onPress={handleRefreshAllMySpacesStatuses}
+                  disabled={isRefreshingMySpacesStatuses || mySpaces.length === 0}
+                  activeOpacity={0.7}
+                  accessibilityRole="button"
+                  accessibilityLabel="Status, tap to refresh all handle statuses"
+                >
+                  {isRefreshingMySpacesStatuses ? (
+                    <ActivityIndicator size="small" color={colors.text} />
+                  ) : (
+                    <Text
+                      style={[
+                        styles.tableHeaderText,
+                        mySpaces.length === 0 && styles.tableHeaderStatusTextDisabled,
+                      ]}
+                    >
+                      Status
+                    </Text>
+                  )}
+                </TouchableOpacity>
+                <View style={styles.tableHeaderColCheck} />
               </View>
               {/* Table Rows */}
               {mySpaces.map((space, index) => {
@@ -3611,6 +4362,136 @@ export default function SpacesScreen() {
           >
             <Text style={styles.findSpacesButtonText}>Find Spaces</Text>
           </TouchableOpacity>
+            </>
+          )}
+        </View>
+
+        {/* Query Subspace Section */}
+        <View style={styles.section}>
+          <View style={styles.collapsibleHeaderRow}>
+            <TouchableOpacity
+              style={styles.collapsibleHeader}
+              onPress={toggleQuerySubspaceExpanded}
+              activeOpacity={0.7}
+            >
+              <View style={styles.collapsibleHeaderLeft}>
+                {isQuerySubspaceExpanded ? (
+                  <ChevronDown size={20} color={colors.textSecondary} />
+                ) : (
+                  <ChevronRight size={20} color={colors.textSecondary} />
+                )}
+                <Text style={styles.collapsibleHeaderText}>Query Subspace</Text>
+              </View>
+            </TouchableOpacity>
+            <View style={styles.noDnsToggle}>
+              <Text style={styles.noDnsLabel}>No-DNS</Text>
+              <Switch
+                value={queryNoDns}
+                onValueChange={handleQueryNoDnsChange}
+                trackColor={{ false: colors.border, true: colors.primary }}
+                thumbColor={colors.white}
+              />
+            </View>
+          </View>
+          {isQuerySubspaceExpanded && (
+            <View style={styles.infoCard}>
+              <Text style={styles.infoLabel}>Anchors servers</Text>
+              <Text style={styles.infoValue}>{anchorsServerHostname ?? '—'}</Text>
+              <View style={styles.querySubspaceRow}>
+                <TextInput
+                  style={[styles.subspaceInput, !anchorsReady && styles.queryInputDisabled]}
+                  placeholder="spaces name"
+                  placeholderTextColor={colors.textSecondary}
+                  value={querySpacesName}
+                  onChangeText={setQuerySpacesName}
+                  editable={anchorsReady}
+                  keyboardType="email-address"
+                  autoComplete="off"
+                  textContentType="none"
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                />
+                <TouchableOpacity
+                  style={[
+                    styles.querySearchButton,
+                    (!anchorsReady || !querySpacesName.trim() || isQuerySearchInFlight) &&
+                      styles.querySearchButtonDisabled,
+                  ]}
+                  onPress={() => void handleQuerySpacesSearch()}
+                  disabled={!anchorsReady || !querySpacesName.trim() || isQuerySearchInFlight}
+                  activeOpacity={0.7}
+                >
+                  <Search
+                    size={20}
+                    color={
+                      anchorsReady && querySpacesName.trim() && !isQuerySearchInFlight
+                        ? colors.text
+                        : colors.textSecondary
+                    }
+                  />
+                </TouchableOpacity>
+              </View>
+              {isQuerySearchInFlight && (
+                <View style={styles.queryResultStatusRow}>
+                  <ActivityIndicator size="small" color={colors.textSecondary} />
+                  <Text style={styles.queryResultStatusText}>Querying and verifying…</Text>
+                </View>
+              )}
+              {queryVerifyError && !isQuerySearchInFlight && (
+                <Text
+                  style={
+                    queryRequestedHandleFound === false && queryVerifiedZones.length > 0
+                      ? styles.queryVerifyWarningText
+                      : styles.queryVerifyErrorText
+                  }
+                >
+                  {queryVerifyError}
+                </Text>
+              )}
+              {queryVerifiedZones.length > 0 && !isQuerySearchInFlight && (
+                <View style={styles.queryResultsSection}>
+                  {queryVerifiedZones.map((zone, zoneIndex) => {
+                    const orderedAttributes = orderZoneAttributes(zone.attributes);
+                    const isLastZone = zoneIndex === queryVerifiedZones.length - 1;
+                    return (
+                      <View
+                        key={`${zone.handle}-${zone.canonical}`}
+                        style={[styles.queryZoneCard, isLastZone && styles.queryZoneCardLast]}
+                      >
+                        <Text style={styles.queryZoneTitle}>
+                          {zone.handle}
+                          <Text style={styles.queryZoneSovereignty}> → {zone.sovereignty}</Text>
+                        </Text>
+                        {zone.alias ? (
+                          <Text style={styles.queryZoneMeta}>alias: {zone.alias}</Text>
+                        ) : null}
+                        {orderedAttributes.length === 0 ? (
+                          <Text style={styles.queryNoRecords}>No published records</Text>
+                        ) : (
+                          orderedAttributes.map((attr, attrIndex) => {
+                            const isLastAttr = attrIndex === orderedAttributes.length - 1;
+                            return (
+                              <View
+                                key={`${zone.handle}-${attr.type}-${attr.key}`}
+                                style={[styles.infoRow, isLastAttr && styles.infoRowLast]}
+                              >
+                                <Text style={styles.infoLabel}>
+                                  {formatZoneAttributeLabel(attr)}
+                                </Text>
+                                <Text style={styles.infoValue} selectable>
+                                  {formatZoneAttributeValue(attr)}
+                                </Text>
+                              </View>
+                            );
+                          })
+                        )}
+                      </View>
+                    );
+                  })}
+                </View>
+              )}
+            </View>
+          )}
         </View>
 
         {/* Info Section */}
@@ -3705,8 +4586,24 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   collapsibleHeader: {
+    flex: 1,
     paddingVertical: 12,
     marginBottom: 12,
+  },
+  collapsibleHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  noDnsToggle: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 12,
+  },
+  noDnsLabel: {
+    fontSize: 13,
+    color: colors.textSecondary,
   },
   collapsibleHeaderLeft: {
     flexDirection: 'row',
@@ -3757,6 +4654,85 @@ const styles = StyleSheet.create({
     fontWeight: '500',
     flex: 2,
     textAlign: 'right',
+  },
+  querySubspaceRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    marginTop: 12,
+  },
+  queryInputDisabled: {
+    opacity: 0.5,
+  },
+  querySearchButton: {
+    width: 44,
+    height: 44,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: colors.borderDark,
+    backgroundColor: colors.background,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  querySearchButtonDisabled: {
+    opacity: 0.5,
+  },
+  queryResultStatusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 12,
+  },
+  queryResultStatusText: {
+    fontSize: 14,
+    color: colors.textSecondary,
+  },
+  queryVerifyErrorText: {
+    marginTop: 12,
+    fontSize: 14,
+    color: colors.error,
+  },
+  queryVerifyWarningText: {
+    marginTop: 12,
+    fontSize: 14,
+    color: colors.textSecondary,
+  },
+  queryResultsSection: {
+    marginTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: colors.borderDark,
+    paddingTop: 12,
+  },
+  queryZoneCard: {
+    marginBottom: 12,
+    paddingBottom: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.borderDark,
+  },
+  queryZoneCardLast: {
+    marginBottom: 0,
+    paddingBottom: 0,
+    borderBottomWidth: 0,
+  },
+  queryZoneTitle: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: colors.text,
+    marginBottom: 8,
+  },
+  queryZoneSovereignty: {
+    fontWeight: '500',
+    color: colors.textSecondary,
+  },
+  queryZoneMeta: {
+    fontSize: 13,
+    color: colors.textSecondary,
+    marginBottom: 8,
+  },
+  queryNoRecords: {
+    fontSize: 14,
+    color: colors.textSecondary,
+    fontStyle: 'italic',
   },
   spaceCard: {
     flexDirection: 'row',
@@ -4151,17 +5127,23 @@ const styles = StyleSheet.create({
     color: colors.text,
     textTransform: 'uppercase',
   },
-  /** ~64% of row; Space column gets most width. */
+  /** Space column — 40% narrower than prior flex 4 (now 2.4). */
   tableHeaderColSpace: {
-    flex: 4,
+    flex: 2.4,
     minWidth: 0,
   },
   tableHeaderColStatus: {
-    flex: 1,
+    flex: 1.4,
   },
   tableHeaderColCheck: {
     flex: 1,
-    textAlign: 'right',
+  },
+  tableHeaderStatusButton: {
+    justifyContent: 'center',
+    minHeight: 20,
+  },
+  tableHeaderStatusTextDisabled: {
+    color: colors.textTertiary,
   },
   tableRow: {
     flexDirection: 'row',
@@ -4173,11 +5155,11 @@ const styles = StyleSheet.create({
     borderBottomWidth: 0,
   },
   tableColSpace: {
-    flex: 4,
+    flex: 2.4,
     minWidth: 0,
   },
   tableColStatus: {
-    flex: 1,
+    flex: 1.4,
   },
   tableColCheck: {
     flex: 1,

@@ -27,6 +27,7 @@ import {
   getBitcoinTaprootPathPrefix,
 } from '@/utils/spaces-scan-paths';
 import { buildPaymentWatchRequestBody } from '@/utils/build-payment-watch-body';
+import { encodeNpubFromPubKeyHex, encodeNsecFromPrivKeyHex } from '@/utils/nip19-encode';
 import { WDKSpaces, type UpdateOnchainHexParams } from '@/utils/wdk-spaces';
 import {
   conservativePointerPaymentFeeSats,
@@ -599,7 +600,30 @@ async function fiatLabelForFeeSats(feeSats: number): Promise<string | null> {
   }
 }
 
-/** Match `scriptPubKeyHex` to a Spaces scan path and return taproot receive address + wallet-relative path for `priorAcct`. */
+type KeyDisplayMode = 'public' | 'private' | 'tweaked';
+
+const KEY_DISPLAY_LABELS: Record<KeyDisplayMode, string> = {
+  public: 'Public Key',
+  private: 'Private Key',
+  tweaked: 'Tweaked Private Key',
+};
+
+function nextKeyDisplayMode(mode: KeyDisplayMode): KeyDisplayMode {
+  if (mode === 'public') return 'private';
+  if (mode === 'private') return 'tweaked';
+  return 'public';
+}
+
+type NostrDisplayMode = 'npub' | 'nsec';
+
+const NOSTR_DISPLAY_LABELS: Record<NostrDisplayMode, string> = {
+  npub: 'NPUB',
+  nsec: 'NSEC',
+};
+
+function nextNostrDisplayMode(mode: NostrDisplayMode): NostrDisplayMode {
+  return mode === 'npub' ? 'nsec' : 'npub';
+}
 /** P2TR scriptPubKey: OP_1 (0x51) + push 32 (0x20) + 32-byte x-only output key. */
 function taprootXOnlyPubkeyHexFromScriptPubkeyHex(scriptPubkeyHex: string): string | null {
   const h = scriptPubkeyHex.trim().toLowerCase().replace(/^0x/, '');
@@ -613,6 +637,9 @@ async function resolveTaprootForScriptPubKey(scriptPubKeyHex: string): Promise<{
   priorAccountRelativePath: string;
   /** Full BIP-86 path, e.g. m/86'/0'/9'/0/0 */
   derivationPath: string;
+  internalPubKeyHex?: string;
+  privateKeyHex?: string;
+  tweakedPrivateKeyHex?: string;
 } | null> {
   const { bip, coinType } = getBitcoinTaprootPathPrefix();
   const fullPaths = buildSpacesScanDerivationPaths();
@@ -623,15 +650,25 @@ async function resolveTaprootForScriptPubKey(scriptPubKeyHex: string): Promise<{
   }
   if (rels.length === 0) return null;
   const { addressesJson } = await WDKSpaces.deriveTaprootAddressesFromPaths(rels);
-  const entries = JSON.parse(addressesJson) as { address?: string; scriptPubKeyHex?: string }[];
+  const entries = JSON.parse(addressesJson) as {
+    address?: string;
+    scriptPubKeyHex?: string;
+    internalPubKeyHex?: string;
+    privateKeyHex?: string;
+    tweakedPrivateKeyHex?: string;
+  }[];
   const target = scriptPubKeyHex.toLowerCase();
   const idx = entries.findIndex((e) => e.scriptPubKeyHex?.toLowerCase() === target);
   if (idx < 0 || !entries[idx]?.address) return null;
   const derivationPath = fullPaths[idx] ?? `m/${bip}'/${coinType}'/${rels[idx]}`;
+  const entry = entries[idx];
   return {
-    address: entries[idx].address!,
+    address: entry.address!,
     priorAccountRelativePath: rels[idx],
     derivationPath,
+    internalPubKeyHex: entry.internalPubKeyHex,
+    privateKeyHex: entry.privateKeyHex,
+    tweakedPrivateKeyHex: entry.tweakedPrivateKeyHex,
   };
 }
 
@@ -677,6 +714,13 @@ export default function SubspaceScreen() {
 
   const [taprootReceiveAddress, setTaprootReceiveAddress] = useState<string | null>(null);
   const [taprootDerivationPath, setTaprootDerivationPath] = useState<string | null>(null);
+  const [taprootKeyMaterial, setTaprootKeyMaterial] = useState<{
+    internalPubKeyHex?: string;
+    privateKeyHex?: string;
+    tweakedPrivateKeyHex?: string;
+  } | null>(null);
+  const [keyDisplayMode, setKeyDisplayMode] = useState<KeyDisplayMode>('public');
+  const [nostrDisplayMode, setNostrDisplayMode] = useState<NostrDisplayMode>('npub');
   const [taprootAddressLoading, setTaprootAddressLoading] = useState(false);
 
   useEffect(() => {
@@ -684,6 +728,7 @@ export default function SubspaceScreen() {
     if (!spk) {
       setTaprootReceiveAddress(null);
       setTaprootDerivationPath(null);
+      setTaprootKeyMaterial(null);
       setTaprootAddressLoading(false);
       return;
     }
@@ -694,12 +739,22 @@ export default function SubspaceScreen() {
         if (!cancelled) {
           setTaprootReceiveAddress(r?.address ?? null);
           setTaprootDerivationPath(r?.derivationPath ?? null);
+          setTaprootKeyMaterial(
+            r
+              ? {
+                  internalPubKeyHex: r.internalPubKeyHex,
+                  privateKeyHex: r.privateKeyHex,
+                  tweakedPrivateKeyHex: r.tweakedPrivateKeyHex,
+                }
+              : null
+          );
         }
       })
       .catch(() => {
         if (!cancelled) {
           setTaprootReceiveAddress(null);
           setTaprootDerivationPath(null);
+          setTaprootKeyMaterial(null);
         }
       })
       .finally(() => {
@@ -1550,14 +1605,51 @@ export default function SubspaceScreen() {
   };
 
   const scriptPubkeyDisplay = spaceData?.scriptPubKeyHex?.trim() ?? '';
-  const publicKeyDisplay =
+  const publicKeyFromScript =
     scriptPubkeyDisplay.length > 0
-      ? (taprootXOnlyPubkeyHexFromScriptPubkeyHex(scriptPubkeyDisplay)?.toLowerCase() ?? '—')
+      ? (taprootXOnlyPubkeyHexFromScriptPubkeyHex(scriptPubkeyDisplay)?.toLowerCase() ?? '')
       : '';
+  const displayedKeyValue = useMemo(() => {
+    if (keyDisplayMode === 'public') {
+      return (
+        taprootKeyMaterial?.internalPubKeyHex?.toLowerCase() ||
+        publicKeyFromScript ||
+        '—'
+      );
+    }
+    if (keyDisplayMode === 'private') {
+      return taprootKeyMaterial?.privateKeyHex?.toLowerCase() ?? '—';
+    }
+    return taprootKeyMaterial?.tweakedPrivateKeyHex?.toLowerCase() ?? '—';
+  }, [keyDisplayMode, taprootKeyMaterial, publicKeyFromScript]);
+
+  const nostrPubKeyHex =
+    taprootKeyMaterial?.internalPubKeyHex?.toLowerCase() || publicKeyFromScript || '';
+  const displayedNostrValue = useMemo(() => {
+    if (nostrDisplayMode === 'npub') {
+      return encodeNpubFromPubKeyHex(nostrPubKeyHex) ?? '—';
+    }
+    return encodeNsecFromPrivKeyHex(taprootKeyMaterial?.privateKeyHex) ?? '—';
+  }, [nostrDisplayMode, nostrPubKeyHex, taprootKeyMaterial?.privateKeyHex]);
+
+  const handleCycleKeyDisplay = () => {
+    setKeyDisplayMode((mode) => nextKeyDisplayMode(mode));
+  };
+
+  const handleCycleNostrDisplay = () => {
+    setNostrDisplayMode((mode) => nextNostrDisplayMode(mode));
+  };
 
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
-      <Header title={displayName} />
+      <Header
+        title={displayName}
+        subtitle={
+          taprootAddressLoading
+            ? undefined
+            : taprootDerivationPath ?? undefined
+        }
+      />
 
       <View style={styles.content}>
         {/* Status Display */}
@@ -1596,10 +1688,20 @@ export default function SubspaceScreen() {
               </TouchableOpacity>
               {detailsExpanded ? (
                 <View style={styles.cryptoSection}>
-                  <Text style={styles.cryptoLabel}>Public Key</Text>
+                  <TouchableOpacity
+                    style={styles.cryptoLabelButton}
+                    onPress={handleCycleKeyDisplay}
+                    activeOpacity={0.7}
+                    accessibilityRole="button"
+                    accessibilityLabel={`${KEY_DISPLAY_LABELS[keyDisplayMode]}, tap to change key type`}
+                  >
+                    <Text style={styles.cryptoLabelButtonText}>
+                      {KEY_DISPLAY_LABELS[keyDisplayMode]}
+                    </Text>
+                  </TouchableOpacity>
                   <View style={styles.cryptoValueBox}>
                     <Text style={styles.cryptoValueText} selectable>
-                      {publicKeyDisplay}
+                      {displayedKeyValue}
                     </Text>
                   </View>
                   <Text style={styles.cryptoLabel}>Script Pubkey</Text>
@@ -1608,14 +1710,23 @@ export default function SubspaceScreen() {
                       {scriptPubkeyDisplay.toLowerCase()}
                     </Text>
                   </View>
-                  <View style={styles.cryptoTaprootLabelRow}>
-                    <Text style={[styles.cryptoLabel, { marginBottom: 0 }]}>Taproot Address</Text>
-                    {taprootDerivationPath ? (
-                      <Text style={styles.cryptoDerivationPath} selectable>
-                        {taprootDerivationPath}
-                      </Text>
-                    ) : null}
+                  <TouchableOpacity
+                    style={styles.cryptoLabelButton}
+                    onPress={handleCycleNostrDisplay}
+                    activeOpacity={0.7}
+                    accessibilityRole="button"
+                    accessibilityLabel={`${NOSTR_DISPLAY_LABELS[nostrDisplayMode]}, tap to change Nostr key type`}
+                  >
+                    <Text style={styles.cryptoLabelButtonText}>
+                      {NOSTR_DISPLAY_LABELS[nostrDisplayMode]}
+                    </Text>
+                  </TouchableOpacity>
+                  <View style={styles.cryptoValueBox}>
+                    <Text style={styles.cryptoValueText} selectable>
+                      {displayedNostrValue}
+                    </Text>
                   </View>
+                  <Text style={styles.cryptoLabel}>Taproot Address</Text>
                   <View style={styles.cryptoValueBox}>
                     {taprootAddressLoading ? (
                       <ActivityIndicator color={colors.text} style={styles.cryptoAddressSpinner} />
@@ -2002,18 +2113,14 @@ const styles = StyleSheet.create({
     color: colors.text,
     marginBottom: 2,
   },
-  cryptoTaprootLabelRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    alignItems: 'baseline',
-    gap: 8,
+  cryptoLabelButton: {
+    alignSelf: 'flex-start',
     marginBottom: 2,
   },
-  cryptoDerivationPath: {
-    fontSize: 13,
-    fontWeight: '400',
-    color: colors.textSecondary,
-    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+  cryptoLabelButtonText: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: colors.text,
   },
   cryptoValueBox: {
     backgroundColor: colors.cardDark,
