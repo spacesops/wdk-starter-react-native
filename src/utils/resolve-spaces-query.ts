@@ -4,7 +4,7 @@ import {
   querySpacesFromAnchorServer,
 } from '@/utils/get-anchors-json';
 import type { VerifiedZoneSummary } from '@/utils/extract-zone-attributes';
-import type { Zone } from '@spacesprotocol/react-native-libveritas';
+import type { Zone } from '@spacesops/react-native-libveritas';
 
 export type ResolveSpacesQueryResult = {
   zones: VerifiedZoneSummary[];
@@ -22,7 +22,7 @@ type CachedRootZone = {
   epochHint?: { root: string; height: number };
 };
 
-type LibveritasModule = typeof import('@spacesprotocol/react-native-libveritas');
+type LibveritasModule = typeof import('@spacesops/react-native-libveritas');
 
 const rootZoneCache = new Map<string, CachedRootZone>();
 
@@ -365,7 +365,7 @@ export async function resolveSpacesQuery(
   );
 
   const [lib, { summarizeVerifiedZones, sortZonesForQuery }] = await Promise.all([
-    import('@spacesprotocol/react-native-libveritas'),
+    import('@spacesops/react-native-libveritas'),
     import('@/utils/extract-zone-attributes'),
   ]);
 

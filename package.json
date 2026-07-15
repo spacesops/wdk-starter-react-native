@@ -1,7 +1,7 @@
 {
   "name": "@tetherto/wdk-starter-react-native",
   "main": "expo-router/entry",
-  "version": "1.0.0-alpha.1",
+  "version": "1.0.1",
   "scripts": {
     "start": "expo start --dev-client",
     "start:clear": "expo start --dev-client --clear",
@@ -17,9 +17,9 @@
     "android:open": "eas build --platform android --profile beta --auto-submit-with-profile open",
     "android:preview": "eas build --platform android --profile preview",
     "beta": "eas build --platform all --profile beta --auto-submit",
-    "ios": "BARE_PACK_PLATFORM=ios node scripts/fix-secret-manager-bundle.js && expo run:ios",
-    "ios:prod": "BARE_PACK_PLATFORM=ios node scripts/fix-secret-manager-bundle.js && expo run:ios --configuration Release",
-    "ios:prod:device": "BARE_PACK_PLATFORM=ios node scripts/fix-secret-manager-bundle.js && expo run:ios --configuration Release --device",
+    "ios": "BARE_PACK_PLATFORM=ios node scripts/fix-secret-manager-bundle.js && node scripts/ensure-ios-rncore-debug.js && expo run:ios",
+    "ios:prod": "BARE_PACK_PLATFORM=ios node scripts/fix-secret-manager-bundle.js && node scripts/patch-react-native-libveritas.js && expo run:ios --configuration Release",
+    "ios:prod:device": "BARE_PACK_PLATFORM=ios node scripts/fix-secret-manager-bundle.js && node scripts/patch-react-native-libveritas.js && expo run:ios --configuration Release --device",
     "ios:release:iphone8": "BARE_PACK_PLATFORM=ios node scripts/fix-secret-manager-bundle.js && npm run rebuild-wdk-bundle && expo run:ios --configuration Release --device iPhone8",
     "ios:beta:build": "eas build --platform ios --profile beta",
     "ios:beta:submit": "eas submit --platform ios --profile beta --latest",
@@ -34,7 +34,7 @@
     "gen:bundle": "npm --prefix node_modules/@tetherto/pear-wrk-wdk run gen:mobile-bundle",
     "rebuild-wdk-bundle": "./scripts/rebuild-wdk-bundle.sh",
     "postinstall": "node scripts/patch-pear-wrk-taproot-keys.js && node scripts/fix-secret-manager-bundle.js && node scripts/patch-wdk-unlock-guard.js && node scripts/patch-react-native-libveritas.js",
-    "eas-build-post-install": "node scripts/patch-pear-wrk-taproot-keys.js && node scripts/fix-secret-manager-bundle.js && node scripts/patch-wdk-unlock-guard.js && node scripts/patch-react-native-libveritas.js",
+    "eas-build-post-install": "node scripts/patch-pear-wrk-taproot-keys.js && node scripts/fix-secret-manager-bundle.js && node scripts/patch-wdk-unlock-guard.js && node scripts/patch-react-native-libveritas.js && node scripts/ensure-ios-rncore-debug.js",
     "prebuild": "expo prebuild",
     "prebuild:clean": "expo prebuild --clean",
     "env:push:eas": "./scripts/push-env-to-eas.sh",
@@ -49,7 +49,7 @@
     "@react-navigation/elements": "^2.6.3",
     "@react-navigation/native": "^7.1.8",
     "@reduxjs/toolkit": "^2.9.0",
-    "@spacesprotocol/react-native-libveritas": "^0.2.0",
+    "@spacesops/react-native-libveritas": "^0.2.0",
     "@tetherto/pear-wrk-wdk": "npm:@spacesops/pear-wrk-wdk@^1.0.0-beta.30",
     "@tetherto/wdk-pricing-bitfinex-http": "^1.0.0-beta.1",
     "@tetherto/wdk-pricing-provider": "^1.0.0-beta.1",
@@ -90,7 +90,7 @@
     "querystring-es3": "^0.2.1",
     "react": "19.1.0",
     "react-dom": "19.1.0",
-    "react-native": "0.81.4",
+    "react-native": "0.81.5",
     "react-native-bare-kit": "^0.10.2",
     "react-native-chart-kit": "^6.12.0",
     "react-native-crypto": "^2.2.1",
@@ -104,7 +104,7 @@
     "react-native-reanimated": "~4.1.0",
     "react-native-safe-area-context": "~5.6.0",
     "react-native-screens": "~4.16.0",
-    "react-native-svg": "^15.13.0",
+    "react-native-svg": "15.12.1",
     "react-native-tcp-socket": "^6.3.0",
     "react-native-url-polyfill": "^2.0.0",
     "react-native-web": "~0.21.0",
@@ -119,7 +119,6 @@
   "devDependencies": {
     "@types/b4a": "^1.6.5",
     "@types/react": "~19.1.0",
-    "eas-cli": "20.1.0",
     "eslint": "^9.25.0",
     "eslint-config-expo": "~10.0.0",
     "eslint-config-prettier": "^10.1.8",
@@ -134,7 +133,20 @@
   },
   "peerDependencies": {
     "react": "19.1.0",
-    "react-native": "0.81.4"
+    "react-native": "0.81.5"
+  },
+  "expo": {
+    "doctor": {
+      "reactNativeDirectoryCheck": {
+        "exclude": [
+          "react-native-tcp-socket",
+          "react-native-randombytes",
+          "@spacesops/react-native-libveritas",
+          "react-native-fast-pbkdf2"
+        ],
+        "listUnknownPackages": false
+      }
+    }
   },
   "overrides": {
     "bare-pack": "1.5.1",
