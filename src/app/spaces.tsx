@@ -32,6 +32,7 @@ import {
   getBitcoinTaprootPathPrefix,
 } from '@/utils/spaces-scan-paths';
 import { buildPaymentWatchRequestBody } from '@/utils/build-payment-watch-body';
+import { formatMySpaceHandleStatusLabel } from '@/utils/format-my-space-status';
 import { resolveNextAvailableTaprootPath } from '@/utils/resolve-next-spaces-path';
 import { WDKSpaces } from '@/utils/wdk-spaces';
 import { registerPurchaseStatusPollStarter } from '@/utils/purchase-poll-bridge';
@@ -46,6 +47,7 @@ import {
   orderZoneAttributes,
   type VerifiedZoneSummary,
 } from '@/utils/extract-zone-attributes';
+import { resolveTaprootPurchaseRequiredSats } from '@/utils/estimate-taproot-memo-fee';
 import * as Clipboard from 'expo-clipboard';
 import { toast } from 'sonner-native';
 
@@ -53,6 +55,18 @@ const SPACE_NAME_OPTIONS = ['spacesops_services', 'are_currently_unavailable', '
 const DURATION_OPTIONS = ['~10 mins', '~1 hour', '~8 hours'];
 const SPACES_API_BASE_URL = process.env.EXPO_PUBLIC_SPACES_API_BASE_URL || 'http://192.168.1.111:7264';
 const SPACES_APP_NAME = 'spaces-wallet';
+const EMPTY_SUBSPACE_BUTTON_LABEL = 'Enter a subspace name';
+const NO_SPACE_NAME_BUTTON_LABEL = 'Select a Space name';
+
+function idlePurchaseButtonLabel(subspaceValue: string, spaceNameValue: string): string {
+  if (subspaceValue.trim().length === 0) {
+    return EMPTY_SUBSPACE_BUTTON_LABEL;
+  }
+  if (!spaceNameValue.trim()) {
+    return NO_SPACE_NAME_BUTTON_LABEL;
+  }
+  return 'Purchase';
+}
 
 /** @see PURCHASE.md — subname quote + purchase; pointer flow is separate (`purchase_type: "pointer"`). */
 const PURCHASE_TYPE_SUBNAME = 'subname';
@@ -173,6 +187,14 @@ const PROOF_COMMITTED_OR_LATER = new Set<string>([
   'sptr_delivered',
 ]);
 
+type SubsHandleSnapshot = {
+  subsStatus: string | null;
+  scriptPubkeyHex: string | null;
+  commitmentRoot: string | null;
+  /** `null` while batch confirmation is in progress; `final` when published. */
+  publishStatus?: string | null;
+};
+
 /**
  * GET /api/subsd/spaces/@{space}/handles/{subspace}
  * `staged` = payment confirmed; `committed` = batch commitment on-chain. Keep monitoring.
@@ -181,11 +203,7 @@ async function fetchSubsHandleRecord(
   baseUrl: string,
   spaceName: string,
   subspace: string
-): Promise<{
-  subsStatus: string | null;
-  scriptPubkeyHex: string | null;
-  commitmentRoot: string | null;
-} | null> {
+): Promise<SubsHandleSnapshot | null> {
   const b = baseUrl.replace(/\/$/, '');
   const spaceSlug = `@${spaceName.toLowerCase()}`;
   const url = `${b}/api/subsd/spaces/${encodeURIComponent(spaceSlug)}/handles/${encodeURIComponent(subspace.trim())}`;
@@ -212,19 +230,117 @@ async function fetchSubsHandleRecord(
       typeof o.commitment_root === 'string' && o.commitment_root.trim()
         ? o.commitment_root.trim().toLowerCase()
         : null;
-    console.log('[Spaces] subs handle', { url, subsStatus, scriptPubkeyHex, commitmentRoot });
-    return { subsStatus, scriptPubkeyHex, commitmentRoot };
+    const publishStatus =
+      typeof o.publish_status === 'string' && o.publish_status.trim()
+        ? o.publish_status.trim().toLowerCase()
+        : null;
+    console.log('[Spaces] subs handle', {
+      url,
+      subsStatus,
+      scriptPubkeyHex,
+      commitmentRoot,
+      publishStatus,
+    });
+    return { subsStatus, scriptPubkeyHex, commitmentRoot, publishStatus };
   } catch (e) {
     console.warn('[Spaces] subs handle', url, e);
     return null;
   }
 }
 
-type SubsHandleSnapshot = {
-  subsStatus: string | null;
-  scriptPubkeyHex: string | null;
-  commitmentRoot: string | null;
+type SpacePipelineSteps = {
+  broadcast?: string;
+  confirmed?: string;
 };
+
+/** Batch is awaiting confirmation when broadcast finished and confirmation is in progress. */
+function isPipelineBatchConfirming(steps: SpacePipelineSteps | null | undefined): boolean {
+  return steps?.broadcast === 'complete' && steps?.confirmed === 'in_progress';
+}
+
+/**
+ * GET /spaces/@{space}/pipeline — space-level batch pipeline (not per-handle).
+ * Returns `null` when the request fails; do not change stored confirming state.
+ */
+async function fetchSpacePipelineBatchConfirming(
+  baseUrl: string,
+  spaceName: string
+): Promise<boolean | null> {
+  const b = baseUrl.replace(/\/$/, '');
+  const spaceSlug = `@${spaceName.toLowerCase()}`;
+  const url = `${b}/spaces/${encodeURIComponent(spaceSlug)}/pipeline`;
+  try {
+    const res = await fetch(url, { headers: { Accept: 'application/json' } });
+    const text = await res.text();
+    let body: unknown;
+    try {
+      body = text ? JSON.parse(text) : null;
+    } catch {
+      body = null;
+    }
+    const o = body && typeof body === 'object' ? (body as Record<string, unknown>) : {};
+    const steps =
+      o.steps && typeof o.steps === 'object' ? (o.steps as SpacePipelineSteps) : null;
+    if (!res.ok || o.success === false) {
+      console.warn('[Spaces] space pipeline', { url, status: res.status, body });
+      return null;
+    }
+    if (
+      !steps &&
+      (typeof o.handle === 'string' || o.price != null || typeof o.state === 'string')
+    ) {
+      console.warn('[Spaces] space pipeline: unexpected handle payload', { url, body: o });
+      return null;
+    }
+    if (!steps) {
+      console.warn('[Spaces] space pipeline: missing steps', { url, body: o });
+      return null;
+    }
+    const confirming = isPipelineBatchConfirming(steps);
+    console.log('[Spaces] space pipeline', { url, confirming, steps });
+    return confirming;
+  } catch (e) {
+    console.warn('[Spaces] space pipeline', url, e);
+    return null;
+  }
+}
+
+/**
+ * Prefer space pipeline steps; when unavailable, infer from subs `publish_status`
+ * (`null` ⇒ batch confirmation still in progress, `final` ⇒ settled).
+ */
+function resolveSubsBatchConfirming(
+  subs: SubsHandleSnapshot | null | undefined,
+  pipelineConfirming: boolean | null
+): boolean | null {
+  if (subs?.subsStatus !== 'committed') {
+    return false;
+  }
+  if (pipelineConfirming !== null) {
+    return pipelineConfirming;
+  }
+  if (subs.publishStatus === 'final') {
+    return false;
+  }
+  if (subs.publishStatus == null) {
+    return true;
+  }
+  return null;
+}
+
+function subsPipelineFieldsFromUpdate(
+  subs: SubsHandleSnapshot | null | undefined,
+  pipelineConfirming: boolean | null
+): { subsPipelineBatchConfirming?: boolean } {
+  const resolved = resolveSubsBatchConfirming(subs, pipelineConfirming);
+  if (subs?.subsStatus !== 'committed') {
+    return { subsPipelineBatchConfirming: false };
+  }
+  if (resolved === null) {
+    return {};
+  }
+  return { subsPipelineBatchConfirming: resolved };
+}
 
 /** Track commitment_root for committed handles; flag when root changes on a later check. */
 function subsCommitmentFieldsFromUpdate(
@@ -981,7 +1097,7 @@ export default function SpacesScreen() {
     'available' | 'taken' | 'reserved' | 'loading' | null
   >(null);
   const [isButtonEnabled, setIsButtonEnabled] = useState(false);
-  const [buttonLabel, setButtonLabel] = useState('Purchase');
+  const [buttonLabel, setButtonLabel] = useState(EMPTY_SUBSPACE_BUTTON_LABEL);
   const [selectedDuration, setSelectedDuration] = useState<string>('~8 hours');
   const [priceSats, setPriceSats] = useState<number | null>(null);
   const [blockFee1, setBlockFee1] = useState<number | null>(null);
@@ -1068,6 +1184,8 @@ export default function SpacesScreen() {
       subsCommitmentRoot?: string | null;
       /** True when commitment_root changed since the prior check. */
       subsCommitmentRootConfirming?: boolean;
+      /** True when space pipeline has broadcast complete and confirmation in progress. */
+      subsPipelineBatchConfirming?: boolean;
       /** `state.payment_confirmed` from GET /tenant-quotes when off-chain. */
       tenantQuotePaymentConfirmed?: boolean | null;
     }[]
@@ -1117,16 +1235,14 @@ export default function SpacesScreen() {
   const [isAboutSpacesExpanded, setIsAboutSpacesExpanded] = useState(false);
   const [isRefreshingMySpacesStatuses, setIsRefreshingMySpacesStatuses] = useState(false);
 
-  const handleSubspaceSelect = (space: {
-    subspace: string;
-    spaceName: string;
-    scriptPubKeyHex?: string;
-  }) => {
+  const handleSubspaceSelect = (space: (typeof mySpaces)[number]) => {
+    const statusLabel = getSpaceStatus(space.subspace, space.spaceName);
     router.push({
       pathname: '/subspace',
       params: {
         subspace: space.subspace,
         spaceName: space.spaceName,
+        statusLabel,
         ...(space.scriptPubKeyHex ? { scriptPubKeyHex: space.scriptPubKeyHex } : {}),
       },
     });
@@ -1269,52 +1385,7 @@ export default function SpacesScreen() {
 
   const getSpaceStatus = (subspace: string, spaceName: string): string => {
     const space = mySpaces.find((s) => s.subspace === subspace && s.spaceName === spaceName);
-    if (!space) return 'Unknown';
-
-    const statusMap: Record<UnifiedStatus, string> = {
-      pending_payment: 'Awaiting Payment',
-      processing: 'Confirming Payment',
-      confirmed: 'Payment Confirmed',
-      proof_created: 'Proof Created',
-      proof_batched: 'Waiting for Batch',
-      proof_committed: 'Proof Committed',
-      certificate_pending: 'Preparing Certificate',
-      certificate_delivered: 'Certificate Ready',
-      sptr_creating: 'Creating SPTR',
-      sptr_created: 'SPTR Created',
-      sptr_delivered: 'Complete',
-      expired: 'Expired',
-      cancelled: 'Cancelled',
-      purchasing: 'Purchasing', // Legacy status
-      requesting: 'Requesting',
-      discovered: 'Discovered',
-    };
-
-    if (space.chainPresence === 'on-chain') return 'On-chain';
-    if (
-      space.subsHandleStatus === 'committed' &&
-      space.subsCommitmentRootConfirming
-    ) {
-      return 'Confirming';
-    }
-    if (space.subsHandleStatus === 'committed') return 'Committed';
-    if (space.subsHandleStatus === 'staged') return 'Staged';
-    if (space.chainPresence !== 'on-chain' && space.tenantQuotePaymentConfirmed === false) {
-      return 'Awaiting Payment';
-    }
-    if (
-      space.chainPresence !== 'on-chain' &&
-      space.tenantQuotePaymentConfirmed === true &&
-      space.subsHandleStatus !== 'committed'
-    ) {
-      return 'Staged';
-    }
-
-    const unifiedLabel = statusMap[space.status];
-    if (unifiedLabel) return unifiedLabel;
-    if (space.chainPresence !== 'on-chain') return 'Off-chain';
-
-    return 'Unknown';
+    return formatMySpaceHandleStatusLabel(space);
   };
 
   const getTimeUntilNextCheck = (subspace: string, spaceName: string): number | null => {
@@ -1416,6 +1487,27 @@ export default function SpacesScreen() {
         }
       }
 
+      const pipelineSpacesToCheck = new Set<string>();
+      for (const space of mySpaces) {
+        const k = `${space.subspace}\0${space.spaceName.toLowerCase()}`;
+        if (subsByKey.get(k)?.subsStatus === 'committed') {
+          pipelineSpacesToCheck.add(space.spaceName.toLowerCase());
+        }
+      }
+
+      const pipelineBySpace = new Map<string, boolean>();
+      await Promise.all(
+        [...pipelineSpacesToCheck].map(async (spaceName) => {
+          const confirming = await fetchSpacePipelineBatchConfirming(
+            SPACES_API_BASE_URL,
+            spaceName
+          );
+          if (confirming !== null) {
+            pipelineBySpace.set(spaceName, confirming);
+          }
+        })
+      );
+
       const offChainForTenantQuote = mySpaces.filter((space) => {
         const k = `${space.subspace}\0${space.spaceName.toLowerCase()}`;
         const snap = listnumsByKey.get(k);
@@ -1462,6 +1554,10 @@ export default function SpacesScreen() {
             next = {
               ...next,
               ...subsCommitmentFieldsFromUpdate(next, subs),
+              ...subsPipelineFieldsFromUpdate(
+                subs,
+                pipelineBySpace.get(row.spaceName.toLowerCase()) ?? null
+              ),
             };
           }
           if (snap) {
@@ -1535,6 +1631,15 @@ export default function SpacesScreen() {
       Alert.alert('Error', 'Failed to copy transaction hex to clipboard');
     }
   };
+
+  const finishPurchaseTxFlow = useCallback(() => {
+    setShowTxHexModal(false);
+    setSubspace('');
+    subspaceBeforeSpaceNameWarnedRef.current = false;
+    setButtonState(null);
+    setIsButtonEnabled(false);
+    setButtonLabel(EMPTY_SUBSPACE_BUTTON_LABEL);
+  }, []);
 
   const handleFindSpaces = async () => {
     const fullPaths = buildSpacesScanDerivationPaths();
@@ -1675,6 +1780,17 @@ export default function SpacesScreen() {
       unifiedStatusPurchaseType = 'subname',
     } = options;
 
+    const spaceNameLower = spaceName.toLowerCase();
+    const existingSpace = mySpaces.find(
+      (s) => s.subspace === subspace && s.spaceName === spaceNameLower
+    );
+    if (existingSpace?.chainPresence === 'on-chain') {
+      console.log(
+        `[Spaces] pollJobStatus: skip — ${subspace}@${spaceNameLower} already on-chain`
+      );
+      return null;
+    }
+
     if (activePurchaseJobPolls.has(jobId)) {
       console.log(`[Spaces] pollJobStatus: skip duplicate for job ${jobId}`);
       return null;
@@ -1714,14 +1830,34 @@ export default function SpacesScreen() {
       }));
     };
 
-    const updateSpaceStatus = (
-      status: UnifiedStatus,
-      subsSnapshot?: SubsHandleSnapshot | null,
-      tenantQuote?: TenantQuoteSnapshot | null
+    const markSpaceOnChainFromListnums = (
+      listnumsSnapshot: NonNullable<Awaited<ReturnType<typeof fetchListnumsChainSnapshot>>>
     ) => {
       setMySpaces((prev) =>
         prev.map((space) => {
-          if (space.subspace !== subspace || space.spaceName !== spaceName.toLowerCase()) {
+          if (space.subspace !== subspace || space.spaceName !== spaceNameLower) {
+            return space;
+          }
+          return {
+            ...space,
+            chainPresence: 'on-chain' as const,
+            listnumsLastDataHex: listnumsSnapshot.listnumsLastDataHex,
+            priorTxid: listnumsSnapshot.priorTxid,
+            tenantQuotePaymentConfirmed: null,
+          };
+        })
+      );
+    };
+
+    const updateSpaceStatus = (
+      status: UnifiedStatus,
+      subsSnapshot?: SubsHandleSnapshot | null,
+      tenantQuote?: TenantQuoteSnapshot | null,
+      pipelineBatchConfirming?: boolean | null
+    ) => {
+      setMySpaces((prev) =>
+        prev.map((space) => {
+          if (space.subspace !== subspace || space.spaceName !== spaceNameLower) {
             return space;
           }
           const isOffChain = space.chainPresence !== 'on-chain';
@@ -1740,6 +1876,9 @@ export default function SpacesScreen() {
               ? { scriptPubKeyHex: subsSnapshot.scriptPubkeyHex }
               : {}),
             ...(subsSnapshot ? subsCommitmentFieldsFromUpdate(space, subsSnapshot) : {}),
+            ...(subsSnapshot
+              ? subsPipelineFieldsFromUpdate(subsSnapshot, pipelineBatchConfirming)
+              : {}),
             ...tenantFields,
           };
         })
@@ -1795,12 +1934,19 @@ export default function SpacesScreen() {
             subspace
           );
           const spaceRow = mySpaces.find(
-            (s) => s.subspace === subspace && s.spaceName === spaceName.toLowerCase()
+            (s) => s.subspace === subspace && s.spaceName === spaceNameLower
           );
           const tenantQuote =
             spaceRow?.chainPresence !== 'on-chain'
               ? await fetchTenantQuoteRecord(SPACES_API_BASE_URL, spaceName, subspace)
               : null;
+          let pipelineBatchConfirming: boolean | null = null;
+          if (subsSnapshot?.subsStatus === 'committed') {
+            pipelineBatchConfirming = await fetchSpacePipelineBatchConfirming(
+              SPACES_API_BASE_URL,
+              spaceName
+            );
+          }
           if (subsSnapshot?.subsStatus) {
             unifiedStatus = mergeStatusWithSubsHandle(
               unifiedStatus,
@@ -1820,7 +1966,7 @@ export default function SpacesScreen() {
 
           // Use unified status if available, otherwise map from job status
           if (unifiedStatus) {
-            updateSpaceStatus(unifiedStatus, subsSnapshot, tenantQuote);
+            updateSpaceStatus(unifiedStatus, subsSnapshot, tenantQuote, pipelineBatchConfirming);
             if (
               unifiedStatusPurchaseType !== 'pointer' &&
               !subsPaymentConfirmToastShown &&
@@ -1864,7 +2010,7 @@ export default function SpacesScreen() {
             if (mergedFromSubs) {
               mappedStatus = mergedFromSubs as UnifiedStatus;
             }
-            updateSpaceStatus(mappedStatus, subsSnapshot, tenantQuote);
+            updateSpaceStatus(mappedStatus, subsSnapshot, tenantQuote, pipelineBatchConfirming);
             if (
               !subsPaymentConfirmToastShown &&
               subsSnapshot?.subsStatus === 'staged' &&
@@ -1874,6 +2020,29 @@ export default function SpacesScreen() {
               toast.success('Payment confirmed on-chain');
             }
             unifiedStatus = mappedStatus;
+          }
+
+          const scriptPubKeyHex =
+            subsSnapshot?.scriptPubkeyHex?.trim() || spaceRow?.scriptPubKeyHex?.trim();
+          if (scriptPubKeyHex) {
+            const listnumsSnapshot = await fetchListnumsChainSnapshot(
+              SPACES_API_BASE_URL,
+              scriptPubKeyHex
+            );
+            if (listnumsSnapshot?.onChain) {
+              markSpaceOnChainFromListnums(listnumsSnapshot);
+              updatePollingState(Date.now(), false);
+              console.log(
+                `[Spaces] ${subspace}@${spaceNameLower} is on-chain — stopping status poll for job ${jobId}`
+              );
+              return data;
+            }
+          } else if (spaceRow?.chainPresence === 'on-chain') {
+            updatePollingState(Date.now(), false);
+            console.log(
+              `[Spaces] ${subspace}@${spaceNameLower} is on-chain — stopping status poll for job ${jobId}`
+            );
+            return data;
           }
 
           // Check for terminal states
@@ -2198,7 +2367,7 @@ export default function SpacesScreen() {
         });
       }
 
-      setShowTxHexModal(false);
+      finishPurchaseTxFlow();
     } catch (error) {
       console.error('[Spaces] Failed to broadcast transaction:', error);
       const errorMessage =
@@ -2477,8 +2646,7 @@ export default function SpacesScreen() {
 
           // Estimate transaction fee to check if we have enough balance
           const requestedSats = paymentAmountSats;
-          let estimatedFeeSats = 0;
-          let totalRequiredSats = requestedSats;
+          let quotedFeeSats: number | null = null;
           try {
             const feeQuote = await WDKService.quoteSendByNetworkWithMemo(
               quoteOptions.network,
@@ -2488,11 +2656,20 @@ export default function SpacesScreen() {
               quoteOptions.asset,
               quoteOptions.memo
             );
-            estimatedFeeSats = Math.round(feeQuote * 100000000);
-            totalRequiredSats = requestedSats + estimatedFeeSats;
+            quotedFeeSats = Math.round(feeQuote * 100000000);
           } catch (feeError) {
-            console.warn('[Spaces] Could not estimate fee, using amount only:', feeError);
+            console.warn(
+              '[Spaces] Fee quote failed; using conservative Taproot memo estimate:',
+              feeError
+            );
           }
+
+          const { estimatedFeeSats, totalRequiredSats, feeSource } =
+            resolveTaprootPurchaseRequiredSats(
+              requestedSats,
+              purchaseData.handle,
+              quotedFeeSats
+            );
 
           console.log('[Spaces] Balance check (P2TR):', {
             balanceBTC: balanceBTC.toFixed(8),
@@ -2500,6 +2677,7 @@ export default function SpacesScreen() {
             requestedAmountSats: requestedSats,
             requestedAmountBTC: quoteOptions.amount.toFixed(8),
             estimatedFeeSats,
+            feeSource,
             totalRequiredSats,
             sufficient: balanceSats >= totalRequiredSats,
           });
@@ -2912,6 +3090,11 @@ export default function SpacesScreen() {
             sptrFee6,
             sptrFee48,
           });
+          const { estimatedFeeSats, totalRequiredSats } = resolveTaprootPurchaseRequiredSats(
+            requestedAmount,
+            purchaseData?.handle ?? '',
+            null
+          );
 
           console.error('[Spaces] Insufficient balance details:', {
             errorMessage: error.message,
@@ -2919,10 +3102,13 @@ export default function SpacesScreen() {
             balanceSats: Math.round(balanceSats),
             requestedAmount,
             requestedAmountBTC: (requestedAmount / 100000000).toFixed(8),
-            shortfall: Math.round(requestedAmount - balanceSats),
-            shortfallBTC: ((requestedAmount - balanceSats) / 100000000).toFixed(8),
+            estimatedFeeSats,
+            totalRequiredSats,
+            shortfall: Math.round(totalRequiredSats - balanceSats),
+            shortfallBTC: ((totalRequiredSats - balanceSats) / 100000000).toFixed(8),
             fromAddress: addresses?.[NetworkType.SEGWIT],
             recipientAddress: purchaseData?.taproot_address,
+            memo: purchaseData?.handle,
           });
         } else {
           console.error('[Spaces] Transaction error details:', {
@@ -3525,7 +3711,7 @@ export default function SpacesScreen() {
     if (!subspace.trim() || !spaceName) {
       setButtonState(null);
       setIsButtonEnabled(false);
-      setButtonLabel('Purchase');
+      setButtonLabel(idlePurchaseButtonLabel(subspace, spaceName));
       setPriceSats(null);
       setBlockFee1(null);
       setBlockFee6(null);
@@ -3772,9 +3958,9 @@ export default function SpacesScreen() {
 
     setButtonState(null);
     setIsButtonEnabled(false);
-    setButtonLabel('Purchase');
+    setButtonLabel(idlePurchaseButtonLabel(subspace, spaceName));
     Alert.alert('Error', message);
-  }, []);
+  }, [subspace, spaceName]);
 
   handleSpacesPurchaseApiErrorRef.current = handleSpacesPurchaseApiError;
 
@@ -3806,8 +3992,14 @@ export default function SpacesScreen() {
         // Resume polling for active jobs
         const terminalStates: UnifiedStatus[] = ['certificate_delivered', 'sptr_delivered', 'expired', 'cancelled'];
         const activeSpaces = loadedSpaces.filter(
-          (space: { jobId?: number; status: UnifiedStatus }) =>
-            space.jobId && !terminalStates.includes(space.status)
+          (space: {
+            jobId?: number;
+            status: UnifiedStatus;
+            chainPresence?: 'on-chain' | 'off-chain';
+          }) =>
+            space.jobId &&
+            !terminalStates.includes(space.status) &&
+            space.chainPresence !== 'on-chain'
         );
 
         if (activeSpaces.length > 0) {
@@ -4160,7 +4352,7 @@ export default function SpacesScreen() {
               </View>
             )}
 
-            {/* Take Onchain Checkbox */}
+            {/* Take Onchain — hidden for now; re-enable when SPTR pointer purchase at quote time is ready again.
             {!isConfirmationMode && (
               <TouchableOpacity
                 style={styles.checkboxContainer}
@@ -4175,6 +4367,7 @@ export default function SpacesScreen() {
                 </Text>
               </TouchableOpacity>
             )}
+            */}
 
             <TouchableOpacity
               style={[
@@ -4215,7 +4408,7 @@ export default function SpacesScreen() {
           visible={showTxHexModal}
           transparent={true}
           animationType="fade"
-          onRequestClose={() => setShowTxHexModal(false)}
+          onRequestClose={finishPurchaseTxFlow}
         >
           <View style={styles.modalOverlay}>
             <View style={styles.modalContent}>
@@ -4234,15 +4427,16 @@ export default function SpacesScreen() {
                   <Copy size={18} color={colors.black} />
                   <Text style={styles.modalCopyButtonText}>Copy</Text>
                 </TouchableOpacity>
-                <TouchableOpacity
-                  style={styles.modalDismissButton}
-                  onPress={() => setShowTxHexModal(false)}
-                  activeOpacity={0.7}
-                >
-                  <Text style={styles.modalDismissButtonText}>Dismiss</Text>
-                </TouchableOpacity>
               </View>
               <View style={[styles.modalButtonRow, styles.modalButtonRowSpacing]}>
+                <TouchableOpacity
+                  style={styles.modalDismissButton}
+                  onPress={finishPurchaseTxFlow}
+                  activeOpacity={0.7}
+                >
+                  <Text style={styles.modalDismissButtonText}>Cancel</Text>
+                </TouchableOpacity>
+                {/* Simulate (dev-only dummy txid): re-enable when simulating watch-payment without broadcast is needed again.
                 <TouchableOpacity
                   style={styles.modalSimulateButton}
                   onPress={handleSimulate}
@@ -4250,12 +4444,13 @@ export default function SpacesScreen() {
                 >
                   <Text style={styles.modalSimulateButtonText}>Simulate</Text>
                 </TouchableOpacity>
+                */}
                 <TouchableOpacity
                   style={styles.modalBroadcastButton}
                   onPress={handleBroadcast}
                   activeOpacity={0.7}
                 >
-                  <Text style={styles.modalBroadcastButtonText}>Broadcast</Text>
+                  <Text style={styles.modalBroadcastButtonText}>Proceed</Text>
                 </TouchableOpacity>
               </View>
             </View>
@@ -4334,7 +4529,7 @@ export default function SpacesScreen() {
                       onPress={() => handleSubspaceSelect(space)}
                       activeOpacity={0.7}
                     >
-                      <Text style={styles.tableCellSpaceText}>
+                      <Text style={styles.tableCellSpaceText} numberOfLines={1}>
                         {space.subspace}@{space.spaceName}
                       </Text>
                     </TouchableOpacity>
@@ -4452,6 +4647,8 @@ export default function SpacesScreen() {
                 <View style={styles.queryResultsSection}>
                   {queryVerifiedZones.map((zone, zoneIndex) => {
                     const orderedAttributes = orderZoneAttributes(zone.attributes);
+                    const orderedFallbackAttributes = orderZoneAttributes(zone.fallbackAttributes);
+                    const hasFallback = orderedFallbackAttributes.length > 0;
                     const isLastZone = zoneIndex === queryVerifiedZones.length - 1;
                     return (
                       <View
@@ -4465,25 +4662,57 @@ export default function SpacesScreen() {
                         {zone.alias ? (
                           <Text style={styles.queryZoneMeta}>alias: {zone.alias}</Text>
                         ) : null}
-                        {orderedAttributes.length === 0 ? (
+                        {orderedAttributes.length === 0 && !hasFallback ? (
                           <Text style={styles.queryNoRecords}>No published records</Text>
                         ) : (
-                          orderedAttributes.map((attr, attrIndex) => {
-                            const isLastAttr = attrIndex === orderedAttributes.length - 1;
-                            return (
-                              <View
-                                key={`${zone.handle}-${attr.type}-${attr.key}`}
-                                style={[styles.infoRow, isLastAttr && styles.infoRowLast]}
-                              >
-                                <Text style={styles.infoLabel}>
-                                  {formatZoneAttributeLabel(attr)}
-                                </Text>
-                                <Text style={styles.infoValue} selectable>
-                                  {formatZoneAttributeValue(attr)}
-                                </Text>
-                              </View>
-                            );
-                          })
+                          <>
+                            {orderedAttributes.length === 0 ? (
+                              <Text style={styles.queryNoRecords}>No published records</Text>
+                            ) : (
+                              orderedAttributes.map((attr, attrIndex) => {
+                                const isLastPrimary =
+                                  !hasFallback && attrIndex === orderedAttributes.length - 1;
+                                return (
+                                  <View
+                                    key={`${zone.handle}-${attr.type}-${attr.key}`}
+                                    style={[styles.infoRow, isLastPrimary && styles.infoRowLast]}
+                                  >
+                                    <Text style={styles.infoLabel}>
+                                      {formatZoneAttributeLabel(attr)}
+                                    </Text>
+                                    <Text style={styles.infoValue} selectable>
+                                      {formatZoneAttributeValue(attr)}
+                                    </Text>
+                                  </View>
+                                );
+                              })
+                            )}
+                            {hasFallback ? (
+                              <>
+                                <Text style={styles.queryFallbackHeading}>Fallback</Text>
+                                {orderedFallbackAttributes.map((attr, attrIndex) => {
+                                  const isLastFallback =
+                                    attrIndex === orderedFallbackAttributes.length - 1;
+                                  return (
+                                    <View
+                                      key={`${zone.handle}-fallback-${attr.type}-${attr.key}`}
+                                      style={[
+                                        styles.infoRow,
+                                        isLastFallback && styles.infoRowLast,
+                                      ]}
+                                    >
+                                      <Text style={styles.infoLabel}>
+                                        {formatZoneAttributeLabel(attr)}
+                                      </Text>
+                                      <Text style={styles.infoValue} selectable>
+                                        {formatZoneAttributeValue(attr)}
+                                      </Text>
+                                    </View>
+                                  );
+                                })}
+                              </>
+                            ) : null}
+                          </>
                         )}
                       </View>
                     );
@@ -4733,6 +4962,13 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: colors.textSecondary,
     fontStyle: 'italic',
+  },
+  queryFallbackHeading: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: colors.textSecondary,
+    marginTop: 8,
+    marginBottom: 4,
   },
   spaceCard: {
     flexDirection: 'row',
@@ -5127,13 +5363,13 @@ const styles = StyleSheet.create({
     color: colors.text,
     textTransform: 'uppercase',
   },
-  /** Space column — 40% narrower than prior flex 4 (now 2.4). */
+  /** Space column — share of row width (Status column widened for longer labels). */
   tableHeaderColSpace: {
-    flex: 2.4,
+    flex: 1.8,
     minWidth: 0,
   },
   tableHeaderColStatus: {
-    flex: 1.4,
+    flex: 2.2,
   },
   tableHeaderColCheck: {
     flex: 1,
@@ -5155,11 +5391,11 @@ const styles = StyleSheet.create({
     borderBottomWidth: 0,
   },
   tableColSpace: {
-    flex: 2.4,
+    flex: 1.8,
     minWidth: 0,
   },
   tableColStatus: {
-    flex: 1.4,
+    flex: 2.2,
   },
   tableColCheck: {
     flex: 1,

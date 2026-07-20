@@ -3,18 +3,21 @@ import {
   type RecordRow,
   type RecordType,
   RECOMMENDED_KEYS,
+  applyInternalWireSplit,
   bytesToHex,
   decodeRecordSet,
-  encodeRecordSet,
+  encodeEditableRecordSet,
   hexToBytes,
   isValidHex,
   jsonToRows,
   rowsToJson,
   validateJsonRecords,
   validateKey,
+  buildEditableWireRows,
 } from '@/lib/wire';
 import { colors } from '@/constants/colors';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
+import { publishRecordsToCertrelay } from '@/utils/publish-records-to-certrelay';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Clipboard from 'expo-clipboard';
 import { useLocalSearchParams } from 'expo-router';
@@ -39,8 +42,13 @@ const WIRE_HEX_KEY = 'wire_hex';
 const LEGACY_VTLV_KEY = 'vltv_hex';
 const MY_SPACES_KEY = 'mySpaces';
 
+type HexToolMode = 'attributes' | 'fallback';
+
+function certificateStorageKeyFor(subspace: string, spaceName: string): string {
+  return `spaces_cert_${String(spaceName).toLowerCase()}_${subspace.trim()}`;
+}
+
 const RECORD_TYPES: { type: RecordType; label: string }[] = [
-  { type: 'seq', label: 'SEQ' },
   { type: 'txt', label: 'TXT' },
   { type: 'blob', label: 'BLOB' },
 ];
@@ -48,7 +56,6 @@ const RECORD_TYPES: { type: RecordType; label: string }[] = [
 const KEY_CATEGORIES = ['Spaces Protocol', 'Payment Addresses', 'Identity & Keys', 'General'] as const;
 
 function getPlaceholder(row: RecordRow): string {
-  if (row.recordType === 'seq') return '0';
   if (row.key && RECOMMENDED_KEYS[row.key]) {
     return RECOMMENDED_KEYS[row.key].placeholder;
   }
@@ -70,6 +77,9 @@ export default function HexToolScreen() {
     newDataHex: newDataHexParam,
     seedWireFromSubspace: seedWireFromSubspaceParam,
     chainPresence: chainPresenceParam,
+    hexToolMode: hexToolModeParam,
+    primaryRecordsHex: primaryRecordsHexParam,
+    scriptPubKeyHex: scriptPubKeyHexParam,
   } = useLocalSearchParams<{
     subspace?: string;
     spaceName?: string;
@@ -78,24 +88,34 @@ export default function HexToolScreen() {
     /** '1' when opened from Subspace → Hex Tool (seed / clear from listnums-by-spk result). */
     seedWireFromSubspace?: string;
     chainPresence?: string;
+    /** attributes = publish to certrelay; fallback = save on-chain hex (default). */
+    hexToolMode?: HexToolMode;
+    /** Primary zone records hex when editing attributes. */
+    primaryRecordsHex?: string;
+    scriptPubKeyHex?: string;
   }>();
 
+  const hexToolMode: HexToolMode = hexToolModeParam === 'attributes' ? 'attributes' : 'fallback';
+  const isAttributesMode = hexToolMode === 'attributes';
+
   const [hexString, setHexString] = useState('');
+  const [seqVersion, setSeqVersion] = useState(0);
   const [tableRows, setTableRows] = useState<RecordRow[]>([]);
   const [selectedRowForType, setSelectedRowForType] = useState<string | null>(null);
   const [selectedRowForKey, setSelectedRowForKey] = useState<string | null>(null);
   const [hexCopied, setHexCopied] = useState(false);
   const [hydrated, setHydrated] = useState(false);
+  const [footerBusy, setFooterBusy] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const isUpdatingFromHex = useRef(false);
   const isUpdatingFromRows = useRef(false);
 
-  const recalculateHex = useCallback((rows: RecordRow[]) => {
+  const recalculateHex = useCallback((rows: RecordRow[], version: number) => {
     if (isUpdatingFromHex.current) return;
     isUpdatingFromRows.current = true;
     try {
-      const bytes = encodeRecordSet(rows);
+      const bytes = encodeEditableRecordSet(rows, version);
       setHexString(bytesToHex(bytes));
     } catch {
       // encoding error — leave hex as-is
@@ -125,8 +145,12 @@ export default function HexToolScreen() {
     isUpdatingFromHex.current = true;
     try {
       const bytes = hexToBytes(hexString);
-      const rows = decodeRecordSet(bytes);
-      setTableRows(rows);
+      const { seqVersion: nextSeqVersion, visibleRows, hex } = applyInternalWireSplit(
+        decodeRecordSet(bytes)
+      );
+      setSeqVersion(nextSeqVersion);
+      setTableRows(visibleRows);
+      setHexString(hex);
     } catch {
       // malformed data — don't update table
     } finally {
@@ -139,6 +163,7 @@ export default function HexToolScreen() {
     (async () => {
       try {
         const seedFromSubspace = seedWireFromSubspaceParam === '1';
+        const attributesMode = hexToolModeParam === 'attributes';
         const chainPresence =
           chainPresenceParam === 'on-chain' || chainPresenceParam === 'off-chain'
             ? chainPresenceParam
@@ -150,6 +175,16 @@ export default function HexToolScreen() {
           if (chainPresence === 'off-chain') {
             nextHex = '';
             nextRows = [];
+          } else if (attributesMode) {
+            const h = primaryRecordsHexParam ? String(primaryRecordsHexParam).trim() : '';
+            if (/^[0-9A-Fa-f]*$/.test(h) && h.length % 2 === 0 && h.length > 0) {
+              nextHex = h.toUpperCase();
+              try {
+                nextRows = decodeRecordSet(hexToBytes(nextHex));
+              } catch {
+                nextRows = [];
+              }
+            }
           } else {
             const h = listnumsLastDataHex ? String(listnumsLastDataHex).trim() : '';
             if (/^[0-9A-Fa-f]*$/.test(h) && h.length % 2 === 0 && h.length > 0) {
@@ -162,8 +197,16 @@ export default function HexToolScreen() {
             }
           }
           if (!cancelled) {
-            setHexString(nextHex);
-            setTableRows(nextRows);
+            if (nextRows.length > 0) {
+              const { seqVersion: nextSeqVersion, visibleRows, hex } = applyInternalWireSplit(nextRows);
+              setSeqVersion(nextSeqVersion);
+              setTableRows(visibleRows);
+              setHexString(hex);
+            } else {
+              setSeqVersion(0);
+              setTableRows([]);
+              setHexString('');
+            }
           }
           return;
         }
@@ -191,13 +234,20 @@ export default function HexToolScreen() {
           }
         }
         if (!cancelled && initial) {
-          setHexString(initial);
           try {
             const bytes = hexToBytes(initial);
-            const rows = decodeRecordSet(bytes);
-            if (!cancelled) setTableRows(rows);
+            const { seqVersion: nextSeqVersion, visibleRows, hex } = applyInternalWireSplit(
+              decodeRecordSet(bytes)
+            );
+            if (!cancelled) {
+              setSeqVersion(nextSeqVersion);
+              setTableRows(visibleRows);
+              setHexString(hex);
+            }
           } catch {
+            setHexString(initial);
             setTableRows([]);
+            setSeqVersion(0);
           }
         }
       } finally {
@@ -212,6 +262,8 @@ export default function HexToolScreen() {
     newDataHexParam,
     seedWireFromSubspaceParam,
     chainPresenceParam,
+    hexToolModeParam,
+    primaryRecordsHexParam,
   ]);
 
   useEffect(() => {
@@ -222,8 +274,8 @@ export default function HexToolScreen() {
   useEffect(() => {
     if (!hydrated) return;
     if (isUpdatingFromHex.current) return;
-    recalculateHex(tableRows);
-  }, [tableRows, recalculateHex, hydrated]);
+    recalculateHex(tableRows, seqVersion);
+  }, [tableRows, seqVersion, recalculateHex, hydrated]);
 
   const getLengthByteDecimal = (): number | null => {
     if (hexString.length === 0) return null;
@@ -254,7 +306,7 @@ export default function HexToolScreen() {
         Alert.alert('Nothing to Download', 'The record table is empty.');
         return;
       }
-      const jsonData = rowsToJson(tableRows);
+      const jsonData = rowsToJson(buildEditableWireRows(tableRows, seqVersion));
       const jsonString = JSON.stringify(jsonData, null, 2);
       const blob = new Blob([jsonString], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
@@ -291,9 +343,13 @@ export default function HexToolScreen() {
       const text = await file.text();
       const parsed = JSON.parse(text);
       const records = validateJsonRecords(parsed);
-      const rows = jsonToRows(records);
-      setTableRows(rows);
-      Alert.alert('Success!', `Loaded ${rows.length} record(s) from JSON file.`);
+      const { seqVersion: nextSeqVersion, visibleRows, hex } = applyInternalWireSplit(
+        jsonToRows(records)
+      );
+      setSeqVersion(nextSeqVersion);
+      setTableRows(visibleRows);
+      setHexString(hex);
+      Alert.alert('Success!', `Loaded ${visibleRows.length} record(s) from JSON file.`);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Failed to parse JSON file.';
       Alert.alert(
@@ -303,8 +359,6 @@ export default function HexToolScreen() {
     }
   };
 
-  const hasSeq = tableRows.some((r) => r.recordType === 'seq');
-
   const updateRow = (id: string, updates: Partial<RecordRow>) => {
     setTableRows((prev) => prev.map((r) => (r.id === id ? { ...r, ...updates } : r)));
   };
@@ -313,25 +367,25 @@ export default function HexToolScreen() {
     setTableRows((prev) => prev.filter((r) => r.id !== id));
   };
 
-  const insertRow = (recordType: 'txt' | 'blob' | 'seq' = 'txt') => {
+  const insertRow = (recordType: 'txt' | 'blob' = 'txt') => {
     const newRow: RecordRow = {
       id: Date.now().toString(),
       recordType,
-      key: recordType === 'txt' || recordType === 'blob' ? '' : undefined,
-      value: recordType === 'seq' ? undefined : '',
-      version: recordType === 'seq' ? 0 : undefined,
+      key: '',
+      value: '',
     };
-    if (recordType === 'seq') {
-      setTableRows((prev) => [newRow, ...prev]);
-    } else {
-      setTableRows((prev) => [...prev, newRow]);
-    }
+    setTableRows((prev) => [...prev, newRow]);
   };
 
   const contextSubtitle =
     subspace && spaceName ? `${subspace}@${String(spaceName).toLowerCase()}` : null;
 
   const canSaveToSpace = Boolean(subspace && spaceName);
+  const canPublishToCertrelay = Boolean(
+    subspace && spaceName && scriptPubKeyHexParam?.trim()
+  );
+  const footerEnabled = isAttributesMode ? canPublishToCertrelay : canSaveToSpace;
+  const footerLabel = isAttributesMode ? 'Publish Hex String' : 'Save Hex String';
 
   const handleSaveHexString = async () => {
     if (!subspace || !spaceName) {
@@ -370,11 +424,63 @@ export default function HexToolScreen() {
     }
   };
 
+  const handlePublishHexString = async () => {
+    if (!subspace || !spaceName) {
+      Alert.alert('Cannot Publish', 'Open Hex Tool from a space to publish for that handle.');
+      return;
+    }
+    if (!scriptPubKeyHexParam?.trim()) {
+      Alert.alert('Cannot Publish', 'Missing script pubkey for this space.');
+      return;
+    }
+    const trimmed = hexString.trim().toUpperCase();
+    if (trimmed.length > 0 && (trimmed.length % 2 !== 0 || !isValidHex(trimmed))) {
+      Alert.alert('Invalid Hex', 'Use an even number of hexadecimal digits, or leave empty.');
+      return;
+    }
+
+    setFooterBusy(true);
+    try {
+      console.log('[HexTool] publish requested', {
+        handle: `${subspace.trim()}@${String(spaceName).toLowerCase()}`,
+        wireHexChars: trimmed.length,
+        mode: 'attributes',
+      });
+      const certKey = certificateStorageKeyFor(subspace, spaceName);
+      const rawCert = await AsyncStorage.getItem(certKey);
+      if (!rawCert) {
+        Alert.alert(
+          'Certificate Required',
+          'Receive the latest certificate on the subspace screen before publishing attributes.'
+        );
+        return;
+      }
+      const payload = JSON.parse(rawCert) as { certificate?: unknown };
+      const handle = `${subspace.trim()}@${String(spaceName).toLowerCase()}`;
+      await publishRecordsToCertrelay({
+        handle,
+        recordsWireHex: trimmed,
+        certificate: payload.certificate,
+        scriptPubKeyHex: scriptPubKeyHexParam.trim(),
+      });
+      router.back();
+    } catch (e) {
+      Alert.alert('Publish Failed', e instanceof Error ? e.message : 'Publish failed');
+    } finally {
+      setFooterBusy(false);
+    }
+  };
+
+  const handleFooterPress = isAttributesMode ? handlePublishHexString : handleSaveHexString;
+
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
       <Header title="Hex Tool" />
       {contextSubtitle ? (
-        <Text style={styles.contextHint}>{contextSubtitle}</Text>
+        <Text style={styles.contextHint}>
+          {contextSubtitle}
+          {isAttributesMode ? ' · attributes (certrelay)' : ' · on-chain fallback'}
+        </Text>
       ) : null}
       <ScrollView style={styles.scrollView} contentContainerStyle={styles.scrollContent}>
         <View style={styles.textInputContainer}>
@@ -463,43 +569,25 @@ export default function HexToolScreen() {
                   </TouchableOpacity>
                 </View>
                 <View style={[styles.tableCellKey, styles.tableCell]}>
-                  {row.recordType === 'seq' ? (
-                    <Text style={styles.naLabel}>--</Text>
-                  ) : (
-                    <TouchableOpacity
-                      style={styles.dropdownButton}
-                      onPress={() => setSelectedRowForKey(row.id)}
-                      activeOpacity={0.7}>
-                      <Text style={styles.dropdownButtonText} numberOfLines={1}>
-                        {row.key ? getKeyLabel(row.key) : 'select key...'}
-                      </Text>
-                    </TouchableOpacity>
-                  )}
+                  <TouchableOpacity
+                    style={styles.dropdownButton}
+                    onPress={() => setSelectedRowForKey(row.id)}
+                    activeOpacity={0.7}>
+                    <Text style={styles.dropdownButtonText} numberOfLines={1}>
+                      {row.key ? getKeyLabel(row.key) : 'select key...'}
+                    </Text>
+                  </TouchableOpacity>
                 </View>
                 <View style={[styles.tableCellValue, styles.tableCell]}>
-                  {row.recordType === 'seq' ? (
-                    <TextInput
-                      style={styles.tableInput}
-                      value={row.version?.toString() ?? '0'}
-                      onChangeText={(text) => {
-                        const num = parseInt(text, 10);
-                        updateRow(row.id, { version: isNaN(num) ? 0 : Math.max(0, num) });
-                      }}
-                      keyboardType="numeric"
-                      placeholder="0"
-                      placeholderTextColor={colors.textSecondary}
-                    />
-                  ) : (
-                    <TextInput
-                      style={styles.tableInput}
-                      value={row.value ?? ''}
-                      onChangeText={(text) => updateRow(row.id, { value: text })}
-                      placeholder={getPlaceholder(row)}
-                      placeholderTextColor={colors.textSecondary}
-                      autoCapitalize="none"
-                      autoCorrect={false}
-                    />
-                  )}
+                  <TextInput
+                    style={styles.tableInput}
+                    value={row.value ?? ''}
+                    onChangeText={(text) => updateRow(row.id, { value: text })}
+                    placeholder={getPlaceholder(row)}
+                    placeholderTextColor={colors.textSecondary}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                  />
                 </View>
                 <View style={styles.tableCellActions}>
                   <TouchableOpacity
@@ -519,12 +607,7 @@ export default function HexToolScreen() {
               activeOpacity={0.7}>
               <Text style={styles.insertButtonText}>+ TXT</Text>
             </TouchableOpacity>
-            <TouchableOpacity
-              style={styles.insertButton}
-              onPress={() => insertRow('blob')}
-              activeOpacity={0.7}>
-              <Text style={styles.insertButtonText}>+ BLOB</Text>
-            </TouchableOpacity>
+            {/* + BLOB — enable when blob record editing is supported in the hex tool UI */}
           </View>
         </View>
 
@@ -537,40 +620,30 @@ export default function HexToolScreen() {
             <Pressable style={StyleSheet.absoluteFill} onPress={() => setSelectedRowForType(null)} />
             <View style={styles.modalCard}>
               <Text style={styles.modalTitle}>Record Type</Text>
-              {RECORD_TYPES.map((rt) => {
-                const row = tableRows.find((r) => r.id === selectedRowForType);
-                const isSeqDisabled = rt.type === 'seq' && hasSeq && row?.recordType !== 'seq';
-                return (
+              {RECORD_TYPES.map((rt) => (
                   <TouchableOpacity
                     key={rt.type}
                     style={[styles.modalOption, { borderBottomColor: colors.borderDark }]}
-                    disabled={isSeqDisabled}
                     onPress={() => {
                       if (!selectedRowForType) return;
                       const current = tableRows.find((r) => r.id === selectedRowForType);
-                      const newFields: Partial<RecordRow> = { recordType: rt.type };
-                      if (rt.type === 'seq') {
-                        newFields.version = 0;
-                        newFields.key = undefined;
-                        newFields.value = undefined;
-                      } else {
-                        newFields.key = current?.key ?? '';
-                        newFields.value = current?.value ?? '';
-                        newFields.version = undefined;
-                      }
-                      updateRow(selectedRowForType, newFields);
+                      updateRow(selectedRowForType, {
+                        recordType: rt.type,
+                        key: current?.key ?? '',
+                        value: current?.value ?? '',
+                        version: undefined,
+                      });
                       setSelectedRowForType(null);
                     }}
                     activeOpacity={0.7}>
-                    <View style={[styles.modalOptionContent, isSeqDisabled && { opacity: 0.4 }]}>
+                    <View style={styles.modalOptionContent}>
                       <Text style={styles.modalOptionName}>{rt.label}</Text>
                       <Text style={styles.modalOptionType}>
-                        0x{rt.type === 'seq' ? '00' : rt.type === 'txt' ? '01' : '02'}
+                        0x{rt.type === 'txt' ? '01' : '02'}
                       </Text>
                     </View>
                   </TouchableOpacity>
-                );
-              })}
+              ))}
             </View>
           </View>
         </Modal>
@@ -638,14 +711,25 @@ export default function HexToolScreen() {
 
       <View style={[styles.saveFooter, { paddingBottom: Math.max(insets.bottom, 16) }]}>
         <TouchableOpacity
-          style={[styles.saveButton, !canSaveToSpace && styles.saveButtonDisabled]}
-          onPress={handleSaveHexString}
-          disabled={!canSaveToSpace}
+          style={[
+            styles.saveButton,
+            (!footerEnabled || footerBusy) && styles.saveButtonDisabled,
+          ]}
+          onPress={handleFooterPress}
+          disabled={!footerEnabled || footerBusy}
           activeOpacity={0.7}
-          accessibilityState={{ disabled: !canSaveToSpace }}
-          accessibilityLabel="Save hex string and return to space">
-          <Text style={[styles.saveButtonText, !canSaveToSpace && styles.saveButtonTextDisabled]}>
-            Save Hex String
+          accessibilityState={{ disabled: !footerEnabled || footerBusy }}
+          accessibilityLabel={
+            isAttributesMode
+              ? 'Publish hex string to certrelay'
+              : 'Save hex string and return to space'
+          }>
+          <Text
+            style={[
+              styles.saveButtonText,
+              (!footerEnabled || footerBusy) && styles.saveButtonTextDisabled,
+            ]}>
+            {footerLabel}
           </Text>
         </TouchableOpacity>
       </View>
@@ -833,11 +917,10 @@ const styles = StyleSheet.create({
     minHeight: 32,
   },
   insertGroup: {
-    flexDirection: 'row',
-    gap: 8,
+    width: '100%',
   },
   insertButton: {
-    flex: 1,
+    width: '100%',
     paddingVertical: 12,
     paddingHorizontal: 16,
     borderRadius: 8,

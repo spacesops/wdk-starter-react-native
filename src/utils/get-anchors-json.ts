@@ -1,3 +1,6 @@
+/** Default certrelay for chain proofs and certificate validation fallback queries. */
+export const CERTRELAY_BASE_URL = 'https://certrelay.spacesops.com';
+
 const BOOTSTRAP_SERVERS = [
   'https://relay-cosmos.spacesprotocol.org/',
   'https://relay-atlas.spacesprotocol.org/',
@@ -406,6 +409,67 @@ export function getQueryRelayUrls(
     }
   }
   return [...urls];
+}
+
+/**
+ * libveritas chainProofRequest() returns a JSON string on native; Node may return an object.
+ */
+export function serializeChainProofRequest(chainProofRequest: unknown): string {
+  if (typeof chainProofRequest === 'string') {
+    return chainProofRequest;
+  }
+  return JSON.stringify(chainProofRequest);
+}
+
+/**
+ * POST {peerUrl}/chain-proof — binary chain proof for MessageBuilder.build().
+ * Tries relays in order until one succeeds.
+ */
+export async function fetchChainProofFromRelays(
+  chainProofRequest: unknown,
+  relayUrls: string[]
+): Promise<{ data: ArrayBuffer; peerUrl: string }> {
+  const body = serializeChainProofRequest(chainProofRequest);
+  const urls = relayUrls.filter(Boolean).map(normalizeBaseUrl);
+  if (urls.length === 0) {
+    throw new Error('No relays available for chain proof.');
+  }
+
+  let lastError = 'No relays available for chain proof.';
+  for (const peerUrl of urls) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    try {
+      const response = await fetch(`${peerUrl}/chain-proof`, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          Accept: 'application/octet-stream',
+          'Content-Type': 'application/json',
+        },
+        body,
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        lastError = text.trim()
+          ? `HTTP ${response.status} from ${peerUrl}: ${text.trim().slice(0, 500)}`
+          : `HTTP ${response.status} from ${peerUrl} (empty response body)`;
+        continue;
+      }
+      const data = await response.arrayBuffer();
+      if (data.byteLength === 0) {
+        lastError = `Empty chain proof from ${peerUrl}`;
+        continue;
+      }
+      return { data, peerUrl };
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  throw new Error(lastError);
 }
 
 export async function querySpacesFromAnchorServer(

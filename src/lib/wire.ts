@@ -6,6 +6,9 @@
 const TYPE_SEQ = 0x00;
 const TYPE_TXT = 0x01;
 const TYPE_BLOB = 0x02;
+const TYPE_ADDR = 0x03;
+/** SIP-7 signature record — internal; stripped in the hex tool UI. */
+export const TYPE_SIG = 0x04;
 
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
@@ -48,7 +51,7 @@ function base64Decode(str: string): Uint8Array {
   return new Uint8Array(bytes);
 }
 
-export type RecordType = 'seq' | 'txt' | 'blob' | 'unknown';
+export type RecordType = 'seq' | 'txt' | 'blob' | 'addr' | 'sig' | 'unknown';
 
 export type RecordRow = {
   id: string;
@@ -222,8 +225,16 @@ export function encodeRecordSet(rows: RecordRow[]): Uint8Array {
         rdata = concatBytes(new Uint8Array([keyBytes.length]), keyBytes, valueBytes);
         break;
       }
+      case 'addr': {
+        rtypeByte = TYPE_ADDR;
+        const keyBytes = encodeUtf8(row.key ?? '');
+        const valueBytes = encodeUtf8(row.value ?? '');
+        const valueLenPrefix = writeCompactSize(valueBytes.length);
+        rdata = concatBytes(new Uint8Array([keyBytes.length]), keyBytes, valueLenPrefix, valueBytes);
+        break;
+      }
       case 'unknown': {
-        rtypeByte = row.rtype ?? 0x03;
+        rtypeByte = row.rtype ?? 0;
         rdata = row.rdata ? base64Decode(row.rdata) : new Uint8Array(0);
         break;
       }
@@ -276,6 +287,16 @@ export function decodeRecordSet(bytes: Uint8Array): RecordRow[] {
         const kv = parseKv(rdata);
         const value = base64Encode(kv.valueBytes);
         rows.push({ id, recordType: 'blob', key: kv.key, value });
+        break;
+      }
+      case TYPE_ADDR: {
+        const kv = parseKv(rdata);
+        const values = parseTxtValues(kv.valueBytes);
+        rows.push({ id, recordType: 'addr', key: kv.key, value: values.join('') });
+        break;
+      }
+      case TYPE_SIG: {
+        rows.push({ id, recordType: 'sig' });
         break;
       }
       default: {
@@ -336,8 +357,12 @@ export function rowsToJson(rows: RecordRow[]): JsonRecord[] {
         return { type: 'txt', key: row.key ?? '', value: row.value ?? '' };
       case 'blob':
         return { type: 'blob', key: row.key ?? '', value: row.value ?? '' };
+      case 'addr':
+        return { type: 'txt', key: row.key ?? '', value: row.value ?? '' };
       case 'unknown':
         return { type: 'unknown', rtype: row.rtype ?? 0, rdata: row.rdata ?? '' };
+      case 'sig':
+        throw new Error('Internal sig record cannot be exported to JSON');
     }
   });
 }
@@ -412,10 +437,79 @@ export function validateJsonRecords(data: unknown): JsonRecord[] {
         records.push({ type: 'unknown', rtype, rdata });
         break;
       }
+      case 'sig':
+        // Internal signature record — ignored when loading JSON into the hex tool UI.
+        break;
       default:
         throw new Error(`Record ${i}: unrecognized type "${recType}"`);
     }
   }
 
   return records;
+}
+
+/** SEQ and SIG are managed internally — not shown as editable table rows. */
+export function isInternalWireRow(row: RecordRow): boolean {
+  return (
+    row.recordType === 'seq' ||
+    row.recordType === 'sig' ||
+    (row.recordType === 'unknown' && row.rtype === TYPE_SIG)
+  );
+}
+
+export function splitInternalWireRows(rows: RecordRow[]): {
+  seqVersion: number;
+  visibleRows: RecordRow[];
+} {
+  const seqRow = rows.find((row) => row.recordType === 'seq');
+  return {
+    seqVersion: seqRow?.version ?? 0,
+    visibleRows: rows.filter((row) => !isInternalWireRow(row)),
+  };
+}
+
+export function buildEditableWireRows(visibleRows: RecordRow[], seqVersion: number): RecordRow[] {
+  const visible = visibleRows.filter((row) => !isInternalWireRow(row));
+  if (visible.length === 0) {
+    return [];
+  }
+  return [{ id: '__internal_seq__', recordType: 'seq', version: seqVersion }, ...visible];
+}
+
+/** Encode visible table rows plus internal SEQ (never SIG). */
+export function encodeEditableRecordSet(visibleRows: RecordRow[], seqVersion: number): Uint8Array {
+  return encodeRecordSet(buildEditableWireRows(visibleRows, seqVersion));
+}
+
+/** Next sequence version when publishing an update to certrelay. */
+export function nextPublishSeqVersion(seqVersion: number): number {
+  return seqVersion + 1;
+}
+
+/** Unsigned wire bytes for publish: visible rows + incremented SEQ (SIG added separately). */
+export function encodePublishRecordSet(visibleRows: RecordRow[], seqVersion: number): Uint8Array {
+  const visible = visibleRows.filter((row) => !isInternalWireRow(row));
+  if (visible.length === 0) {
+    throw new Error('Cannot publish without at least one attribute record.');
+  }
+  return encodeRecordSet(buildEditableWireRows(visible, nextPublishSeqVersion(seqVersion)));
+}
+
+/** Decode wire bytes, drop SEQ/SIG, and rebuild hex from editable records only. */
+export function editableHexFromWireBytes(bytes: Uint8Array): string {
+  const { seqVersion, visibleRows } = splitInternalWireRows(decodeRecordSet(bytes));
+  return bytesToHex(encodeEditableRecordSet(visibleRows, seqVersion));
+}
+
+export function applyInternalWireSplit(rows: RecordRow[]): {
+  seqVersion: number;
+  visibleRows: RecordRow[];
+  hex: string;
+} {
+  const { seqVersion, visibleRows } = splitInternalWireRows(rows);
+  return {
+    seqVersion,
+    visibleRows,
+    hex: bytesToHex(encodeEditableRecordSet(visibleRows, seqVersion)),
+  };
 }

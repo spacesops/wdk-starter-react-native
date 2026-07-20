@@ -1,4 +1,5 @@
 import Header from '@/components/header';
+import VerifiedZonesResults from '@/components/verified-zones-results';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
 import { useFocusEffect } from '@react-navigation/native';
 import { useLocalSearchParams } from 'expo-router';
@@ -21,19 +22,25 @@ import { toast } from 'sonner-native';
 import { ChevronDown, ChevronRight } from 'lucide-react-native';
 import { AssetTicker, NetworkType, WDKService } from '@tetherto/wdk-react-native-provider';
 import { FiatCurrency, pricingService } from '@/services/pricing-service';
+import { resolveTaprootForScriptPubKey } from '@/utils/resolve-taproot-for-script-pubkey';
 import {
   buildSpacesScanDerivationPaths,
   fullPathToWalletRelativePath,
   getBitcoinTaprootPathPrefix,
 } from '@/utils/spaces-scan-paths';
 import { buildPaymentWatchRequestBody } from '@/utils/build-payment-watch-body';
+import { formatMySpaceHandleStatusLabel } from '@/utils/format-my-space-status';
 import { encodeNpubFromPubKeyHex, encodeNsecFromPrivKeyHex } from '@/utils/nip19-encode';
+import { validateStoredCertificate } from '@/utils/validate-stored-certificate';
+import type { VerifiedZoneSummary } from '@/utils/extract-zone-attributes';
 import { WDKSpaces, type UpdateOnchainHexParams } from '@/utils/wdk-spaces';
 import {
   conservativePointerPaymentFeeSats,
   extractFeerateSatPerVbFromJson,
 } from '@/utils/pointer-payment-fee';
 import { requestPurchaseStatusPoll } from '@/utils/purchase-poll-bridge';
+import { loadPrimaryRecordsFromCertrelay } from '@/utils/load-primary-records-from-certrelay';
+import { formatSpacesVerifyError } from '@/utils/resolve-spaces-query';
 
 const SPACES_API_BASE_URL =
   process.env.EXPO_PUBLIC_SPACES_API_BASE_URL || 'http://192.168.1.111:7264';
@@ -80,7 +87,38 @@ type MySpaceRow = {
   /** Tx that created the latest on-chain num (from listnums) — required to spend the 1077-sat output. */
   priorTxid?: string;
   newDataHex?: string;
+  subsHandleStatus?: string | null;
+  subsCommitmentRootConfirming?: boolean;
+  subsPipelineBatchConfirming?: boolean;
+  tenantQuotePaymentConfirmed?: boolean | null;
 };
+
+function mergeMySpaceRowIntoSpaceData(
+  prev: MySpaceRow | null,
+  space: MySpaceRow,
+  scriptPubKeyHexParam?: string
+): MySpaceRow {
+  return {
+    subspace: space.subspace,
+    spaceName: space.spaceName,
+    handle: space.handle ?? prev?.handle,
+    status: space.status ?? prev?.status,
+    jobId: space.jobId ?? prev?.jobId,
+    unifiedStatusPurchaseType: space.unifiedStatusPurchaseType ?? prev?.unifiedStatusPurchaseType,
+    scriptPubKeyHex: space.scriptPubKeyHex ?? prev?.scriptPubKeyHex ?? scriptPubKeyHexParam,
+    chainPresence: space.chainPresence ?? prev?.chainPresence,
+    listnumsLastDataHex: space.listnumsLastDataHex ?? prev?.listnumsLastDataHex,
+    priorTxid: space.priorTxid ?? prev?.priorTxid,
+    newDataHex: space.newDataHex ?? prev?.newDataHex,
+    subsHandleStatus: space.subsHandleStatus ?? prev?.subsHandleStatus,
+    subsCommitmentRootConfirming:
+      space.subsCommitmentRootConfirming ?? prev?.subsCommitmentRootConfirming,
+    subsPipelineBatchConfirming:
+      space.subsPipelineBatchConfirming ?? prev?.subsPipelineBatchConfirming,
+    tenantQuotePaymentConfirmed:
+      space.tenantQuotePaymentConfirmed ?? prev?.tenantQuotePaymentConfirmed,
+  };
+}
 
 /** RPC-derived presence from GET /api/listnums-by-spk (distinct from purchase `status`). */
 export type ChainPresence = 'on-chain' | 'off-chain';
@@ -632,46 +670,6 @@ function taprootXOnlyPubkeyHexFromScriptPubkeyHex(scriptPubkeyHex: string): stri
   return h.slice(4, 68);
 }
 
-async function resolveTaprootForScriptPubKey(scriptPubKeyHex: string): Promise<{
-  address: string;
-  priorAccountRelativePath: string;
-  /** Full BIP-86 path, e.g. m/86'/0'/9'/0/0 */
-  derivationPath: string;
-  internalPubKeyHex?: string;
-  privateKeyHex?: string;
-  tweakedPrivateKeyHex?: string;
-} | null> {
-  const { bip, coinType } = getBitcoinTaprootPathPrefix();
-  const fullPaths = buildSpacesScanDerivationPaths();
-  const rels: string[] = [];
-  for (const p of fullPaths) {
-    const rel = fullPathToWalletRelativePath(p, bip, coinType);
-    if (rel) rels.push(rel);
-  }
-  if (rels.length === 0) return null;
-  const { addressesJson } = await WDKSpaces.deriveTaprootAddressesFromPaths(rels);
-  const entries = JSON.parse(addressesJson) as {
-    address?: string;
-    scriptPubKeyHex?: string;
-    internalPubKeyHex?: string;
-    privateKeyHex?: string;
-    tweakedPrivateKeyHex?: string;
-  }[];
-  const target = scriptPubKeyHex.toLowerCase();
-  const idx = entries.findIndex((e) => e.scriptPubKeyHex?.toLowerCase() === target);
-  if (idx < 0 || !entries[idx]?.address) return null;
-  const derivationPath = fullPaths[idx] ?? `m/${bip}'/${coinType}'/${rels[idx]}`;
-  const entry = entries[idx];
-  return {
-    address: entry.address!,
-    priorAccountRelativePath: rels[idx],
-    derivationPath,
-    internalPubKeyHex: entry.internalPubKeyHex,
-    privateKeyHex: entry.privateKeyHex,
-    tweakedPrivateKeyHex: entry.tweakedPrivateKeyHex,
-  };
-}
-
 export default function SubspaceScreen() {
   const insets = useSafeAreaInsets();
   const router = useDebouncedNavigation();
@@ -679,10 +677,12 @@ export default function SubspaceScreen() {
     subspace,
     spaceName,
     scriptPubKeyHex: scriptPubKeyHexParam,
+    statusLabel: statusLabelParam,
   } = useLocalSearchParams<{
     subspace: string;
     spaceName: string;
     scriptPubKeyHex?: string;
+    statusLabel?: string;
   }>();
 
   const [spaceData, setSpaceData] = useState<MySpaceRow | null>(null);
@@ -698,7 +698,17 @@ export default function SubspaceScreen() {
   const [broadcastParams, setBroadcastParams] = useState<UpdateOnchainHexParams | null>(null);
   const [receiveCertificateLoading, setReceiveCertificateLoading] = useState(false);
   const [hasStoredCertificate, setHasStoredCertificate] = useState(false);
+  const [certificateValidateLoading, setCertificateValidateLoading] = useState(false);
+  const [certificateVerifiedZones, setCertificateVerifiedZones] = useState<VerifiedZoneSummary[]>(
+    []
+  );
+  const [certificateVerifyError, setCertificateVerifyError] = useState<string | null>(null);
+  const [certificateVerifyInfo, setCertificateVerifyInfo] = useState<string | null>(null);
+  const [certificateRequestedHandleFound, setCertificateRequestedHandleFound] = useState<
+    boolean | null
+  >(null);
   const [detailsExpanded, setDetailsExpanded] = useState(false);
+  const [editAttributesLoading, setEditAttributesLoading] = useState(false);
 
   const certificateStorageKey = useMemo(() => {
     if (!subspace?.trim() || !spaceName) {
@@ -817,19 +827,7 @@ export default function SubspaceScreen() {
             (s) => s.subspace === subspace && s.spaceName === spaceName.toLowerCase()
           );
           if (space) {
-            setSpaceData({
-              subspace: space.subspace,
-              spaceName: space.spaceName,
-              handle: space.handle,
-              status: space.status,
-              jobId: space.jobId,
-              unifiedStatusPurchaseType: space.unifiedStatusPurchaseType,
-              scriptPubKeyHex: space.scriptPubKeyHex ?? scriptPubKeyHexParam,
-              chainPresence: space.chainPresence,
-              listnumsLastDataHex: space.listnumsLastDataHex,
-              priorTxid: space.priorTxid,
-              newDataHex: space.newDataHex,
-            });
+            setSpaceData(mergeMySpaceRowIntoSpaceData(null, space, scriptPubKeyHexParam));
           } else if (scriptPubKeyHexParam) {
             setSpaceData({
               subspace,
@@ -864,36 +862,7 @@ export default function SubspaceScreen() {
             (s) => s.subspace === subspace && s.spaceName === spaceName.toLowerCase()
           );
           if (space) {
-            setSpaceData((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    handle: space.handle ?? prev.handle,
-                    scriptPubKeyHex:
-                      space.scriptPubKeyHex ?? prev.scriptPubKeyHex ?? scriptPubKeyHexParam,
-                    chainPresence: space.chainPresence ?? prev.chainPresence,
-                    listnumsLastDataHex: space.listnumsLastDataHex ?? prev.listnumsLastDataHex,
-                    priorTxid: space.priorTxid ?? prev.priorTxid,
-                    newDataHex: space.newDataHex ?? prev.newDataHex,
-                    status: space.status ?? prev.status,
-                    jobId: space.jobId ?? prev.jobId,
-                    unifiedStatusPurchaseType:
-                      space.unifiedStatusPurchaseType ?? prev.unifiedStatusPurchaseType,
-                  }
-                : {
-                    subspace: space.subspace,
-                    spaceName: space.spaceName,
-                    handle: space.handle,
-                    status: space.status,
-                    jobId: space.jobId,
-                    unifiedStatusPurchaseType: space.unifiedStatusPurchaseType,
-                    scriptPubKeyHex: space.scriptPubKeyHex ?? scriptPubKeyHexParam,
-                    chainPresence: space.chainPresence,
-                    listnumsLastDataHex: space.listnumsLastDataHex,
-                    priorTxid: space.priorTxid,
-                    newDataHex: space.newDataHex,
-                  }
-            );
+            setSpaceData((prev) => mergeMySpaceRowIntoSpaceData(prev, space, scriptPubKeyHexParam));
           }
         } catch (e) {
           console.error('[Subspace] focus reload:', e);
@@ -1102,6 +1071,10 @@ export default function SubspaceScreen() {
       };
       await AsyncStorage.setItem(certificateStorageKey, JSON.stringify(payload));
       setHasStoredCertificate(true);
+      setCertificateVerifiedZones([]);
+      setCertificateVerifyError(null);
+      setCertificateVerifyInfo(null);
+      setCertificateRequestedHandleFound(null);
       toast.success(
         hadExisting ? 'Latest certificate saved on this device' : 'Certificate saved on this device'
       );
@@ -1112,6 +1085,50 @@ export default function SubspaceScreen() {
       setReceiveCertificateLoading(false);
     }
   }, [subspace, spaceName, certificateStorageKey, hasStoredCertificate]);
+
+  const handleValidateCertificate = useCallback(async () => {
+    if (!certificateStorageKey || !subspace?.trim() || !spaceName) {
+      toast.error('Missing subspace or space name');
+      return;
+    }
+    const handle = `${subspace.trim()}@${spaceName.toLowerCase()}`;
+
+    setCertificateValidateLoading(true);
+    setCertificateVerifiedZones([]);
+    setCertificateVerifyError(null);
+    setCertificateVerifyInfo(null);
+    setCertificateRequestedHandleFound(null);
+
+    try {
+      const raw = await AsyncStorage.getItem(certificateStorageKey);
+      if (!raw) {
+        setHasStoredCertificate(false);
+        toast.error('No stored certificate found');
+        return;
+      }
+      const payload = JSON.parse(raw) as { certificate?: unknown };
+      const result = await validateStoredCertificate(handle, payload.certificate);
+      setCertificateVerifiedZones(result.zones);
+      setCertificateRequestedHandleFound(result.requestedHandleFound);
+      setCertificateVerifyInfo(result.infoMessage ?? null);
+      setCertificateVerifyError(result.warning ?? null);
+      if (result.requestedHandleFound) {
+        toast.success(
+          result.verificationMethod === 'stored-certificate'
+            ? 'Certificate verified'
+            : 'Certificate verified via certrelay'
+        );
+      }
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Certificate validation failed';
+      setCertificateVerifyInfo(null);
+      setCertificateVerifyError(message);
+      toast.error(message);
+    } finally {
+      setCertificateValidateLoading(false);
+    }
+  }, [certificateStorageKey, subspace, spaceName]);
 
   const handleDeletePress = () => {
     setShowDeleteConfirmation(true);
@@ -1163,7 +1180,7 @@ export default function SubspaceScreen() {
     return (
       <View style={[styles.container, { paddingTop: insets.top }]}>
         <Header title="Spaces" />
-        <View style={styles.content}>
+        <View style={styles.scrollContent}>
           <Text style={styles.errorText}>Invalid space</Text>
         </View>
       </View>
@@ -1172,42 +1189,58 @@ export default function SubspaceScreen() {
 
   const displayName = `${subspace}@${spaceName}`;
 
-  // Get formatted status (chain presence from listnums takes precedence over purchase status,
-  // except certificate phases so "Preparing Certificate" / "Certificate Ready" still show with on-chain data)
+  // Same labels as the My Spaces STATUS column (see format-my-space-status.ts).
   const getStatusText = (): string => {
-    if (spaceData?.status === 'certificate_pending') return 'Preparing Certificate';
-    if (spaceData?.status === 'certificate_delivered') return 'Certificate Ready';
-    if (spaceData?.chainPresence === 'on-chain') return 'On-chain';
-    if (spaceData?.chainPresence === 'off-chain') return 'Off-chain';
-    if (!spaceData?.status) return 'Unknown';
-
-    const statusMap: Record<string, string> = {
-      pending_payment: 'Awaiting Payment',
-      processing: 'Confirming Payment',
-      confirmed: 'Payment Confirmed',
-      proof_created: 'Proof Created',
-      proof_batched: 'Waiting for Batch',
-      proof_committed: 'Proof Committed',
-      certificate_pending: 'Preparing Certificate',
-      certificate_delivered: 'Certificate Ready',
-      sptr_creating: 'Creating SPTR',
-      sptr_created: 'SPTR Created',
-      sptr_delivered: 'Complete',
-      expired: 'Expired',
-      cancelled: 'Cancelled',
-      purchasing: 'Purchasing',
-      requesting: 'Requesting',
-      discovered: 'Discovered',
-      pending: 'Pending',
-      purchased: 'Purchased',
-    };
-
-    return statusMap[spaceData.status] || 'Unknown';
+    const fromRow = formatMySpaceHandleStatusLabel(spaceData);
+    if (fromRow !== 'Unknown') return fromRow;
+    if (typeof statusLabelParam === 'string' && statusLabelParam.trim()) {
+      return statusLabelParam.trim();
+    }
+    return 'Unknown';
   };
 
   /** Hex Tool after chain check: disabled while loading or when listnums says off-chain. */
   const isHexToolEnabled =
     Boolean(spaceData) && !chainResolutionLoading && spaceData?.chainPresence !== 'off-chain';
+
+  const handleForHexTool = `${subspace}@${spaceName.toLowerCase()}`;
+
+  const hexToolBaseParams = {
+    subspace,
+    spaceName,
+    seedWireFromSubspace: '1' as const,
+    ...(spaceData?.chainPresence != null ? { chainPresence: spaceData.chainPresence } : {}),
+    ...(spaceData?.scriptPubKeyHex ? { scriptPubKeyHex: spaceData.scriptPubKeyHex } : {}),
+  };
+
+  const handleEditAttributes = async () => {
+    if (editAttributesLoading) return;
+    setEditAttributesLoading(true);
+    try {
+      console.log('[Subspace] Edit Attributes: certrelay query for', handleForHexTool);
+      const result = await loadPrimaryRecordsFromCertrelay(handleForHexTool);
+      router.push({
+        pathname: '/hex-tool',
+        params: {
+          ...hexToolBaseParams,
+          hexToolMode: 'attributes',
+          ...(result.recordsHex?.trim() ? { primaryRecordsHex: result.recordsHex.trim() } : {}),
+        },
+      });
+    } catch (error) {
+      console.error('[Subspace] Edit Attributes certrelay query failed:', error);
+      toast.error(formatSpacesVerifyError(error, handleForHexTool));
+      router.push({
+        pathname: '/hex-tool',
+        params: {
+          ...hexToolBaseParams,
+          hexToolMode: 'attributes',
+        },
+      });
+    } finally {
+      setEditAttributesLoading(false);
+    }
+  };
 
   const showTakeOnchainButton = spaceData?.chainPresence === 'off-chain';
 
@@ -1651,7 +1684,12 @@ export default function SubspaceScreen() {
         }
       />
 
-      <View style={styles.content}>
+      <ScrollView
+        style={styles.scrollView}
+        contentContainerStyle={[styles.scrollContent, { paddingBottom: insets.bottom + 32 }]}
+        showsVerticalScrollIndicator={false}
+        keyboardShouldPersistTaps="handled"
+      >
         {/* Status Display */}
         <View style={styles.topSection}>
           <View style={styles.subspaceNameContainer}>
@@ -1752,32 +1790,53 @@ export default function SubspaceScreen() {
             </TouchableOpacity>
           ) : null}
 
-          {/* Hex Tool — only when listnums resolved to on-chain */}
-          <TouchableOpacity
-            style={[styles.hexToolButton, !isHexToolEnabled && styles.hexToolButtonDisabled]}
-            onPress={() => {
-              router.push({
-                pathname: '/hex-tool',
-                params: {
-                  subspace: subspace,
-                  spaceName: spaceName,
-                  seedWireFromSubspace: '1',
-                  ...(spaceData?.chainPresence != null
-                    ? { chainPresence: spaceData.chainPresence }
-                    : {}),
-                  ...(spaceData?.listnumsLastDataHex
-                    ? { listnumsLastDataHex: spaceData.listnumsLastDataHex }
-                    : {}),
-                  ...(spaceData?.newDataHex ? { newDataHex: spaceData.newDataHex } : {}),
-                },
-              });
-            }}
-            activeOpacity={0.7}
-            disabled={!isHexToolEnabled}
-            accessibilityState={{ disabled: !isHexToolEnabled }}
-          >
-            <Text style={styles.hexToolButtonText}>Hex Tool</Text>
-          </TouchableOpacity>
+          {/* Edit Attributes / Edit Fallback — only when listnums resolved to on-chain */}
+          <View style={styles.hexToolButtonRow}>
+            <TouchableOpacity
+              style={[
+                styles.hexToolButton,
+                styles.hexToolButtonHalf,
+                (!isHexToolEnabled || editAttributesLoading) && styles.hexToolButtonDisabled,
+              ]}
+              onPress={() => void handleEditAttributes()}
+              activeOpacity={0.7}
+              disabled={!isHexToolEnabled || editAttributesLoading}
+              accessibilityState={{ disabled: !isHexToolEnabled || editAttributesLoading }}
+              accessibilityLabel="Edit attributes and publish to certrelay"
+            >
+              {editAttributesLoading ? (
+                <ActivityIndicator color={colors.black} />
+              ) : (
+                <Text style={styles.hexToolButtonText}>Edit Attributes</Text>
+              )}
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.hexToolButton,
+                styles.hexToolButtonHalf,
+                !isHexToolEnabled && styles.hexToolButtonDisabled,
+              ]}
+              onPress={() => {
+                router.push({
+                  pathname: '/hex-tool',
+                  params: {
+                    ...hexToolBaseParams,
+                    hexToolMode: 'fallback',
+                    ...(spaceData?.listnumsLastDataHex
+                      ? { listnumsLastDataHex: spaceData.listnumsLastDataHex }
+                      : {}),
+                    ...(spaceData?.newDataHex ? { newDataHex: spaceData.newDataHex } : {}),
+                  },
+                });
+              }}
+              activeOpacity={0.7}
+              disabled={!isHexToolEnabled}
+              accessibilityState={{ disabled: !isHexToolEnabled }}
+              accessibilityLabel="Edit on-chain fallback data"
+            >
+              <Text style={styles.hexToolButtonText}>Edit Fallback</Text>
+            </TouchableOpacity>
+          </View>
 
           {hasPendingOnchainUpdate ? (
             <TouchableOpacity
@@ -1809,9 +1868,40 @@ export default function SubspaceScreen() {
               </Text>
             )}
           </TouchableOpacity>
-        </View>
 
-        <View style={styles.bottomSpacer} />
+          <TouchableOpacity
+            style={[
+              styles.updateOnchainButton,
+              (!hasStoredCertificate || certificateValidateLoading || receiveCertificateLoading) &&
+                styles.hexToolButtonDisabled,
+            ]}
+            onPress={() => void handleValidateCertificate()}
+            activeOpacity={0.7}
+            disabled={
+              !hasStoredCertificate || certificateValidateLoading || receiveCertificateLoading
+            }
+            accessibilityLabel="Validate certificate"
+            accessibilityState={{
+              disabled:
+                !hasStoredCertificate || certificateValidateLoading || receiveCertificateLoading,
+            }}
+          >
+            {certificateValidateLoading ? (
+              <ActivityIndicator color={colors.primary} />
+            ) : (
+              <Text style={styles.updateOnchainButtonText}>Validate Certificate</Text>
+            )}
+          </TouchableOpacity>
+
+          <VerifiedZonesResults
+            zones={certificateVerifiedZones}
+            verifyError={certificateVerifyError}
+            verifyInfo={certificateVerifyInfo}
+            requestedHandleFound={certificateRequestedHandleFound}
+            isLoading={certificateValidateLoading}
+            loadingText="Validating certificate…"
+          />
+        </View>
 
         {/* Delete Space Button */}
         <TouchableOpacity
@@ -1821,7 +1911,7 @@ export default function SubspaceScreen() {
         >
           <Text style={styles.deleteButtonText}>Delete Space</Text>
         </TouchableOpacity>
-      </View>
+      </ScrollView>
 
       {/* Delete Confirmation Dialog */}
       <Modal
@@ -2077,8 +2167,10 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: colors.background,
   },
-  content: {
+  scrollView: {
     flex: 1,
+  },
+  scrollContent: {
     paddingHorizontal: 20,
     paddingTop: 24,
   },
@@ -2140,10 +2232,6 @@ const styles = StyleSheet.create({
   cryptoAddressSpinner: {
     paddingVertical: 4,
     alignSelf: 'flex-start',
-  },
-  bottomSpacer: {
-    flex: 1,
-    minHeight: 16,
   },
   subspaceNameContainer: {
     backgroundColor: colors.card,
@@ -2224,12 +2312,19 @@ const styles = StyleSheet.create({
     lineHeight: 17,
     marginBottom: 12,
   },
+  hexToolButtonRow: {
+    flexDirection: 'row',
+    gap: 10,
+  },
   hexToolButton: {
     backgroundColor: colors.primary,
     borderRadius: 12,
     paddingVertical: 16,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  hexToolButtonHalf: {
+    flex: 1,
   },
   updateOnchainButton: {
     backgroundColor: colors.card,
@@ -2259,6 +2354,7 @@ const styles = StyleSheet.create({
     paddingVertical: 16,
     alignItems: 'center',
     justifyContent: 'center',
+    marginTop: 24,
     marginBottom: 40,
   },
   deleteButtonText: {

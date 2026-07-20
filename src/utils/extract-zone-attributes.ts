@@ -1,3 +1,5 @@
+import { bytesToHex } from '@/lib/wire';
+
 /** Minimal zone shape from libveritas — avoids static import of native module. */
 export type ZoneLike = {
   handle: string;
@@ -20,6 +22,11 @@ export type VerifiedZoneSummary = {
   canonical: string;
   alias?: string;
   attributes: ZoneAttribute[];
+  fallbackAttributes: ZoneAttribute[];
+  /** Primary zone SIP-7 wire bytes as hex (includes Seq; may include Sig). */
+  recordsHex?: string;
+  /** Fallback zone SIP-7 wire bytes as hex. */
+  fallbackRecordsHex?: string;
 };
 
 const PREFERRED_ATTRIBUTE_KEYS = ['website', 'nostr', 'btc'] as const;
@@ -56,21 +63,25 @@ async function extractAttributesFromRecordBytes(
   return attributes;
 }
 
-async function extractAttributesFromZone(zone: ZoneLike): Promise<ZoneAttribute[]> {
-  const primary = await extractAttributesFromRecordBytes(zone.records);
-  if (primary.length > 0) {
-    return primary;
-  }
-  return extractAttributesFromRecordBytes(zone.fallbackRecords);
-}
-
 export async function summarizeVerifiedZone(zone: ZoneLike): Promise<VerifiedZoneSummary> {
+  const [attributes, fallbackAttributes] = await Promise.all([
+    extractAttributesFromRecordBytes(zone.records),
+    extractAttributesFromRecordBytes(zone.fallbackRecords),
+  ]);
+
   return {
     handle: zone.handle,
     sovereignty: zone.sovereignty,
     canonical: zone.canonical,
     alias: zone.alias,
-    attributes: await extractAttributesFromZone(zone),
+    attributes,
+    fallbackAttributes,
+    recordsHex:
+      zone.records.byteLength > 0 ? bytesToHex(new Uint8Array(zone.records)) : undefined,
+    fallbackRecordsHex:
+      zone.fallbackRecords.byteLength > 0
+        ? bytesToHex(new Uint8Array(zone.fallbackRecords))
+        : undefined,
   };
 }
 
