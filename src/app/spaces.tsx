@@ -33,6 +33,11 @@ import {
 } from '@/utils/spaces-scan-paths';
 import { buildPaymentWatchRequestBody } from '@/utils/build-payment-watch-body';
 import { formatMySpaceHandleStatusLabel } from '@/utils/format-my-space-status';
+import {
+  fetchSpacePipelineSnapshot,
+  formatMySpacesThirdColumnLabel,
+  pipelineSnapshotFieldsFromUpdate,
+} from '@/utils/space-pipeline';
 import { resolveNextAvailableTaprootPath } from '@/utils/resolve-next-spaces-path';
 import { WDKSpaces } from '@/utils/wdk-spaces';
 import { registerPurchaseStatusPollStarter } from '@/utils/purchase-poll-bridge';
@@ -246,100 +251,6 @@ async function fetchSubsHandleRecord(
     console.warn('[Spaces] subs handle', url, e);
     return null;
   }
-}
-
-type SpacePipelineSteps = {
-  broadcast?: string;
-  confirmed?: string;
-};
-
-/** Batch is awaiting confirmation when broadcast finished and confirmation is in progress. */
-function isPipelineBatchConfirming(steps: SpacePipelineSteps | null | undefined): boolean {
-  return steps?.broadcast === 'complete' && steps?.confirmed === 'in_progress';
-}
-
-/**
- * GET /spaces/@{space}/pipeline — space-level batch pipeline (not per-handle).
- * Returns `null` when the request fails; do not change stored confirming state.
- */
-async function fetchSpacePipelineBatchConfirming(
-  baseUrl: string,
-  spaceName: string
-): Promise<boolean | null> {
-  const b = baseUrl.replace(/\/$/, '');
-  const spaceSlug = `@${spaceName.toLowerCase()}`;
-  const url = `${b}/spaces/${encodeURIComponent(spaceSlug)}/pipeline`;
-  try {
-    const res = await fetch(url, { headers: { Accept: 'application/json' } });
-    const text = await res.text();
-    let body: unknown;
-    try {
-      body = text ? JSON.parse(text) : null;
-    } catch {
-      body = null;
-    }
-    const o = body && typeof body === 'object' ? (body as Record<string, unknown>) : {};
-    const steps =
-      o.steps && typeof o.steps === 'object' ? (o.steps as SpacePipelineSteps) : null;
-    if (!res.ok || o.success === false) {
-      console.warn('[Spaces] space pipeline', { url, status: res.status, body });
-      return null;
-    }
-    if (
-      !steps &&
-      (typeof o.handle === 'string' || o.price != null || typeof o.state === 'string')
-    ) {
-      console.warn('[Spaces] space pipeline: unexpected handle payload', { url, body: o });
-      return null;
-    }
-    if (!steps) {
-      console.warn('[Spaces] space pipeline: missing steps', { url, body: o });
-      return null;
-    }
-    const confirming = isPipelineBatchConfirming(steps);
-    console.log('[Spaces] space pipeline', { url, confirming, steps });
-    return confirming;
-  } catch (e) {
-    console.warn('[Spaces] space pipeline', url, e);
-    return null;
-  }
-}
-
-/**
- * Prefer space pipeline steps; when unavailable, infer from subs `publish_status`
- * (`null` ⇒ batch confirmation still in progress, `final` ⇒ settled).
- */
-function resolveSubsBatchConfirming(
-  subs: SubsHandleSnapshot | null | undefined,
-  pipelineConfirming: boolean | null
-): boolean | null {
-  if (subs?.subsStatus !== 'committed') {
-    return false;
-  }
-  if (pipelineConfirming !== null) {
-    return pipelineConfirming;
-  }
-  if (subs.publishStatus === 'final') {
-    return false;
-  }
-  if (subs.publishStatus == null) {
-    return true;
-  }
-  return null;
-}
-
-function subsPipelineFieldsFromUpdate(
-  subs: SubsHandleSnapshot | null | undefined,
-  pipelineConfirming: boolean | null
-): { subsPipelineBatchConfirming?: boolean } {
-  const resolved = resolveSubsBatchConfirming(subs, pipelineConfirming);
-  if (subs?.subsStatus !== 'committed') {
-    return { subsPipelineBatchConfirming: false };
-  }
-  if (resolved === null) {
-    return {};
-  }
-  return { subsPipelineBatchConfirming: resolved };
 }
 
 /** Track commitment_root for committed handles; flag when root changes on a later check. */
@@ -1186,6 +1097,8 @@ export default function SpacesScreen() {
       subsCommitmentRootConfirming?: boolean;
       /** True when space pipeline has broadcast complete and confirmation in progress. */
       subsPipelineBatchConfirming?: boolean;
+      /** Hours until batch finalization when pipeline finalized step is in progress. */
+      pipelineFinalizedHoursRemaining?: number | null;
       /** `state.payment_confirmed` from GET /tenant-quotes when off-chain. */
       tenantQuotePaymentConfirmed?: boolean | null;
     }[]
@@ -1495,15 +1408,15 @@ export default function SpacesScreen() {
         }
       }
 
-      const pipelineBySpace = new Map<string, boolean>();
+      const pipelineBySpace = new Map<
+        string,
+        NonNullable<Awaited<ReturnType<typeof fetchSpacePipelineSnapshot>>>
+      >();
       await Promise.all(
         [...pipelineSpacesToCheck].map(async (spaceName) => {
-          const confirming = await fetchSpacePipelineBatchConfirming(
-            SPACES_API_BASE_URL,
-            spaceName
-          );
-          if (confirming !== null) {
-            pipelineBySpace.set(spaceName, confirming);
+          const snapshot = await fetchSpacePipelineSnapshot(SPACES_API_BASE_URL, spaceName);
+          if (snapshot) {
+            pipelineBySpace.set(spaceName, snapshot);
           }
         })
       );
@@ -1554,7 +1467,7 @@ export default function SpacesScreen() {
             next = {
               ...next,
               ...subsCommitmentFieldsFromUpdate(next, subs),
-              ...subsPipelineFieldsFromUpdate(
+              ...pipelineSnapshotFieldsFromUpdate(
                 subs,
                 pipelineBySpace.get(row.spaceName.toLowerCase()) ?? null
               ),
@@ -1728,6 +1641,7 @@ export default function SpacesScreen() {
                     ...prev,
                     ...toAdd.map((p) => {
                       let scriptPubKeyHex: string | undefined = p.scriptPubKeyHex;
+                      let taprootDerivationPath: string | undefined;
                       if (!scriptPubKeyHex && parsed.length === scriptPubkeys.length) {
                         const idx = parsed.findIndex(
                           (r) =>
@@ -1735,12 +1649,23 @@ export default function SpacesScreen() {
                         );
                         if (idx >= 0) scriptPubKeyHex = scriptPubkeys[idx];
                       }
+                      if (scriptPubKeyHex) {
+                        const pathIdx = entries.findIndex(
+                          (entry) =>
+                            entry.scriptPubKeyHex?.trim().toLowerCase() ===
+                            scriptPubKeyHex!.trim().toLowerCase()
+                        );
+                        if (pathIdx >= 0) {
+                          taprootDerivationPath = fullPaths[pathIdx];
+                        }
+                      }
                       return {
                         subspace: p.subspace,
                         spaceName: p.spaceName,
                         handle: p.handle,
                         status: 'discovered' as UnifiedStatus,
                         ...(scriptPubKeyHex ? { scriptPubKeyHex } : {}),
+                        ...(taprootDerivationPath ? { taprootDerivationPath } : {}),
                       };
                     }),
                   ];
@@ -1853,7 +1778,7 @@ export default function SpacesScreen() {
       status: UnifiedStatus,
       subsSnapshot?: SubsHandleSnapshot | null,
       tenantQuote?: TenantQuoteSnapshot | null,
-      pipelineBatchConfirming?: boolean | null
+      pipelineSnapshot?: Awaited<ReturnType<typeof fetchSpacePipelineSnapshot>> | null
     ) => {
       setMySpaces((prev) =>
         prev.map((space) => {
@@ -1877,7 +1802,7 @@ export default function SpacesScreen() {
               : {}),
             ...(subsSnapshot ? subsCommitmentFieldsFromUpdate(space, subsSnapshot) : {}),
             ...(subsSnapshot
-              ? subsPipelineFieldsFromUpdate(subsSnapshot, pipelineBatchConfirming)
+              ? pipelineSnapshotFieldsFromUpdate(subsSnapshot, pipelineSnapshot)
               : {}),
             ...tenantFields,
           };
@@ -1940,9 +1865,10 @@ export default function SpacesScreen() {
             spaceRow?.chainPresence !== 'on-chain'
               ? await fetchTenantQuoteRecord(SPACES_API_BASE_URL, spaceName, subspace)
               : null;
-          let pipelineBatchConfirming: boolean | null = null;
+          let pipelineSnapshot: Awaited<ReturnType<typeof fetchSpacePipelineSnapshot>> | null =
+            null;
           if (subsSnapshot?.subsStatus === 'committed') {
-            pipelineBatchConfirming = await fetchSpacePipelineBatchConfirming(
+            pipelineSnapshot = await fetchSpacePipelineSnapshot(
               SPACES_API_BASE_URL,
               spaceName
             );
@@ -1966,7 +1892,7 @@ export default function SpacesScreen() {
 
           // Use unified status if available, otherwise map from job status
           if (unifiedStatus) {
-            updateSpaceStatus(unifiedStatus, subsSnapshot, tenantQuote, pipelineBatchConfirming);
+            updateSpaceStatus(unifiedStatus, subsSnapshot, tenantQuote, pipelineSnapshot);
             if (
               unifiedStatusPurchaseType !== 'pointer' &&
               !subsPaymentConfirmToastShown &&
@@ -2010,7 +1936,7 @@ export default function SpacesScreen() {
             if (mergedFromSubs) {
               mappedStatus = mergedFromSubs as UnifiedStatus;
             }
-            updateSpaceStatus(mappedStatus, subsSnapshot, tenantQuote, pipelineBatchConfirming);
+            updateSpaceStatus(mappedStatus, subsSnapshot, tenantQuote, pipelineSnapshot);
             if (
               !subsPaymentConfirmToastShown &&
               subsSnapshot?.subsStatus === 'staged' &&
@@ -2951,17 +2877,24 @@ export default function SpacesScreen() {
         }
 
         if (needsTaprootPath) {
-          const reserved = mySpaces
+          const reservedPaths = mySpaces
+            .filter(
+              (s) => !(s.subspace === subspaceTrimmed && s.spaceName === spaceNameLower)
+            )
+            .map((s) => s.taprootDerivationPath)
+            .filter((path): path is string => Boolean(path?.trim()));
+          const reservedSpks = mySpaces
             .filter(
               (s) => !(s.subspace === subspaceTrimmed && s.spaceName === spaceNameLower)
             )
             .map((s) => s.scriptPubKeyHex)
             .filter((spk): spk is string => Boolean(spk?.trim()));
 
-          console.log('[Spaces] Resolving next available Taproot path for first-time purchase…');
+          console.log('[Spaces] Resolving next Taproot path (max used index + 1)…');
           const nextPath = await resolveNextAvailableTaprootPath({
             baseUrl: SPACES_API_BASE_URL,
-            reservedScriptPubKeys: reserved,
+            reservedDerivationPaths: reservedPaths,
+            reservedScriptPubKeys: reservedSpks,
           });
 
           if (!nextPath) {
@@ -4517,7 +4450,10 @@ export default function SpacesScreen() {
               {mySpaces.map((space, index) => {
                 const timeUntilNextCheck = getTimeUntilNextCheck(space.subspace, space.spaceName);
                 const statusText = getSpaceStatus(space.subspace, space.spaceName);
-                const showCountdown = timeUntilNextCheck !== null;
+                const thirdColumnLabel = formatMySpacesThirdColumnLabel(
+                  space,
+                  timeUntilNextCheck
+                );
 
                 return (
                   <View
@@ -4540,9 +4476,7 @@ export default function SpacesScreen() {
                     </View>
                     <View style={[styles.tableCellNextCheck, styles.tableColCheck]}>
                       <Text style={styles.tableCellNextCheckText} numberOfLines={1}>
-                        {showCountdown && timeUntilNextCheck !== null
-                          ? `${timeUntilNextCheck} min`
-                          : '-'}
+                        {thirdColumnLabel}
                       </Text>
                     </View>
                   </View>
