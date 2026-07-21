@@ -11,7 +11,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.lcfx.spaceswallet",
-      "buildNumber": "11",
+      "buildNumber": "12",
       "infoPlist": {
         "UIStatusBarStyle": "UIStatusBarStyleLightContent",
         "UIViewControllerBasedStatusBarAppearance": false,
@@ -29,7 +29,7 @@
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
       "package": "com.lcfx.spaceswallet",
-      "versionCode": 11,
+      "versionCode": 12,
       "permissions": [
         "android.permission.CAMERA",
         "android.permission.RECORD_AUDIO"
@@ -72,7 +72,9 @@
           "android": {
             "minSdkVersion": 29,
             "compileSdkVersion": 36,
+            "targetSdkVersion": 35,
             "buildToolsVersion": "36.0.0",
+            "useLegacyPackaging": false,
             "enableProguardInReleaseBuilds": true,
             "enableShrinkResourcesInReleaseBuilds": true,
             "enableMinifyInReleaseBuilds": true
