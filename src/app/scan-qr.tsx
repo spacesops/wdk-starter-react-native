@@ -5,8 +5,16 @@ import { setScannedImportWords } from '@/utils/import-mnemonic-session';
 import { parseTwelveWordMnemonic } from '@/utils/parse-twelve-word-mnemonic';
 import * as bip39 from 'bip39';
 import { X } from 'lucide-react-native';
-import React, { useCallback, useMemo, useState } from 'react';
-import { Alert, Dimensions, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  Alert,
+  Dimensions,
+  Linking,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { colors } from '@/constants/colors';
 
@@ -20,13 +28,14 @@ export default function ScanQRScreen() {
   const isMnemonicMode = scanMode === 'mnemonic';
   const [permission, requestPermission] = useCameraPermissions();
   const [scanned, setScanned] = useState(false);
+  const [hasAsked, setHasAsked] = useState(false);
 
   const copy = useMemo(
     () =>
       isMnemonicMode
         ? {
             permissionBody:
-              'Please allow camera access to scan a QR code containing your 12-word recovery phrase.',
+              'Scanning a QR code of your recovery phrase needs the camera. You can turn it on in Settings, or go back and type your 12 words instead.',
             title: 'Scan QR code with your recovery phrase.',
             subtitle: 'Hold your phone up to the QR code. Only 12-word phrases are supported.',
             scanLabel: 'Scan recovery phrase',
@@ -38,7 +47,7 @@ export default function ScanQRScreen() {
           }
         : {
             permissionBody:
-              'Please allow camera access to scan QR codes for wallet addresses.',
+              'Scanning a QR code needs the camera. You can turn it on in Settings, or go back and paste the address instead.',
             title: 'Scan QR code to make payment.',
             subtitle: 'Hold your phone up to the QR code.',
             scanLabel: 'Scan address',
@@ -117,12 +126,18 @@ export default function ScanQRScreen() {
     router.back();
   }, [router]);
 
-  const handleRequestPermission = useCallback(async () => {
-    const result = await requestPermission();
-    if (!result.granted) {
-      Alert.alert('Camera Permission Required', copy.permissionBody);
+  // Ask once, as soon as the scanner opens, so the system dialog is the first
+  // thing the user sees. Never re-ask after a decision has been made.
+  useEffect(() => {
+    if (permission && !permission.granted && permission.canAskAgain && !hasAsked) {
+      setHasAsked(true);
+      requestPermission();
     }
-  }, [requestPermission, copy.permissionBody]);
+  }, [permission, hasAsked, requestPermission]);
+
+  const handleOpenSettings = useCallback(() => {
+    Linking.openSettings();
+  }, []);
 
   // Show loading while checking permission
   if (permission === null) {
@@ -141,7 +156,7 @@ export default function ScanQRScreen() {
     );
   }
 
-  // Show permission request if not granted
+  // Camera unavailable: the system dialog is either pending or was declined
   if (!permission.granted) {
     return (
       <View style={[styles.container, { paddingTop: insets.top }]}>
@@ -152,11 +167,17 @@ export default function ScanQRScreen() {
           </TouchableOpacity>
         </View>
         <View style={styles.centerContent}>
-          <Text style={styles.centerTitle}>Camera Permission Required</Text>
-          <Text style={styles.centerText}>{copy.permissionBody}</Text>
-          <TouchableOpacity style={styles.permissionButton} onPress={handleRequestPermission}>
-            <Text style={styles.permissionButtonText}>Enable Camera</Text>
-          </TouchableOpacity>
+          {hasAsked || !permission.canAskAgain ? (
+            <>
+              <Text style={styles.centerTitle}>Camera is off</Text>
+              <Text style={styles.centerText}>{copy.permissionBody}</Text>
+              <TouchableOpacity style={styles.permissionButton} onPress={handleOpenSettings}>
+                <Text style={styles.permissionButtonText}>Open Settings</Text>
+              </TouchableOpacity>
+            </>
+          ) : (
+            <Text style={styles.centerText}>Opening camera…</Text>
+          )}
         </View>
       </View>
     );
