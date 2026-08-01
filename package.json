@@ -20,6 +20,7 @@
     "ios": "BARE_PACK_PLATFORM=ios node scripts/fix-secret-manager-bundle.js && node scripts/ensure-ios-rncore-debug.js && expo run:ios",
     "ios:prod": "BARE_PACK_PLATFORM=ios node scripts/fix-secret-manager-bundle.js && node scripts/patch-react-native-libveritas.js && expo run:ios --configuration Release",
     "ios:prod:device": "BARE_PACK_PLATFORM=ios node scripts/fix-secret-manager-bundle.js && node scripts/patch-react-native-libveritas.js && expo run:ios --configuration Release --device",
+    "ios:debug:iphone8": "BARE_PACK_PLATFORM=ios node scripts/fix-secret-manager-bundle.js && npm run rebuild-wdk-bundle && expo run:ios --device iPhone8",
     "ios:release:iphone8": "BARE_PACK_PLATFORM=ios node scripts/fix-secret-manager-bundle.js && npm run rebuild-wdk-bundle && expo run:ios --configuration Release --device iPhone8",
     "ios:beta:build": "eas build --platform ios --profile beta",
     "ios:beta:submit": "eas submit --platform ios --profile beta --latest",

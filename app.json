@@ -17,7 +17,8 @@
         "UIViewControllerBasedStatusBarAppearance": false,
         "NSFaceIDUsageDescription": "This app uses Face ID to secure your wallet and authenticate transactions.",
         "ITSAppUsesNonExemptEncryption": false
-      }
+      },
+      "appleTeamId": "YDF9P54VLB"
     },
     "android": {
       "adaptiveIcon": {
@@ -95,7 +96,6 @@
       "eas": {
         "projectId": "5df02f86-b279-4bbd-a63c-d5b2bd79d853"
       }
-    },
-    "owner": "koine"
+    }
   }
 }
