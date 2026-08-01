@@ -50,7 +50,7 @@
     "@react-navigation/elements": "^2.6.3",
     "@react-navigation/native": "^7.1.8",
     "@reduxjs/toolkit": "^2.9.0",
-    "@spacesops/react-native-libveritas": "^0.2.0",
+    "@spacesops/react-native-libveritas": "^0.3.0",
     "@tetherto/pear-wrk-wdk": "npm:@spacesops/pear-wrk-wdk@^1.0.0-beta.30",
     "@tetherto/wdk-pricing-bitfinex-http": "^1.0.0-beta.1",
     "@tetherto/wdk-pricing-provider": "^1.0.0-beta.1",
