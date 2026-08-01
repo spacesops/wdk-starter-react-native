@@ -2,13 +2,13 @@
 
 Rejection received July 30, 2026 for version 1.0.1 (11), reviewed on iPhone 17 Pro Max.
 Three items were raised: 5.1.1(iv), 5.1.1(ii), and 2.1(a). All three are addressed in
-build **1.0.1 (13)**.
+build **1.0.1 (14)**.
 
 ---
 
 ## Reply to paste into App Store Connect → Resolution Center
 
-Hello, and thank you for the detailed review notes. We have addressed all three items in build 1.0.1 (13).
+Hello, and thank you for the detailed review notes. We have addressed all three items in build 1.0.1 (14).
 
 **Guideline 5.1.1(iv) — Camera permission request**
 
@@ -84,7 +84,13 @@ the exact strings above:
   `android.permission.RECORD_AUDIO`.
 - `android.permissions`: removed the explicit `android.permission.RECORD_AUDIO` entry,
   which would otherwise be merged back in.
-- Bumped `ios.buildNumber` to `13` and `android.versionCode` to `13`.
+- Set `ios.buildNumber` to `14` and `android.versionCode` to `14`.
+
+**`eas.json`**
+
+- `cli.appVersionSource` back to `local` and `autoIncrement: false` on the `beta` and
+  `production` profiles, so the build number is whatever `app.json` says rather than a
+  remotely assigned counter.
 
 **`src/app/scan-qr.tsx`**
 
@@ -108,5 +114,6 @@ the exact strings above:
 - [ ] Decline the permission and verify the "Camera is off" screen with Open Settings, and
       that reopening the scanner does not re-prompt
 - [ ] Scan both demo QR codes end to end
-- [ ] Upload build 1.0.1 (13), attach both PNGs and the notes above, then reply in
+- [ ] Confirm the uploaded build really is 1.0.1 (14) in App Store Connect
+- [ ] Upload build 1.0.1 (14), attach both PNGs and the notes above, then reply in
       Resolution Center
