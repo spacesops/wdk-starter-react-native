@@ -25,7 +25,7 @@ export type ValidateStoredCertificateResult = {
   warning?: string | null;
 };
 
-type LibveritasModule = typeof import('@spacesops/react-native-libveritas');
+type LibveritasModule = typeof import('@spacesprotocol/react-native-libveritas');
 
 /** libveritas expects byte views; plain ArrayBuffer slices break addCert/build on native. */
 type LibveritasByteInput = ArrayBuffer | Uint8Array;
@@ -208,7 +208,7 @@ export async function validateStoredCertificate(
   }
 
   const [lib, { summarizeVerifiedZones, sortZonesForQuery }] = await Promise.all([
-    import('@spacesops/react-native-libveritas'),
+    import('@spacesprotocol/react-native-libveritas'),
     import('@/utils/extract-zone-attributes'),
   ]);
 

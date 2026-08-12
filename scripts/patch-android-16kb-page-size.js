@@ -10,7 +10,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
-const projectRoot = path.join(__dirname, '..');
+const { projectRoot, libveritasAndroidBuildGradleRelative } = require('./libveritas-package-root');
 const CMAKE_FLAG = '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON';
 const CMAKE_PATCH_MARKER = 'spaces-wallet-16kb-page-size';
 
@@ -57,6 +57,11 @@ function regenerateBareKitAddons() {
     return;
   }
 
+  execFileSync(process.execPath, [path.join(projectRoot, 'scripts', 'patch-bare-link-android.js')], {
+    cwd: projectRoot,
+    stdio: 'inherit',
+  });
+
   fs.rmSync(addonsDir, { recursive: true, force: true });
   execFileSync(process.execPath, [linkScript], {
     cwd: bareKitAndroidDir,
@@ -66,9 +71,7 @@ function regenerateBareKitAddons() {
 }
 
 function main() {
-  patchCmakeArguments(
-    'node_modules/@spacesops/react-native-libveritas/android/build.gradle'
-  );
+  patchCmakeArguments(libveritasAndroidBuildGradleRelative());
   patchCmakeArguments('node_modules/react-native-bare-kit/android/build.gradle');
   regenerateBareKitAddons();
 }

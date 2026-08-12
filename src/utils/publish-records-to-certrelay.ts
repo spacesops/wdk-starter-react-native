@@ -30,7 +30,7 @@ type StoredCertificateFile = {
   handle_cert: string;
 };
 
-type LibveritasModule = typeof import('@spacesops/react-native-libveritas');
+type LibveritasModule = typeof import('@spacesprotocol/react-native-libveritas');
 
 function parseStoredCertificate(certificate: unknown): StoredCertificateFile {
   if (!certificate || typeof certificate !== 'object') {
@@ -189,7 +189,7 @@ export async function publishRecordsToCertrelay(
   });
 
   let recordsWireBytes = new Uint8Array(0);
-  const lib = await import('@spacesops/react-native-libveritas');
+  const lib = await import('@spacesprotocol/react-native-libveritas');
   if (wireHex.length > 0) {
     const decoded = decodeRecordSet(hexToBytes(wireHex.toUpperCase()));
     const { seqVersion, visibleRows } = splitInternalWireRows(decoded);

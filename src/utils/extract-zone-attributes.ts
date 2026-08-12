@@ -38,7 +38,7 @@ async function extractAttributesFromRecordBytes(
     return [];
   }
 
-  const { RecordSet } = await import('@spacesops/react-native-libveritas');
+  const { RecordSet } = await import('@spacesprotocol/react-native-libveritas');
   const recordSet = new RecordSet(recordsBytes);
   if (recordSet.isEmpty()) {
     return [];

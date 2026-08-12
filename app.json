@@ -84,6 +84,7 @@
         }
       ],
       "./plugins/withAndroidSubprojects.js",
+      "./plugins/withAndroidGradleNode.js",
       "./plugins/withDisableSwiftUICoreAutolink.js",
       "./plugins/withLibveritasIosLinkerFix.js"
     ],

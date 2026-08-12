@@ -23,7 +23,7 @@ export async function verifyQueryMessage(
 ): Promise<VerifyQueryMessageResult> {
   console.log('[Spaces] verifyQueryMessage: importing libveritas…');
   const { Anchors, Message, QueryContext, Veritas } = await import(
-    '@spacesops/react-native-libveritas'
+    '@spacesprotocol/react-native-libveritas'
   );
   console.log('[Spaces] verifyQueryMessage: libveritas module loaded');
 

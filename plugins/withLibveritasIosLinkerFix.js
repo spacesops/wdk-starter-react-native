@@ -6,7 +6,7 @@ const PATCH_END = '## <<< spaces-wallet libveritas iOS linker fix';
 const XCFRAMEWORKS_HOOK_MARKER = 'spaces-wallet libveritas linker alias';
 
 /**
- * @spacesops/react-native-libveritas ships liblibveritas_uniffi.a but CocoaPods
+ * @spacesprotocol/react-native-libveritas ships liblibveritas_uniffi.a but CocoaPods
  * links -lveritas_uniffi (expects libveritas_uniffi.a). Hard-copy the alias in
  * node_modules and after each [CP] Copy XCFrameworks run so ld always finds it.
  */
@@ -14,7 +14,7 @@ function buildPatch() {
   return [
     PATCH_START,
     '  libveritas_xcframework = File.expand_path(',
-    "    '../node_modules/@spacesops/react-native-libveritas/SpacesopsReactNativeLibveritasFramework.xcframework',",
+    "    '../node_modules/@spacesprotocol/react-native-libveritas/SpacesprotocolReactNativeLibveritasFramework.xcframework',",
     '    __dir__',
     '  )',
     "  ['ios-arm64', 'ios-arm64-simulator'].each do |slice|",

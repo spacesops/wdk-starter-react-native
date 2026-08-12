@@ -5,9 +5,9 @@
   "scripts": {
     "start": "expo start --dev-client",
     "start:clear": "expo start --dev-client --clear",
-    "android": "BARE_PACK_PLATFORM=android node scripts/fix-secret-manager-bundle.js && npm run rebuild-wdk-bundle && expo run:android",
-    "android:prod": "BARE_PACK_PLATFORM=android node scripts/fix-secret-manager-bundle.js && npm run rebuild-wdk-bundle && expo run:android --variant release",
-    "android:build:release": "BARE_PACK_PLATFORM=android node scripts/fix-secret-manager-bundle.js && npm run rebuild-wdk-bundle && cd android && ./gradlew assembleRelease && cd .. && APK_PATH=\"android/app/build/outputs/apk/release/app-release.apk\" && if [ -f \"$APK_PATH\" ]; then echo \"\" && echo \"✓ Android production APK built successfully!\" && echo \"📦 APK Location: $(pwd)/$APK_PATH\" && echo \"📊 File size: $(du -h \"$APK_PATH\" | cut -f1)\" && echo \"\"; else echo \"❌ Error: APK not found at $APK_PATH\"; exit 1; fi",
+    "android": "BARE_PACK_PLATFORM=android node scripts/fix-secret-manager-bundle.js && npm run rebuild-wdk-bundle && node scripts/patch-bare-link-android.js && node scripts/patch-expo-android-bin-dirs.js && node scripts/patch-android-settings-node.js && expo run:android",
+    "android:prod": "BARE_PACK_PLATFORM=android node scripts/fix-secret-manager-bundle.js && npm run rebuild-wdk-bundle && node scripts/patch-bare-link-android.js && node scripts/patch-android-settings-node.js && expo run:android --variant release",
+    "android:build:release": "BARE_PACK_PLATFORM=android node scripts/fix-secret-manager-bundle.js && npm run rebuild-wdk-bundle && node scripts/patch-bare-link-android.js && node scripts/patch-android-settings-node.js && cd android && ./gradlew assembleRelease && cd .. && APK_PATH=\"android/app/build/outputs/apk/release/app-release.apk\" && if [ -f \"$APK_PATH\" ]; then echo \"\" && echo \"✓ Android production APK built successfully!\" && echo \"📦 APK Location: $(pwd)/$APK_PATH\" && echo \"📊 File size: $(du -h \"$APK_PATH\" | cut -f1)\" && echo \"\"; else echo \"❌ Error: APK not found at $APK_PATH\"; exit 1; fi",
     "android:beta:build": "eas build --platform android --profile beta",
     "android:beta:submit": "eas submit --platform android --profile beta --latest",
     "android:beta:verify": "./scripts/verify-play-eas-integration.sh",
@@ -34,8 +34,8 @@
     "typecheck": "tsc --noEmit",
     "gen:bundle": "npm --prefix node_modules/@tetherto/pear-wrk-wdk run gen:mobile-bundle",
     "rebuild-wdk-bundle": "./scripts/rebuild-wdk-bundle.sh",
-    "postinstall": "node scripts/patch-pear-wrk-taproot-keys.js && node scripts/fix-secret-manager-bundle.js && node scripts/patch-wdk-unlock-guard.js && node scripts/patch-wdk-wallet-btc-memo-coinselect.js && node scripts/patch-react-native-libveritas.js && node scripts/patch-android-16kb-page-size.js",
-    "eas-build-post-install": "node scripts/patch-pear-wrk-taproot-keys.js && node scripts/fix-secret-manager-bundle.js && node scripts/patch-wdk-unlock-guard.js && node scripts/patch-wdk-wallet-btc-memo-coinselect.js && node scripts/patch-react-native-libveritas.js && node scripts/patch-android-16kb-page-size.js && node scripts/ensure-ios-rncore-debug.js",
+    "postinstall": "node scripts/patch-pear-wrk-taproot-keys.js && node scripts/fix-secret-manager-bundle.js && node scripts/patch-wdk-unlock-guard.js && node scripts/patch-wdk-wallet-btc-memo-coinselect.js && node scripts/patch-react-native-libveritas.js && node scripts/patch-bare-link-android.js && node scripts/patch-expo-android-bin-dirs.js && node scripts/patch-android-16kb-page-size.js",
+    "eas-build-post-install": "node scripts/patch-pear-wrk-taproot-keys.js && node scripts/fix-secret-manager-bundle.js && node scripts/patch-wdk-unlock-guard.js && node scripts/patch-wdk-wallet-btc-memo-coinselect.js && node scripts/patch-react-native-libveritas.js && node scripts/patch-bare-link-android.js && node scripts/patch-expo-android-bin-dirs.js && node scripts/patch-android-16kb-page-size.js && node scripts/ensure-ios-rncore-debug.js",
     "prebuild": "expo prebuild",
     "prebuild:clean": "expo prebuild --clean",
     "env:push:eas": "./scripts/push-env-to-eas.sh",
@@ -51,7 +51,7 @@
     "@react-navigation/elements": "^2.6.3",
     "@react-navigation/native": "^7.1.8",
     "@reduxjs/toolkit": "^2.9.0",
-    "@spacesops/react-native-libveritas": "^0.3.0",
+    "@spacesprotocol/react-native-libveritas": "^0.3.0",
     "@tetherto/pear-wrk-wdk": "npm:@spacesops/pear-wrk-wdk@^1.0.0-beta.30",
     "@tetherto/wdk-pricing-bitfinex-http": "^1.0.0-beta.1",
     "@tetherto/wdk-pricing-provider": "^1.0.0-beta.1",
@@ -143,7 +143,7 @@
         "exclude": [
           "react-native-tcp-socket",
           "react-native-randombytes",
-          "@spacesops/react-native-libveritas",
+          "@spacesprotocol/react-native-libveritas",
           "react-native-fast-pbkdf2"
         ],
         "listUnknownPackages": false

@@ -57,7 +57,7 @@ Spaces Wallet is on a stack that should cover **Expo/React Native core**:
 Expo/RN/Hermes are typically fine on SDK 54. The likely failure source is **third-party prebuilt `.so` files**, especially:
 
 - `react-native-bare-kit` + **pear-wrk / WDK** worklet bundle (`libbare-*.so`, etc.)
-- `@spacesops/react-native-libveritas` (Rust / uniffi native)
+- `@spacesprotocol/react-native-libveritas` (Rust / uniffi native)
 - Other crypto natives (`react-native-fast-pbkdf2`, `react-native-randombytes`, sodium-related)
 
 `app.json` does not currently set explicit NDK/AGP versions for 16 KB. That helps **source-built** natives during EAS builds but does **not** fix **prebuilt** libs shipped inside npm packages with 4 KB alignment.
@@ -128,7 +128,7 @@ For each **UNALIGNED** library:
 
 | Source | Action |
 |--------|--------|
-| `@spacesops/react-native-libveritas` | Request 16 KB–aligned build from Spaces Protocol, or rebuild with NDK r28+ and `-Wl,-z,max-page-size=16384` |
+| `@spacesprotocol/react-native-libveritas` | Request 16 KB–aligned build from Spaces Protocol, or rebuild with NDK r28+ and `-Wl,-z,max-page-size=16384` |
 | `react-native-bare-kit` / `@tetherto/pear-wrk-wdk` | Request updated WDK/BareKit Android binaries with 16 KB alignment |
 | Other RN native modules | Upgrade to latest; check CHANGELOG/issues for “16 KB” |
 
