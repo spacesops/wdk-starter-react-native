@@ -21,6 +21,9 @@ const pearWrkPath = fs.existsSync(pearWrkPathTetherto)
 const pearWrkImportsFile = path.join(pearWrkPath, 'pack.imports.json');
 
 const BARE_ADDONS = ['bare-crypto', 'bare-tcp', 'bare-tls', 'bare-url'];
+// Nested copies of these must be removed before bare-pack; otherwise wallet-btc's
+// own node_modules wins and packs a native binding the worklet cannot load.
+const NESTED_BARE_TO_REMOVE = [...BARE_ADDONS, 'bare-performance'];
 
 const ANDROID_BARE_PACK_TARGETS = [
   'android-arm',
@@ -155,13 +158,40 @@ function getLinkedAddonVersions (bundlePath) {
     const re = /libbare-([a-z-]+)\.(\d+\.\d+\.\d+)\.so/g;
     let match;
     while ((match = re.exec(content)) !== null) {
-      linked.set(`bare-${match[1]}`, match[2]);
+      const addon = `bare-${match[1]}`;
+      const version = match[2];
+      if (!linked.has(addon)) linked.set(addon, new Set());
+      linked.get(addon).add(version);
     }
   } catch (_) {
     // ignore
   }
 
   return linked;
+}
+
+function getBundleSkew (bundlePath, addons = BARE_ADDONS) {
+  const linked = getLinkedAddonVersions(bundlePath);
+  const skew = [];
+
+  for (const addon of addons) {
+    const installed = getInstalledVersion(addon);
+    if (!installed) continue;
+
+    const linkedVersions = linked.get(addon);
+    if (!linkedVersions || linkedVersions.size === 0) continue;
+
+    const versions = [...linkedVersions];
+    if (versions.length !== 1 || versions[0] !== installed) {
+      skew.push({
+        addon,
+        installed,
+        linked: versions.join(', '),
+      });
+    }
+  }
+
+  return skew;
 }
 
 function bundleHasIosLinkedFrameworks (bundlePath) {
@@ -206,26 +236,6 @@ function shouldRegenerateForPlatformMismatch (bundlePath) {
   }
 
   return !bundleHasIosLinkedFrameworks(bundlePath);
-}
-
-function getBundleSkew (bundlePath, addons = BARE_ADDONS) {
-  const linked = getLinkedAddonVersions(bundlePath);
-  const skew = [];
-
-  for (const addon of addons) {
-    const installed = getInstalledVersion(addon);
-    if (!installed) continue;
-
-    const shortName = addon.replace(/^bare-/, '');
-    const linkedVersion = linked.get(addon);
-    if (!linkedVersion) continue;
-
-    if (linkedVersion !== installed) {
-      skew.push({ addon, installed, linked: linkedVersion });
-    }
-  }
-
-  return skew;
 }
 
 function getBarePackBin () {
@@ -273,10 +283,15 @@ function ensureBarePerformanceShim () {
   fs.mkdirSync(path.join(pearWrkPath, 'shims'), { recursive: true });
   fs.cpSync(src, dest, {
     recursive: true,
-    filter: (entry) =>
-      !entry.includes(`${path.sep}prebuilds${path.sep}`)
-      && !entry.endsWith(`${path.sep}binding.c`)
-      && !entry.endsWith(`${path.sep}CMakeLists.txt`),
+    filter: (entry) => {
+      const base = path.basename(entry);
+      return (
+        base !== 'prebuilds'
+        && base !== 'binding.c'
+        && base !== 'CMakeLists.txt'
+        && !entry.includes(`${path.sep}prebuilds${path.sep}`)
+      );
+    },
   });
 
   fs.copyFileSync(
@@ -338,13 +353,27 @@ function updatePackImports () {
       'utf-8-validate': 'utf-8-validate',
       'bare-crypto': 'bare-crypto',
       'bare-tcp': 'bare-tcp',
+      'bare-tls': 'bare-tls',
+      'bare-url': 'bare-url',
       'sodium-native': 'sodium-native',
+      // descriptors-core require()'s the scoped package name; map both so bare-pack
+      // can resolve without installing @ledgerhq/ledger-bitcoin on mobile.
       'ledger-bitcoin': ledgerBitcoinShim,
+      '@ledgerhq/ledger-bitcoin': ledgerBitcoinShim,
       'bare-performance': path.join(barePerformanceShim, 'index.js'),
     };
     const existing = fs.existsSync(pearWrkImportsFile)
       ? JSON.parse(fs.readFileSync(pearWrkImportsFile, 'utf8'))
       : {};
+    // Drop any prior absolute bare-* remaps that break bare-module-traverse.
+    for (const addon of BARE_ADDONS) {
+      if (
+        typeof existing[addon] === 'string' &&
+        path.isAbsolute(existing[addon])
+      ) {
+        delete existing[addon];
+      }
+    }
     fs.writeFileSync(
       pearWrkImportsFile,
       JSON.stringify({ ...existing, ...workerImportsConfig }, null, 2) + '\n',
@@ -359,11 +388,49 @@ function removeNestedBareModules () {
   if (!fs.existsSync(pearWrkPath)) return;
 
   const nestedRoot = path.join(pearWrkPath, 'node_modules');
-  for (const addon of BARE_ADDONS) {
-    const nested = path.join(nestedRoot, addon);
-    if (fs.existsSync(nested)) {
-      fs.rmSync(nested, { recursive: true, force: true });
-      console.log(`Removed nested ${addon} to use root version`);
+  if (!fs.existsSync(nestedRoot)) return;
+
+  // Remove every nested copy of NESTED_BARE_TO_REMOVE under pear-wrk-wdk (any
+  // depth), including through package symlinks into local checkouts such as
+  // ../wdk-wallet-btc. Leaving those packs a second bare-crypto/tcp version
+  // beside the root override, or a native bare-performance instead of the JS shim.
+  const stack = [nestedRoot];
+  while (stack.length > 0) {
+    const dir = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (_) {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      let isDir = entry.isDirectory();
+      if (entry.isSymbolicLink()) {
+        try {
+          isDir = fs.statSync(full).isDirectory();
+        } catch (_) {
+          continue;
+        }
+      }
+      if (!isDir) continue;
+
+      if (NESTED_BARE_TO_REMOVE.includes(entry.name)) {
+        // Always remove nested addon copies, even when reached via a package
+        // symlink into a local checkout (e.g. ../wdk-wallet-btc). Leaving them
+        // packs a second bare-crypto/tcp version beside the root override.
+        fs.rmSync(full, { recursive: true, force: true });
+        console.log(`Removed nested ${entry.name} to use root version (${path.relative(projectRoot, full)})`);
+        continue;
+      }
+
+      if (entry.name === 'node_modules' || entry.name.startsWith('@')) {
+        stack.push(full);
+      } else {
+        const nested = path.join(full, 'node_modules');
+        if (fs.existsSync(nested)) stack.push(nested);
+      }
     }
   }
 }
