@@ -54,3 +54,5 @@ spacesops/
 wdk-react-native-provider/
 
 credentials.json
+addons-lock.json
+

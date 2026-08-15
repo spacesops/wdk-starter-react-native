@@ -1,6 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-/** Matches @tetherto/wdk-react-native-provider wallet-context storage key. */
+/** Matches legacy wallet-context / WDK address cache storage key. */
 export const WDK_WALLET_ADDRESSES_KEY = 'wdk_wallet_addresses';
 
 /** Networks used to detect unexpected address drift between unlocks. */

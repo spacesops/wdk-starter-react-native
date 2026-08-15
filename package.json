@@ -5,9 +5,9 @@
   "scripts": {
     "start": "expo start --dev-client",
     "start:clear": "expo start --dev-client --clear",
-    "android": "npm run rebuild-wdk-bundle && BARE_PACK_PLATFORM=android node scripts/fix-secret-manager-bundle.js && node scripts/patch-bare-link-android.js && node scripts/patch-expo-android-bin-dirs.js && node scripts/patch-android-settings-node.js && expo run:android",
-    "android:prod": "npm run rebuild-wdk-bundle && BARE_PACK_PLATFORM=android node scripts/fix-secret-manager-bundle.js && node scripts/patch-bare-link-android.js && node scripts/patch-android-settings-node.js && expo run:android --variant release",
-    "android:build:release": "npm run rebuild-wdk-bundle && BARE_PACK_PLATFORM=android node scripts/fix-secret-manager-bundle.js && node scripts/patch-bare-link-android.js && node scripts/patch-android-settings-node.js && cd android && ./gradlew assembleRelease && cd .. && APK_PATH=\"android/app/build/outputs/apk/release/app-release.apk\" && if [ -f \"$APK_PATH\" ]; then echo \"\" && echo \"✓ Android production APK built successfully!\" && echo \"📦 APK Location: $(pwd)/$APK_PATH\" && echo \"📊 File size: $(du -h \"$APK_PATH\" | cut -f1)\" && echo \"\"; else echo \"❌ Error: APK not found at $APK_PATH\"; exit 1; fi",
+    "android": "node scripts/patch-bare-link-android.js && node scripts/patch-expo-android-bin-dirs.js && node scripts/patch-android-settings-node.js && expo run:android",
+    "android:prod": "node scripts/patch-bare-link-android.js && node scripts/patch-android-settings-node.js && expo run:android --variant release",
+    "android:build:release": "node scripts/patch-bare-link-android.js && node scripts/patch-android-settings-node.js && cd android && ./gradlew assembleRelease && cd .. && APK_PATH=\"android/app/build/outputs/apk/release/app-release.apk\" && if [ -f \"$APK_PATH\" ]; then echo \"\" && echo \"✓ Android production APK built successfully!\" && echo \"📦 APK Location: $(pwd)/$APK_PATH\" && echo \"📊 File size: $(du -h \"$APK_PATH\" | cut -f1)\" && echo \"\"; else echo \"❌ Error: APK not found at $APK_PATH\"; exit 1; fi",
     "android:beta:build": "eas build --platform android --profile beta",
     "android:beta:submit": "eas submit --platform android --profile beta --latest",
     "android:beta:verify": "./scripts/verify-play-eas-integration.sh",
@@ -17,11 +17,11 @@
     "android:open": "eas build --platform android --profile beta --auto-submit-with-profile open",
     "android:preview": "eas build --platform android --profile preview",
     "beta": "eas build --platform all --profile beta --auto-submit",
-    "ios": "BARE_PACK_PLATFORM=ios node scripts/fix-secret-manager-bundle.js && node scripts/ensure-ios-rncore-debug.js && expo run:ios",
-    "ios:prod": "BARE_PACK_PLATFORM=ios node scripts/fix-secret-manager-bundle.js && node scripts/patch-react-native-libveritas.js && expo run:ios --configuration Release",
-    "ios:prod:device": "BARE_PACK_PLATFORM=ios node scripts/fix-secret-manager-bundle.js && node scripts/patch-react-native-libveritas.js && expo run:ios --configuration Release --device",
-    "ios:debug:iphone8": "npm run rebuild-wdk-bundle && BARE_PACK_PLATFORM=ios node scripts/fix-secret-manager-bundle.js && expo run:ios --device iPhone8",
-    "ios:release:iphone8": "npm run rebuild-wdk-bundle && BARE_PACK_PLATFORM=ios node scripts/fix-secret-manager-bundle.js && expo run:ios --configuration Release --device iPhone8",
+    "ios": "node scripts/ensure-ios-rncore-debug.js && expo run:ios",
+    "ios:prod": "node scripts/patch-react-native-libveritas.js && expo run:ios --configuration Release",
+    "ios:prod:device": "node scripts/patch-react-native-libveritas.js && expo run:ios --configuration Release --device",
+    "ios:debug:iphone8": "expo run:ios --device iPhone8",
+    "ios:release:iphone8": "expo run:ios --configuration Release --device iPhone8",
     "ios:beta:build": "eas build --platform ios --profile beta",
     "ios:beta:submit": "eas submit --platform ios --profile beta --latest",
     "ios:beta": "eas build --platform ios --profile beta --auto-submit",
@@ -32,10 +32,10 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "typecheck": "tsc --noEmit",
-    "gen:bundle": "npm --prefix node_modules/@tetherto/pear-wrk-wdk run gen:mobile-bundle",
+    "gen:bundle": "npm --prefix node_modules/@spacesops/pear-wrk-wdk run gen:mobile-bundle",
     "rebuild-wdk-bundle": "./scripts/rebuild-wdk-bundle.sh",
-    "postinstall": "node scripts/patch-pear-wrk-taproot-keys.js && node scripts/fix-secret-manager-bundle.js && node scripts/patch-wdk-unlock-guard.js && node scripts/patch-wdk-wallet-btc-memo-coinselect.js && node scripts/patch-react-native-libveritas.js && node scripts/patch-bare-link-android.js && node scripts/patch-expo-android-bin-dirs.js && node scripts/patch-android-16kb-page-size.js",
-    "eas-build-post-install": "node scripts/patch-pear-wrk-taproot-keys.js && node scripts/fix-secret-manager-bundle.js && node scripts/patch-wdk-unlock-guard.js && node scripts/patch-wdk-wallet-btc-memo-coinselect.js && node scripts/patch-react-native-libveritas.js && node scripts/patch-bare-link-android.js && node scripts/patch-expo-android-bin-dirs.js && node scripts/patch-android-16kb-page-size.js && node scripts/ensure-ios-rncore-debug.js",
+    "postinstall": "node scripts/ensure-bare-performance-prebuilds.js && node scripts/patch-pear-wrk-taproot-keys.js && node scripts/patch-wdk-wallet-btc-memo-coinselect.js && node scripts/patch-react-native-libveritas.js && node scripts/patch-bare-link-android.js && node scripts/patch-expo-android-bin-dirs.js && node scripts/patch-android-16kb-page-size.js",
+    "eas-build-post-install": "node scripts/ensure-bare-performance-prebuilds.js && node scripts/patch-pear-wrk-taproot-keys.js && node scripts/patch-wdk-wallet-btc-memo-coinselect.js && node scripts/patch-react-native-libveritas.js && node scripts/patch-bare-link-android.js && node scripts/patch-expo-android-bin-dirs.js && node scripts/patch-android-16kb-page-size.js && node scripts/ensure-ios-rncore-debug.js",
     "prebuild": "expo prebuild",
     "prebuild:clean": "expo prebuild --clean",
     "env:push:eas": "./scripts/push-env-to-eas.sh",
@@ -51,17 +51,13 @@
     "@react-navigation/elements": "^2.6.3",
     "@react-navigation/native": "^7.1.8",
     "@reduxjs/toolkit": "^2.9.0",
+    "@spacesops/react-native-bare-kit": "0.11.0-beta.49",
+    "@spacesops/wdk-react-native-core": "1.0.0-beta.67",
     "@spacesprotocol/react-native-libveritas": "^0.3.0",
-    "@tetherto/pear-wrk-wdk": "npm:@spacesops/pear-wrk-wdk@^1.0.0-beta.30",
     "@tetherto/wdk-pricing-bitfinex-http": "^1.0.0-beta.1",
     "@tetherto/wdk-pricing-provider": "^1.0.0-beta.1",
-    "@tetherto/wdk-react-native-provider": "npm:@spacesops/wdk-react-native-provider@^1.0.0-beta.30",
     "@tetherto/wdk-uikit-react-native": "^1.0.0-beta.2",
     "@ton/core": "^0.62.0",
-    "@wdk/wallet-btc": "npm:@spacesops/wdk-wallet-btc@^1.0.0-beta.15",
-    "b4a": "^1.7.2",
-    "bare-pack": "1.5.1",
-    "bare-performance": "^2.0.0",
     "bip39": "^3.1.0",
     "browserify-zlib": "^0.2.0",
     "decimal.js": "^10.6.0",
@@ -77,6 +73,7 @@
     "expo-haptics": "~15.0.7",
     "expo-image": "~3.0.8",
     "expo-linking": "~8.0.8",
+    "expo-local-authentication": "~17.0.8",
     "expo-router": "~6.0.6",
     "expo-splash-screen": "~31.0.10",
     "expo-status-bar": "~3.0.8",
@@ -93,7 +90,6 @@
     "react": "19.1.0",
     "react-dom": "19.1.0",
     "react-native": "0.81.5",
-    "react-native-bare-kit": "^0.10.2",
     "react-native-chart-kit": "^6.12.0",
     "react-native-crypto": "^2.2.1",
     "react-native-device-info": "^14.1.1",
@@ -101,6 +97,7 @@
     "react-native-gesture-handler": "~2.28.0",
     "react-native-get-random-values": "^1.11.0",
     "react-native-keychain": "^10.0.0",
+    "react-native-nitro-modules": "^0.35.0",
     "react-native-qr-svg": "^1.5.0",
     "react-native-randombytes": "^3.6.2",
     "react-native-reanimated": "~4.1.0",
@@ -151,8 +148,17 @@
     }
   },
   "overrides": {
-    "bare-pack": "1.5.1",
-    "bare-crypto": "1.13.5",
-    "os": "npm:bare-os@3.9.3"
+    "expo-crypto": "$expo-crypto",
+    "expo-local-authentication": "$expo-local-authentication",
+    "@spacesops/wdk-react-native-core": {
+      "@tetherto/wdk-react-native-secure-storage": {
+        "expo-crypto": "$expo-crypto",
+        "expo-local-authentication": "$expo-local-authentication"
+      }
+    },
+    "@tetherto/wdk-react-native-secure-storage": {
+      "expo-crypto": "$expo-crypto",
+      "expo-local-authentication": "$expo-local-authentication"
+    }
   }
 }

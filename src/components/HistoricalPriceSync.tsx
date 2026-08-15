@@ -1,30 +1,30 @@
-import { useWallet } from '@tetherto/wdk-react-native-provider';
+import { useWallet, useWalletManager } from '@spacesops/wdk-react-native-core';
 import React, { useEffect, useRef } from 'react';
 import { pricingService } from '@/services/pricing-service';
 import {
   clearAllHistoricalPriceData,
   syncHistoricalPrices,
-  type TransactionLike,
 } from '@/services/historical-price-storage';
+import { resolveCurrentWalletId } from '@/utils/resolve-current-wallet-id';
 
 const shouldClearPrices =
-  typeof process !== 'undefined' &&
-  process.env.EXPO_PUBLIC_CLEAR_PRICES === 'true';
+  typeof process !== 'undefined' && process.env.EXPO_PUBLIC_CLEAR_PRICES === 'true';
 
 /**
- * When the wallet is unlocked and transactions are loaded, computes earliest
- * date per token from activity, stores it in AsyncStorage, fetches historical
- * prices from that date to now (or appends new data since last launch), and
- * stores the series in AsyncStorage.
- * If EXPO_PUBLIC_CLEAR_PRICES is true, clears all stored historical data first
- * so it is reloaded from the API (100 days from today at midnight).
+ * When the wallet is initialized, optionally clears stored prices and syncs
+ * historical price series. Transaction-based earliest-date sync is unavailable
+ * until the new core exposes activity history.
  */
 export function HistoricalPriceSync() {
-  const { wallet, isUnlocked, transactions } = useWallet();
+  const { wallets, activeWalletId } = useWalletManager();
+  const currentWalletId = resolveCurrentWalletId(activeWalletId, wallets);
+  const { isInitialized } = useWallet(
+    currentWalletId ? { walletId: currentWalletId } : undefined
+  );
   const hasSyncedRef = useRef(false);
 
   useEffect(() => {
-    if (!wallet || !isUnlocked || !transactions?.list || transactions.isLoading) {
+    if (!isInitialized) {
       return;
     }
     if (hasSyncedRef.current) return;
@@ -34,11 +34,13 @@ export function HistoricalPriceSync() {
       try {
         if (shouldClearPrices) {
           await clearAllHistoricalPriceData();
-          console.log('[HistoricalPriceSync] Cleared historical price data (EXPO_PUBLIC_CLEAR_PRICES=true), reloading from API');
+          console.log(
+            '[HistoricalPriceSync] Cleared historical price data (EXPO_PUBLIC_CLEAR_PRICES=true), reloading from API'
+          );
         }
         await pricingService.initialize();
-        const list = transactions.list as TransactionLike[];
-        await syncHistoricalPrices(list, pricingService);
+        // No transaction list in new core yet — sync default window from empty activity.
+        await syncHistoricalPrices([], pricingService);
       } catch (err) {
         console.warn('[HistoricalPriceSync]', err);
         hasSyncedRef.current = false;
@@ -46,7 +48,7 @@ export function HistoricalPriceSync() {
     };
 
     run();
-  }, [wallet, isUnlocked, transactions?.list, transactions?.isLoading]);
+  }, [isInitialized]);
 
   return null;
 }

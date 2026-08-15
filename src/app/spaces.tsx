@@ -1,7 +1,7 @@
 import Header from '@/components/header';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
 import { AtSign, Check, ChevronDown, ChevronRight, ChevronUp, Circle, Copy, Info, Search } from 'lucide-react-native';
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useFocusEffect } from '@react-navigation/native';
 import {
   ActivityIndicator,
@@ -17,15 +17,21 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { colors } from '@/constants/colors';
+import { resolveCurrentWalletId } from '@/utils/resolve-current-wallet-id';
 import { pricingService, FiatCurrency, getPricingServiceHostname } from '@/services/pricing-service';
+import { AssetTicker } from '@/config/assets';
+import getTokenConfigs from '@/config/get-token-configs';
+import { NetworkType } from '@/config/networks';
+import { WDKService } from '@/services/wdk-service';
 import {
-  AssetTicker,
-  NetworkType,
+  useBalancesForWallet,
   useWallet,
-  WDKService,
-} from '@tetherto/wdk-react-native-provider';
+  useWalletManager,
+} from '@spacesops/wdk-react-native-core';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import getChainsConfig from '@/config/get-chains-config';
+import { createLegacyBalances } from '@/utils/legacy-balances';
+import { getWalletAddress } from '@/utils/wallet-addresses';
 import {
   buildSpacesScanDerivationPaths,
   fullPathToWalletRelativePath,
@@ -975,7 +981,21 @@ function throwSpacesApiHttpError(httpStatus: number, errorText: string): never {
 export default function SpacesScreen() {
   const insets = useSafeAreaInsets();
   const router = useDebouncedNavigation();
-  const { wallet, addresses, balances } = useWallet();
+  const { wallets, activeWalletId } = useWalletManager();
+  const currentWalletId = resolveCurrentWalletId(activeWalletId, wallets);
+  const { addresses, isInitialized } = useWallet(
+    currentWalletId ? { walletId: currentWalletId } : undefined
+  );
+  const tokenConfigs = useMemo(() => getTokenConfigs(), []);
+  const { data: balanceResults, isLoading: isLoadingBalances } = useBalancesForWallet(
+    0,
+    tokenConfigs,
+    { enabled: isInitialized }
+  );
+  const balances = useMemo(
+    () => createLegacyBalances(balanceResults, tokenConfigs, isLoadingBalances),
+    [balanceResults, tokenConfigs, isLoadingBalances]
+  );
   const [subspace, setSubspace] = useState('');
   const [spaceName, setSpaceName] = useState<string>('');
   /** Avoid repeating the "select space name first" warning on every subspace keystroke. */
@@ -2477,14 +2497,14 @@ export default function SpacesScreen() {
 
       try {
         // Get Bitcoin account through WDKService
-        if (!wallet) {
+        if (!isInitialized) {
           throw new Error('Wallet not available');
         }
 
         // Get the Bitcoin address from addresses (same as settings page)
         // This is the address that should be used for transactions
         // The settings page uses accountIndex=0 via resolveWalletAddresses()
-        const bitcoinAddress = addresses?.[NetworkType.SEGWIT];
+        const bitcoinAddress = getWalletAddress(addresses, NetworkType.SEGWIT);
         if (!bitcoinAddress) {
           throw new Error('Bitcoin address not available. Please ensure wallet is initialized.');
         }
@@ -3039,7 +3059,7 @@ export default function SpacesScreen() {
             totalRequiredSats,
             shortfall: Math.round(totalRequiredSats - balanceSats),
             shortfallBTC: ((totalRequiredSats - balanceSats) / 100000000).toFixed(8),
-            fromAddress: addresses?.[NetworkType.SEGWIT],
+            fromAddress: getWalletAddress(addresses, NetworkType.SEGWIT),
             recipientAddress: purchaseData?.taproot_address,
             memo: purchaseData?.handle,
           });
@@ -3048,7 +3068,7 @@ export default function SpacesScreen() {
             errorMessage: error instanceof Error ? error.message : String(error),
             errorStack: error instanceof Error ? error.stack : undefined,
             purchaseData,
-            fromAddress: addresses?.[NetworkType.SEGWIT],
+            fromAddress: getWalletAddress(addresses, NetworkType.SEGWIT),
           });
         }
 

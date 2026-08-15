@@ -1,5 +1,5 @@
-import avatarOptions, { setAvatar } from '@/config/avatar-options';
-import { useWallet } from '@tetherto/wdk-react-native-provider';
+import avatarOptions, { setAvatar, setWalletName } from '@/config/avatar-options';
+import { useAppWalletManager } from '@/hooks/use-app-wallet-manager';
 import { useLocalSearchParams } from 'expo-router';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
 import { useKeyboard } from '@/hooks/use-keyboard';
@@ -44,8 +44,8 @@ export default function ImportNameWalletScreen() {
   const params = useLocalSearchParams<{ mnemonic?: string | string[]; seedPhrase?: string | string[] }>();
   const insets = useSafeAreaInsets();
   const keyboard = useKeyboard();
-  const { createWallet } = useWallet();
-  const [walletName, setWalletName] = useState('');
+  const { initializeFromMnemonic } = useAppWalletManager();
+  const [walletName, setWalletNameState] = useState('');
   const [selectedAvatar, setSelectedAvatar] = useState(avatarOptions[0]);
   const [isImporting, setIsImporting] = useState(false);
   const [sessionMnemonic] = useState(() => consumePendingImportMnemonic());
@@ -91,14 +91,15 @@ export default function ImportNameWalletScreen() {
     }
 
     setIsImporting(true);
-    logImportStep('createWallet starting', { walletName });
+    logImportStep('initializeFromMnemonic starting', { walletName });
 
     try {
-      await createWallet({ name: walletName, mnemonic: seedPhrase });
-      logImportStep('createWallet finished');
+      await initializeFromMnemonic(seedPhrase, 'default');
+      logImportStep('initializeFromMnemonic finished');
 
+      await setWalletName(walletName);
       await setAvatar(selectedAvatar.id);
-      logImportStep('avatar saved');
+      logImportStep('avatar and name saved');
 
       toast.success('Your wallet has been imported successfully.');
 
@@ -113,7 +114,7 @@ export default function ImportNameWalletScreen() {
       router.dismissTo('/wallet');
       logImportStep('navigation dispatched');
     } catch (error: unknown) {
-      logImportError('createWallet', error);
+      logImportError('initializeFromMnemonic', error);
       Alert.alert(
         'Import Failed',
         getErrorMessage(error, 'Failed to import wallet. Please check your seed phrase and try again.'),
@@ -157,7 +158,7 @@ export default function ImportNameWalletScreen() {
                 <TextInput
                   style={styles.input}
                   value={walletName}
-                  onChangeText={setWalletName}
+                  onChangeText={setWalletNameState}
                   placeholder="e.g., Investment Stash"
                   placeholderTextColor={colors.textTertiary}
                   autoCapitalize="words"

@@ -20,7 +20,9 @@ import { colors } from '@/constants/colors';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { toast } from 'sonner-native';
 import { ChevronDown, ChevronRight } from 'lucide-react-native';
-import { AssetTicker, NetworkType, WDKService } from '@tetherto/wdk-react-native-provider';
+import { AssetTicker } from '@/config/assets';
+import { NetworkType } from '@/config/networks';
+import { WDKService } from '@/services/wdk-service';
 import { FiatCurrency, pricingService } from '@/services/pricing-service';
 import { resolveTaprootForScriptPubKey } from '@/utils/resolve-taproot-for-script-pubkey';
 import {

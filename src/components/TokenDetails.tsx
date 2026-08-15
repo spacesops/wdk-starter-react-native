@@ -2,7 +2,8 @@ import { networkConfigs } from '@/config/networks';
 import formatAmount from '@/utils/format-amount';
 import formatTokenAmount from '@/utils/format-token-amount';
 import formatUSDValue from '@/utils/format-usd-value';
-import { AssetTicker, NetworkType } from '@tetherto/wdk-react-native-provider';
+import { AssetTicker } from '@/config/assets';
+import { NetworkType } from '@/config/networks';
 import { Send } from 'lucide-react-native';
 import React from 'react';
 import { Alert, Image, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
@@ -36,7 +37,7 @@ export function TokenDetails({ tokenData, onSendPress }: TokenDetailsProps) {
     if (onSendPress) {
       onSendPress(network);
     } else {
-      const networkName = network ? networkConfigs[network].name || network : 'any network';
+      const networkName = network ? networkConfigs[network]?.name || network : 'any network';
       Alert.alert('Send Token', `Send ${tokenData.symbol} on ${networkName}`);
     }
   };

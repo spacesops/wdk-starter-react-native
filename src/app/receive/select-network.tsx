@@ -1,13 +1,16 @@
 import Header from '@/components/header';
 import { assetConfig } from '@/config/assets';
-import { Network, networkConfigs } from '@/config/networks';
-import { NetworkType, useWallet } from '@tetherto/wdk-react-native-provider';
+import { Network, networkConfigs, NetworkType } from '@/config/networks';
+import { useWalletManager } from '@spacesops/wdk-react-native-core';
 import { useLocalSearchParams } from 'expo-router';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
 import React, { useCallback, useMemo } from 'react';
 import { FlatList, Image, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { colors } from '@/constants/colors';
+import { useEnsureWalletAddresses } from '@/hooks/use-ensure-wallet-addresses';
+import { getWalletAddress } from '@/utils/wallet-addresses';
+import { resolveCurrentWalletId } from '@/utils/resolve-current-wallet-id';
 
 interface NetworkOption extends Network {
   address?: string;
@@ -15,22 +18,22 @@ interface NetworkOption extends Network {
   description?: string;
 }
 
-// Network descriptions for receive flow
 const NETWORK_DESCRIPTIONS = {
   [NetworkType.ETHEREUM]: 'ERC20',
   [NetworkType.POLYGON]: 'Polygon Network',
   [NetworkType.ARBITRUM]: 'Arbitrum One',
   [NetworkType.TON]: 'TON Network',
-  // [NetworkType.TRON]: 'Tron Network',
-  // [NetworkType.SOLANA]: 'Solana Network',
+  [NetworkType.TRON]: 'Tron Network',
+  [NetworkType.SOLANA]: 'Solana Network',
   [NetworkType.SEGWIT]: 'Native Bitcoin Network',
   [NetworkType.LIGHTNING]: 'Lightning Network',
-};
+} as Partial<Record<NetworkType, string>>;
 
 export default function ReceiveSelectNetworkScreen() {
   const insets = useSafeAreaInsets();
   const router = useDebouncedNavigation();
-  const { addresses } = useWallet();
+  const { wallets, activeWalletId } = useWalletManager();
+  const currentWalletId = resolveCurrentWalletId(activeWalletId, wallets);
   const params = useLocalSearchParams();
 
   const { tokenId, tokenSymbol, tokenName } = params as {
@@ -39,7 +42,21 @@ export default function ReceiveSelectNetworkScreen() {
     tokenName: string;
   };
 
-  // Get available networks for the selected token
+  const preloadNetworkIds = useMemo(() => {
+    const tokenConfig = assetConfig[tokenId];
+    if (!tokenConfig) {
+      return [];
+    }
+    return tokenConfig.supportedNetworks
+      .map(networkType => networkConfigs[networkType]?.id)
+      .filter((id): id is string => Boolean(id));
+  }, [tokenId]);
+
+  const { addresses: flatAddresses } = useEnsureWalletAddresses(
+    preloadNetworkIds,
+    currentWalletId
+  );
+
   const networks: NetworkOption[] = useMemo(() => {
     const tokenConfig = assetConfig[tokenId];
     if (!tokenConfig) {
@@ -48,20 +65,23 @@ export default function ReceiveSelectNetworkScreen() {
 
     return tokenConfig.supportedNetworks.map(networkType => {
       const network = networkConfigs[networkType];
-      const address = addresses?.[network.id as NetworkType];
+      const address =
+        flatAddresses[network?.id as string] ??
+        getWalletAddress(flatAddresses, networkType) ??
+        getWalletAddress(flatAddresses, network?.id ?? '');
       return {
         ...network,
         address,
         hasAddress: Boolean(address),
-        description: NETWORK_DESCRIPTIONS[network.id as NetworkType],
-      };
+        description: NETWORK_DESCRIPTIONS[networkType],
+      } as NetworkOption;
     });
-  }, [tokenId, addresses]);
+  }, [tokenId, flatAddresses]);
 
   const handleSelectNetwork = useCallback(
     (network: NetworkOption) => {
       if (!network.hasAddress) {
-        return; // Don't allow selection if no address available
+        return;
       }
 
       router.push({

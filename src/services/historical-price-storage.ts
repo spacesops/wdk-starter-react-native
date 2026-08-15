@@ -1,5 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { AssetTicker } from '@tetherto/wdk-react-native-provider';
+import { AssetTicker } from '@/config/assets';
 
 const STORAGE_KEY_EARLIEST_DATES = 'wdk_earliest_token_dates';
 const STORAGE_KEY_HISTORICAL_PRICES = 'wdk_historical_prices';

@@ -1,5 +1,7 @@
 import { FiatCurrency } from '@/services/pricing-service';
-import { NetworkType } from '@tetherto/wdk-react-native-provider';
+import { AssetTicker, NetworkType } from './wdk-enums';
+
+export { AssetTicker } from './wdk-enums';
 
 export interface AssetConfig {
   name: string;
@@ -20,6 +22,14 @@ export interface Asset {
   color: string;
 }
 
+/** Assets enabled in the wallet UI (replaces old wallet.enabledAssets). */
+export const ENABLED_ASSET_TICKERS: AssetTicker[] = [
+  AssetTicker.BTC,
+  AssetTicker.USDT,
+  AssetTicker.XAUT,
+  AssetTicker.USAT,
+];
+
 export const assetConfig: Record<string, AssetConfig> = {
   btc: {
     name: 'Bitcoin',
@@ -39,8 +49,8 @@ export const assetConfig: Record<string, AssetConfig> = {
       NetworkType.POLYGON,
       NetworkType.ARBITRUM,
       NetworkType.TON,
-      // NetworkType.TRON,
-      // NetworkType.SOLANA,
+      NetworkType.TRON,
+      NetworkType.SOLANA,
     ],
   },
   xaut: {

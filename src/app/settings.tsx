@@ -1,23 +1,39 @@
 import Header from '@/components/header';
-import { clearAvatar } from '@/config/avatar-options';
-import { networkConfigs } from '@/config/networks';
+import { clearAvatar, clearWalletName, getWalletName } from '@/config/avatar-options';
+import { ENABLED_ASSET_TICKERS } from '@/config/assets';
+import { networkConfigs, NetworkType } from '@/config/networks';
 import useWalletAvatar from '@/hooks/use-wallet-avatar';
 import getDisplaySymbol from '@/utils/get-display-symbol';
-import { NetworkType, useWallet } from '@tetherto/wdk-react-native-provider';
+import {
+  DISPLAY_WALLET_NETWORKS,
+  useEnsureWalletAddresses,
+} from '@/hooks/use-ensure-wallet-addresses';
+import { useWalletManager } from '@spacesops/wdk-react-native-core';
 import * as Clipboard from 'expo-clipboard';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
 import { Copy, Info, Shield, Trash2, Wallet } from 'lucide-react-native';
-import React from 'react';
-import { Alert, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import React, { useEffect, useState } from 'react';
+import { ActivityIndicator, Alert, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { toast } from 'sonner-native';
 import { colors } from '@/constants/colors';
+import { resolveCurrentWalletId } from '@/utils/resolve-current-wallet-id';
 
 export default function SettingsScreen() {
   const insets = useSafeAreaInsets();
   const router = useDebouncedNavigation();
-  const { wallet, clearWallet, addresses } = useWallet();
+  const { wallets, activeWalletId, deleteWallet } = useWalletManager();
+  const currentWalletId = resolveCurrentWalletId(activeWalletId, wallets);
+  const { addresses: flatAddresses, isLoading: isLoadingAddresses } = useEnsureWalletAddresses(
+    DISPLAY_WALLET_NETWORKS,
+    currentWalletId
+  );
   const avatar = useWalletAvatar();
+  const [walletDisplayName, setWalletDisplayName] = useState('My Wallet');
+
+  useEffect(() => {
+    getWalletName().then(setWalletDisplayName);
+  }, []);
 
   const handleDeleteWallet = () => {
     Alert.alert(
@@ -33,8 +49,11 @@ export default function SettingsScreen() {
           style: 'destructive',
           onPress: async () => {
             try {
-              await clearWallet();
+              for (const wallet of wallets) {
+                await deleteWallet(wallet.identifier);
+              }
               await clearAvatar();
+              await clearWalletName();
               toast.success('Wallet deleted successfully');
               router.dismissAll('/');
             } catch (error) {
@@ -59,7 +78,7 @@ export default function SettingsScreen() {
   };
 
   const getNetworkName = (network: string) => {
-    return networkConfigs[network as NetworkType].name || network;
+    return networkConfigs[network as NetworkType]?.name || network;
   };
 
   return (
@@ -81,7 +100,7 @@ export default function SettingsScreen() {
           <View style={styles.infoCard}>
             <View style={styles.infoRow}>
               <Text style={styles.infoLabel}>Name</Text>
-              <Text style={styles.infoValue}>{wallet?.name || 'Unknown'}</Text>
+              <Text style={styles.infoValue}>{walletDisplayName}</Text>
             </View>
 
             <View style={styles.infoRow}>
@@ -92,7 +111,7 @@ export default function SettingsScreen() {
             <View style={[styles.infoRow, styles.infoRowLast]}>
               <Text style={styles.infoLabel}>Enabled Assets</Text>
               <Text style={styles.infoValue}>
-                {wallet?.enabledAssets?.map(asset => getDisplaySymbol(asset)).join(', ') || 'None'}
+                {ENABLED_ASSET_TICKERS.map(asset => getDisplaySymbol(asset)).join(', ') || 'None'}
               </Text>
             </View>
           </View>
@@ -106,24 +125,39 @@ export default function SettingsScreen() {
           </View>
 
           <View style={styles.addressCard}>
-            {addresses &&
-              Object.entries(addresses).map(([network, address], index, array) => (
-                <TouchableOpacity
-                  key={network}
-                  style={[
-                    styles.addressRow,
-                    index === array.length - 1 ? styles.addressRowLast : null,
-                  ]}
-                  onPress={() => handleCopyAddress(address as string, getNetworkName(network))}
-                  activeOpacity={0.7}
-                >
-                  <View style={styles.addressContent}>
-                    <Text style={styles.networkLabel}>{getNetworkName(network)}</Text>
-                    <Text style={styles.addressValue}>{formatAddress(address as string)}</Text>
-                  </View>
-                  <Copy size={18} color={colors.primary} />
-                </TouchableOpacity>
-              ))}
+            {isLoadingAddresses && Object.keys(flatAddresses).length === 0 ? (
+              <View style={styles.addressLoadingRow}>
+                <ActivityIndicator size="small" color={colors.primary} />
+                <Text style={styles.addressLoadingText}>Loading addresses...</Text>
+              </View>
+            ) : null}
+
+            {DISPLAY_WALLET_NETWORKS.filter(network => flatAddresses[network]).map(
+              (network, index, array) => {
+                const address = flatAddresses[network];
+                return (
+                  <TouchableOpacity
+                    key={network}
+                    style={[
+                      styles.addressRow,
+                      index === array.length - 1 ? styles.addressRowLast : null,
+                    ]}
+                    onPress={() => handleCopyAddress(address, getNetworkName(network))}
+                    activeOpacity={0.7}
+                  >
+                    <View style={styles.addressContent}>
+                      <Text style={styles.networkLabel}>{getNetworkName(network)}</Text>
+                      <Text style={styles.addressValue}>{formatAddress(address)}</Text>
+                    </View>
+                    <Copy size={18} color={colors.primary} />
+                  </TouchableOpacity>
+                );
+              }
+            )}
+
+            {!isLoadingAddresses && !DISPLAY_WALLET_NETWORKS.some(network => flatAddresses[network]) ? (
+              <Text style={styles.addressEmptyText}>No addresses available</Text>
+            ) : null}
           </View>
         </View>
 
@@ -221,11 +255,6 @@ const styles = StyleSheet.create({
     color: colors.text,
     fontWeight: '500',
   },
-  infoValueSmall: {
-    fontSize: 12,
-    color: colors.text,
-    fontWeight: '500',
-  },
   addressCard: {
     backgroundColor: colors.card,
     borderRadius: 12,
@@ -255,6 +284,23 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: colors.text,
     fontFamily: 'monospace',
+  },
+  addressLoadingRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 16,
+    gap: 10,
+  },
+  addressLoadingText: {
+    fontSize: 14,
+    color: colors.textSecondary,
+  },
+  addressEmptyText: {
+    fontSize: 14,
+    color: colors.textSecondary,
+    textAlign: 'center',
+    paddingVertical: 16,
   },
   dangerSection: {
     paddingHorizontal: 20,

@@ -51,6 +51,7 @@
     "plugins": [
       "expo-router",
       "expo-dev-client",
+      "@spacesops/react-native-bare-kit",
       [
         "expo-splash-screen",
         {

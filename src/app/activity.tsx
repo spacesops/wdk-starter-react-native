@@ -1,80 +1,43 @@
-import { AssetTicker, useWallet } from '@tetherto/wdk-react-native-provider';
+import { useWallet, useWalletManager } from '@spacesops/wdk-react-native-core';
 import { Transaction, TransactionList } from '@tetherto/wdk-uikit-react-native';
-import React, { useEffect, useState } from 'react';
-import { StyleSheet, View } from 'react-native';
+import React, { useMemo, useState } from 'react';
+import { StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { assetConfig } from '../config/assets';
-import { FiatCurrency, pricingService } from '../services/pricing-service';
-import formatTokenAmount from '@/utils/format-token-amount';
-import formatUSDValue from '@/utils/format-usd-value';
 import Header from '@/components/header';
 import { colors } from '@/constants/colors';
+import { flattenWalletAddresses } from '@/utils/wallet-addresses';
+import { resolveCurrentWalletId } from '@/utils/resolve-current-wallet-id';
 
-/** Normalize provider token to assetConfig key (e.g. "XAU", "XAU₮" -> "xaut") so config lookup works. */
-function tokenToConfigKey(token: string | undefined): string {
-  const t = (token ?? '').toString().toLowerCase();
-  if (t === 'xaut' || t === 'xau' || t.startsWith('xau')) return 'xaut';
-  if (t === 'usat' || t === 'usa' || t.startsWith('usa')) return 'usat';
-  return t || '';
-}
-
+/**
+ * Activity historically came from useWallet().transactions.
+ * @spacesops/wdk-react-native-core does not expose a transaction list yet.
+ */
 export default function ActivityScreen() {
   const insets = useSafeAreaInsets();
-  const { transactions: walletTransactions, addresses } = useWallet();
-  const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const { wallets, activeWalletId } = useWalletManager();
+  const currentWalletId = resolveCurrentWalletId(activeWalletId, wallets);
+  const { addresses } = useWallet(
+    currentWalletId ? { walletId: currentWalletId } : undefined
+  );
+  const [transactions] = useState<Transaction[]>([]);
 
-  // Transform wallet transactions to display format with fiat values
-  const getTransactionsWithFiatValues = async () => {
-    if (!walletTransactions.list) return [];
-
-    // Get the wallet's own addresses for comparison
-    const walletAddresses = addresses
-      ? Object.values(addresses).map(addr => addr.toLowerCase())
-      : [];
-
-    // Sort transactions by timestamp (newest first) and calculate fiat values
-    const result = await Promise.all(
-      walletTransactions.list
-        .sort((a, b) => b.timestamp - a.timestamp)
-        .map(async (tx, index) => {
-          const fromAddress = tx.from?.toLowerCase();
-          const isSent = walletAddresses.includes(fromAddress);
-          const amount = parseFloat(tx.amount);
-          const configKey = tokenToConfigKey(tx.token);
-          const config = assetConfig[configKey as keyof typeof assetConfig];
-          const assetTicker = (configKey || tx.token || '') as AssetTicker;
-
-          // Calculate fiat amount using pricing service
-          const fiatAmount = await pricingService.getFiatValue(
-            amount,
-            assetTicker,
-            FiatCurrency.USD
-          );
-
-          return {
-            id: `${tx.transactionHash}-${index}`,
-            type: isSent ? ('sent' as const) : ('received' as const),
-            token: config?.name || (tx.token ?? '').toString().toUpperCase(),
-            amount: `${formatTokenAmount(amount, assetTicker)}`,
-            fiatAmount: formatUSDValue(fiatAmount, false),
-            fiatCurrency: FiatCurrency.USD,
-            network: tx.blockchain,
-          };
-        })
-    );
-
-    return result;
-  };
-
-  useEffect(() => {
-    getTransactionsWithFiatValues().then(setTransactions);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [walletTransactions.list, addresses]);
+  // Keep address flattening wired so we can restore sent/received once txs return.
+  useMemo(() => flattenWalletAddresses(addresses), [addresses]);
 
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
-      <Header isLoading={walletTransactions.isLoading} title="Activity" />
-      <TransactionList transactions={transactions} />
+      <Header isLoading={false} title="Activity" />
+      {transactions.length === 0 ? (
+        <View style={styles.empty}>
+          <Text style={styles.emptyTitle}>No activity yet</Text>
+          <Text style={styles.emptySubtitle}>
+            Transaction history is not available with the current WDK core. Balances and sends still
+            work.
+          </Text>
+        </View>
+      ) : (
+        <TransactionList transactions={transactions} />
+      )}
     </View>
   );
 }
@@ -83,5 +46,23 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: colors.background,
+  },
+  empty: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 32,
+  },
+  emptyTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: colors.textSecondary,
+    marginBottom: 8,
+  },
+  emptySubtitle: {
+    fontSize: 14,
+    color: colors.textTertiary,
+    textAlign: 'center',
+    lineHeight: 20,
   },
 });

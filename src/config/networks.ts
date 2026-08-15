@@ -1,4 +1,6 @@
-import { NetworkType } from '@tetherto/wdk-react-native-provider';
+import { NetworkType } from './wdk-enums';
+
+export { NetworkType } from './wdk-enums';
 
 export interface Network {
   id: string;

@@ -2,7 +2,7 @@
 
 /**
  * Android 16 KB page size fixes for Play Store compliance:
- * - Regenerate react-native-bare-kit addon .so files (drop stale unaligned copies)
+ * - Regenerate @spacesops/react-native-bare-kit addon .so files (drop stale unaligned copies)
  * - Add ANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON to native CMake builds
  */
 
@@ -13,6 +13,8 @@ const { execFileSync } = require('child_process');
 const { projectRoot, libveritasAndroidBuildGradleRelative } = require('./libveritas-package-root');
 const CMAKE_FLAG = '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON';
 const CMAKE_PATCH_MARKER = 'spaces-wallet-16kb-page-size';
+
+const BARE_KIT_ANDROID_REL = 'node_modules/@spacesops/react-native-bare-kit/android';
 
 function patchCmakeArguments(relativeGradlePath) {
   const gradlePath = path.join(projectRoot, relativeGradlePath);
@@ -43,17 +45,12 @@ function patchCmakeArguments(relativeGradlePath) {
 }
 
 function regenerateBareKitAddons() {
-  const bareKitAndroidDir = path.join(
-    projectRoot,
-    'node_modules',
-    'react-native-bare-kit',
-    'android'
-  );
+  const bareKitAndroidDir = path.join(projectRoot, BARE_KIT_ANDROID_REL);
   const addonsDir = path.join(bareKitAndroidDir, 'src', 'main', 'addons');
-  const linkScript = path.join(bareKitAndroidDir, 'link.js');
+  const linkScript = path.join(bareKitAndroidDir, 'link.mjs');
 
   if (!fs.existsSync(linkScript)) {
-    console.log('[16kb] react-native-bare-kit not installed, skipping addon relink');
+    console.log('[16kb] @spacesops/react-native-bare-kit not installed, skipping addon relink');
     return;
   }
 
@@ -67,12 +64,12 @@ function regenerateBareKitAddons() {
     cwd: bareKitAndroidDir,
     stdio: 'inherit',
   });
-  console.log('[16kb] regenerated react-native-bare-kit Android addons');
+  console.log('[16kb] regenerated @spacesops/react-native-bare-kit Android addons');
 }
 
 function main() {
   patchCmakeArguments(libveritasAndroidBuildGradleRelative());
-  patchCmakeArguments('node_modules/react-native-bare-kit/android/build.gradle');
+  patchCmakeArguments(`${BARE_KIT_ANDROID_REL}/build.gradle`);
   regenerateBareKitAddons();
 }
 

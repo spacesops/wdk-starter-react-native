@@ -1,4 +1,4 @@
-import { AssetTicker } from '@tetherto/wdk-react-native-provider';
+import { AssetTicker } from '@/config/assets';
 import DecimalJS from 'decimal.js';
 
 /** Inlined at build time from EXPO_PUBLIC_SPACES_API_BASE_URL (must use direct process.env access). */

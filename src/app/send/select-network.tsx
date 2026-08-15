@@ -1,11 +1,16 @@
 import { Network, NetworkSelector } from '@/components/NetworkSelector';
-import { assetConfig } from '@/config/assets';
+import { assetConfig, AssetTicker } from '@/config/assets';
+import getTokenConfigs from '@/config/get-token-configs';
 import { networkConfigs } from '@/config/networks';
 import formatAmount from '@/utils/format-amount';
-import { AssetTicker, useWallet } from '@tetherto/wdk-react-native-provider';
+import {
+  useBalancesForWallet,
+  useWallet,
+  useWalletManager,
+} from '@spacesops/wdk-react-native-core';
 import { useLocalSearchParams } from 'expo-router';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { FiatCurrency, pricingService } from '@/services/pricing-service';
@@ -13,12 +18,26 @@ import getDisplaySymbol from '@/utils/get-display-symbol';
 import formatTokenAmount from '@/utils/format-token-amount';
 import Header from '@/components/header';
 import { colors } from '@/constants/colors';
+import { createLegacyBalances } from '@/utils/legacy-balances';
+import { resolveCurrentWalletId } from '@/utils/resolve-current-wallet-id';
 
 export default function SelectNetworkScreen() {
   const insets = useSafeAreaInsets();
   const router = useDebouncedNavigation();
   const params = useLocalSearchParams();
-  const { balances } = useWallet();
+  const { wallets, activeWalletId } = useWalletManager();
+  const currentWalletId = resolveCurrentWalletId(activeWalletId, wallets);
+  const { isInitialized } = useWallet(
+    currentWalletId ? { walletId: currentWalletId } : undefined
+  );
+  const tokenConfigs = useMemo(() => getTokenConfigs(), []);
+  const { data: balanceResults, isLoading } = useBalancesForWallet(0, tokenConfigs, {
+    enabled: isInitialized,
+  });
+  const balances = useMemo(
+    () => createLegacyBalances(balanceResults, tokenConfigs, isLoading),
+    [balanceResults, tokenConfigs, isLoading]
+  );
   const { tokenId, tokenSymbol, tokenName, scannedAddress } = params as {
     tokenId: string;
     tokenSymbol: string;
@@ -28,7 +47,6 @@ export default function SelectNetworkScreen() {
 
   const [networks, setNetworks] = useState<Network[]>([]);
 
-  // Calculate networks with balances and fiat values
   useEffect(() => {
     const calculateNetworks = async () => {
       const tokenConfig = assetConfig[tokenId];
@@ -48,7 +66,6 @@ export default function SelectNetworkScreen() {
 
           const balanceValue = balance ? parseFloat(balance.value) : 0;
 
-          // Calculate fiat value using pricing service
           const balanceUSD = await pricingService.getFiatValue(
             balanceValue,
             tokenId as AssetTicker,
@@ -65,7 +82,7 @@ export default function SelectNetworkScreen() {
         })
       );
 
-      setNetworks(networksWithBalances);
+      setNetworks(networksWithBalances as Network[]);
     };
 
     calculateNetworks();

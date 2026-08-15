@@ -1,22 +1,43 @@
-import { assetConfig } from '@/config/assets';
+import { assetConfig, AssetTicker } from '@/config/assets';
+import getTokenConfigs from '@/config/get-token-configs';
 import formatAmount from '@/utils/format-amount';
-import { AssetTicker, NetworkType, useWallet } from '@tetherto/wdk-react-native-provider';
+import { NetworkType, networkConfigs } from '@/config/networks';
+import {
+  useBalancesForWallet,
+  useWallet,
+  useWalletManager,
+} from '@spacesops/wdk-react-native-core';
 import { useLocalSearchParams } from 'expo-router';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { TokenDetails } from '../components/TokenDetails';
 import { FiatCurrency, pricingService } from '../services/pricing-service';
-import { networkConfigs } from '@/config/networks';
 import getDisplaySymbol from '@/utils/get-display-symbol';
 import Header from '@/components/header';
 import { colors } from '@/constants/colors';
+import { createLegacyBalances } from '@/utils/legacy-balances';
+import { flattenWalletAddresses } from '@/utils/wallet-addresses';
+import { resolveCurrentWalletId } from '@/utils/resolve-current-wallet-id';
 
 export default function TokenDetailsScreen() {
   const router = useDebouncedNavigation();
   const insets = useSafeAreaInsets();
-  const { wallet, balances, addresses } = useWallet();
+  const { wallets, activeWalletId } = useWalletManager();
+  const currentWalletId = resolveCurrentWalletId(activeWalletId, wallets);
+  const { isInitialized, addresses: nestedAddresses } = useWallet(
+    currentWalletId ? { walletId: currentWalletId } : undefined
+  );
+  const tokenConfigs = useMemo(() => getTokenConfigs(), []);
+  const { data: balanceResults, isLoading } = useBalancesForWallet(0, tokenConfigs, {
+    enabled: isInitialized,
+  });
+  const balances = useMemo(
+    () => createLegacyBalances(balanceResults, tokenConfigs, isLoading),
+    [balanceResults, tokenConfigs, isLoading]
+  );
+  const addresses = useMemo(() => flattenWalletAddresses(nestedAddresses), [nestedAddresses]);
   const params = useLocalSearchParams<{ walletId?: string; token?: string }>();
 
   const tokenSymbol = params.token?.toLowerCase() as keyof typeof assetConfig;
@@ -38,7 +59,6 @@ export default function TokenDetailsScreen() {
     priceUSD: number;
   } | null>(null);
 
-  // Calculate token balances from wallet data with async pricing
   useEffect(() => {
     const calculateTokenData = async () => {
       if (!balances.list || !tokenSymbol || !tokenConfig) {
@@ -46,16 +66,13 @@ export default function TokenDetailsScreen() {
         return;
       }
 
-      // Filter balances for this specific token
       const tokenBalances = balances.list.filter(balance => balance.denomination === tokenSymbol);
 
-      // Calculate total balance and network breakdown with fiat values
       let totalBalance = 0;
       const networkBalancesPromises = tokenBalances.map(async balance => {
         const amount = parseFloat(balance.value);
         totalBalance += amount;
 
-        // Calculate fiat value using pricing service
         const usdValue = await pricingService.getFiatValue(
           amount,
           tokenSymbol as AssetTicker,
@@ -104,14 +121,11 @@ export default function TokenDetailsScreen() {
   const handleSendToken = (network?: NetworkType) => {
     if (!tokenData || !network) return;
 
-    // Find the specific network balance
     const networkBalance = tokenData.networkBalances.find(nb => nb.network === network);
     if (!networkBalance) return;
 
-    // Capitalize network name (e.g., "polygon" -> "Polygon")
-    const networkName = networkConfigs[network].name;
+    const networkName = networkConfigs[network]?.name;
 
-    // Navigate to send details screen with all required params
     router.push({
       pathname: '/send/details',
       params: {
@@ -126,7 +140,7 @@ export default function TokenDetailsScreen() {
     });
   };
 
-  if (!params.walletId || !wallet) {
+  if (!params.walletId || !isInitialized) {
     return (
       <View style={[styles.container, { paddingTop: insets.top }]}>
         <Header isLoading={balances.isLoading} title="Token Details" />

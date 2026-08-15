@@ -1,4 +1,5 @@
-import { useWallet } from '@tetherto/wdk-react-native-provider';
+import { useAppWalletManager } from '@/hooks/use-app-wallet-manager';
+import { setWalletName } from '@/config/avatar-options';
 import { useLocalSearchParams } from 'expo-router';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
 import React, { useEffect, useState } from 'react';
@@ -10,27 +11,25 @@ export default function CompleteScreen() {
   const router = useDebouncedNavigation();
   const insets = useSafeAreaInsets();
   const params = useLocalSearchParams<{ walletName: string; mnemonic: string }>();
-  const { createWallet, isLoading } = useWallet();
+  const { initializeFromMnemonic, isInitializing } = useAppWalletManager();
   const [walletCreated, setWalletCreated] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
 
   useEffect(() => {
-    // Auto-create wallet when screen loads
     createWalletWithWDK();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const createWalletWithWDK = async () => {
-    if (walletCreated) return;
+    if (walletCreated || isLoading) return;
 
+    setIsLoading(true);
     try {
       const walletName = params.walletName || 'My Wallet';
       const mnemonic = params.mnemonic.split(',').join(' ');
 
-      // Use the wallet context to create the wallet
-      await createWallet({
-        name: walletName,
-        mnemonic,
-      });
+      await initializeFromMnemonic(mnemonic, 'default');
+      await setWalletName(walletName);
 
       setWalletCreated(true);
     } catch (error) {
@@ -40,6 +39,8 @@ export default function CompleteScreen() {
         'There was an issue creating your wallet. Please try again.',
         [{ text: 'Retry', onPress: () => createWalletWithWDK() }]
       );
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -51,7 +52,7 @@ export default function CompleteScreen() {
     router.dismissTo('/wallet');
   };
 
-  const generalLoadingStatus = !walletCreated || isLoading;
+  const generalLoadingStatus = !walletCreated || isLoading || isInitializing;
 
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>

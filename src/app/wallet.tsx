@@ -1,5 +1,10 @@
 import { BalanceLoader } from '@/components/BalanceLoader';
-import { AssetTicker, useWallet } from '@tetherto/wdk-react-native-provider';
+import {
+  useBalancesForWallet,
+  useRefreshBalance,
+  useWallet,
+  useWalletManager,
+} from '@spacesops/wdk-react-native-core';
 import { Balance } from '@tetherto/wdk-uikit-react-native';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
 import { ArrowDownLeft, ArrowUpRight, AtSign, QrCode, Settings } from 'lucide-react-native';
@@ -19,7 +24,8 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { LineChart } from 'react-native-chart-kit';
-import { AssetConfig, assetConfig } from '../config/assets';
+import { AssetConfig, assetConfig, AssetTicker } from '../config/assets';
+import getTokenConfigs from '../config/get-token-configs';
 import { FiatCurrency, pricingService } from '../services/pricing-service';
 import {
   buildBtcDailyBalanceTable,
@@ -38,6 +44,10 @@ import formatTokenAmount from '@/utils/format-token-amount';
 import formatUSDValue from '@/utils/format-usd-value';
 import useWalletAvatar from '@/hooks/use-wallet-avatar';
 import { colors } from '@/constants/colors';
+import { createLegacyBalances } from '@/utils/legacy-balances';
+import { resolveCurrentWalletId } from '@/utils/resolve-current-wallet-id';
+import { flattenWalletAddresses } from '@/utils/wallet-addresses';
+import { getWalletName } from '@/config/avatar-options';
 
 const chartWidth = Dimensions.get('window').width - 40;
 const chartHeight = 220;
@@ -66,31 +76,46 @@ type Transaction = {
 export default function WalletScreen() {
   const insets = useSafeAreaInsets();
   const router = useDebouncedNavigation();
+  const { wallets, activeWalletId } = useWalletManager();
+  const currentWalletId = resolveCurrentWalletId(activeWalletId, wallets);
+  const { isInitialized, addresses: nestedAddresses } = useWallet(
+    currentWalletId ? { walletId: currentWalletId } : undefined
+  );
+  const { mutate: refreshBalance } = useRefreshBalance();
+  const tokenConfigs = useMemo(() => getTokenConfigs(), []);
   const {
-    wallet,
-    isLoading,
-    isUnlocked,
-    refreshWalletBalance,
-    balances,
-    addresses,
-    transactions: walletTransactions,
-  } = useWallet();
+    data: balanceResults,
+    isLoading: isLoadingBalances,
+    refetch,
+  } = useBalancesForWallet(0, tokenConfigs, { enabled: isInitialized });
+  const balances = useMemo(
+    () => createLegacyBalances(balanceResults, tokenConfigs, isLoadingBalances),
+    [balanceResults, tokenConfigs, isLoadingBalances]
+  );
+  const addresses = useMemo(() => flattenWalletAddresses(nestedAddresses), [nestedAddresses]);
+  const walletTransactions = useMemo(() => ({ list: [] as any[], isLoading: false }), []);
+  const isLoading = isLoadingBalances;
   const [refreshing, setRefreshing] = useState(false);
   const [aggregatedBalances, setAggregatedBalances] = useState<AggregatedBalance>([]);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [chartData, setChartData] = useState<PriceChartData | null>(null);
   const [mounted, setMounted] = useState(false);
+  const [walletDisplayName, setWalletDisplayName] = useState('My Wallet');
   const avatar = useWalletAvatar();
   const scrollY = useRef(new Animated.Value(0)).current;
 
-  const hasWallet = !!wallet;
+  const hasWallet = isInitialized || Object.keys(addresses).length > 0;
 
-  // Redirect to authorization if wallet is not unlocked
   useEffect(() => {
-    if (hasWallet && !isUnlocked) {
+    getWalletName().then(setWalletDisplayName);
+  }, []);
+
+  // Redirect to authorization if wallet is not initialized
+  useEffect(() => {
+    if (wallets.some(w => w.exists) && !isInitialized) {
       router.replace('/authorize');
     }
-  }, [hasWallet, isUnlocked, router]);
+  }, [wallets, isInitialized, router]);
 
   // Calculate aggregated balances by denomination
   const getAggregatedBalances = async () => {
@@ -302,11 +327,12 @@ export default function WalletScreen() {
   };
 
   const handleRefresh = async () => {
-    if (!wallet) return;
+    if (!hasWallet) return;
 
     setRefreshing(true);
     try {
-      await refreshWalletBalance();
+      refreshBalance({ accountIndex: 0, type: 'wallet' });
+      await refetch();
       await loadChartData();
     } catch (error) {
       console.error('Failed to refresh wallet data:', error);
@@ -411,7 +437,7 @@ export default function WalletScreen() {
           <View style={styles.walletIcon}>
             <Text style={styles.walletIconText}>{avatar}</Text>
           </View>
-          <Text style={styles.walletName}>{wallet?.name || 'No Wallet'}</Text>
+          <Text style={styles.walletName}>{walletDisplayName}</Text>
         </View>
 
         <View style={styles.headerActions}>
@@ -494,11 +520,11 @@ export default function WalletScreen() {
                   key={asset.denomination}
                   style={styles.assetRow}
                   onPress={() => {
-                    if (wallet) {
+                    if (hasWallet) {
                       router.push({
                         pathname: '/token-details',
                         params: {
-                          walletId: wallet.id,
+                          walletId: currentWalletId,
                           token: asset.denomination.toUpperCase(),
                         },
                       });

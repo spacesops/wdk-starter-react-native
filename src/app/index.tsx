@@ -1,4 +1,4 @@
-import { useWallet } from '@tetherto/wdk-react-native-provider';
+import { useWallet, useWalletManager } from '@spacesops/wdk-react-native-core';
 import { Redirect } from 'expo-router';
 import { useEffect, useState } from 'react';
 import {
@@ -11,10 +11,16 @@ import {
 } from 'react-native';
 import { getPricingServiceHostname, pricingService } from '../services/pricing-service';
 import { colors } from '@/constants/colors';
+import { resolveCurrentWalletId } from '@/utils/resolve-current-wallet-id';
 
 export default function Index() {
-  const { wallet, isInitialized, isUnlocked } = useWallet();
+  const { wallets, activeWalletId, refreshWalletList } = useWalletManager();
+  const currentWalletId = resolveCurrentWalletId(activeWalletId, wallets);
+  const { isInitialized } = useWallet(
+    currentWalletId ? { walletId: currentWalletId } : undefined
+  );
   const [isPricingReady, setIsPricingReady] = useState(false);
+  const [isListReady, setIsListReady] = useState(false);
   const [isPricingErrorVisible, setIsPricingErrorVisible] = useState(false);
   const pricingHostname = getPricingServiceHostname();
 
@@ -33,22 +39,34 @@ export default function Index() {
     initializePricing();
   }, []);
 
-  let content: JSX.Element;
+  useEffect(() => {
+    const loadWallets = async () => {
+      try {
+        await refreshWalletList();
+      } catch (error) {
+        console.error('Failed to refresh wallet list:', error);
+      } finally {
+        setIsListReady(true);
+      }
+    };
+    loadWallets();
+  }, [refreshWalletList]);
 
-  // Show loading indicator while WDK and pricing service are being initialized
-  if (!isInitialized || !isPricingReady) {
+  let content: React.ReactElement;
+
+  if (!isListReady || !isPricingReady) {
     content = (
       <View style={styles.loadingContainer}>
         <ActivityIndicator size="large" color={colors.primary} />
       </View>
     );
-  } else if (!wallet) {
-    // Redirect based on wallet existence and unlock status
-    content = <Redirect href="/onboarding" />;
   } else {
-    // If wallet exists but is not unlocked, go to authorization
-    // If wallet is already unlocked (e.g., just created/imported), go directly to wallet
-    content = <Redirect href={isUnlocked ? '/wallet' : '/authorize'} />;
+    const walletExists = wallets.some(w => w.exists);
+    if (!walletExists) {
+      content = <Redirect href="/onboarding" />;
+    } else {
+      content = <Redirect href={isInitialized ? '/wallet' : '/authorize'} />;
+    }
   }
 
   return (

@@ -1,9 +1,7 @@
-import {
-  AssetTicker,
-  NetworkType,
-  useWallet,
-  WDKService,
-} from '@tetherto/wdk-react-native-provider';
+import { AssetTicker } from '@/config/assets';
+import { NetworkType } from '@/config/networks';
+import { useRefreshBalance } from '@spacesops/wdk-react-native-core';
+import { WDKService } from '@/services/wdk-service';
 import { CryptoAddressInput } from '@tetherto/wdk-uikit-react-native';
 import { useLocalSearchParams } from 'expo-router';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
@@ -44,7 +42,7 @@ import { toast } from 'sonner-native';
 export default function SendDetailsScreen() {
   const insets = useSafeAreaInsets();
   const router = useDebouncedNavigation();
-  const { refreshWalletBalance } = useWallet();
+  const { mutate: refreshBalance } = useRefreshBalance();
   const params = useLocalSearchParams();
   const scrollViewRef = useRef<ScrollView>(null);
   const amountSectionYPosition = useRef<number>(0);
@@ -397,7 +395,9 @@ export default function SendDetailsScreen() {
         );
       }
 
-      setTransactionResult({ txId: sendResult });
+      setTransactionResult({
+        txId: typeof sendResult === 'string' ? { fee: '0', hash: sendResult } : sendResult,
+      });
       setShowConfirmation(true);
     } catch (error) {
       console.error('Transaction failed:', error);
@@ -408,7 +408,7 @@ export default function SendDetailsScreen() {
       setTransactionResult({ error: errorMessage });
     } finally {
       setSendingTransaction(false);
-      refreshWalletBalance();
+      refreshBalance({ accountIndex: 0, type: 'wallet' });
     }
   }, [
     validateTransaction,
@@ -416,7 +416,7 @@ export default function SendDetailsScreen() {
     recipientAddress,
     networkId,
     tokenId,
-    refreshWalletBalance,
+    refreshBalance,
     inputMode,
     tokenPrice,
   ]);

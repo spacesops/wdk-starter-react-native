@@ -212,6 +212,7 @@ function patchFile(targetPath) {
 const projectRoot = path.join(__dirname, '..');
 const targets = [
   path.join(projectRoot, 'node_modules', '@wdk', 'wallet-btc', 'src', 'wallet-account-read-only-btc.js'),
+  path.join(projectRoot, 'node_modules', '@spacesops', 'wdk-wallet-btc', 'src', 'wallet-account-read-only-btc.js'),
   path.join(projectRoot, '..', 'wdk-wallet-btc', 'src', 'wallet-account-read-only-btc.js'),
 ];
 

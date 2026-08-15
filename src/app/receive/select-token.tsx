@@ -1,7 +1,6 @@
-import { assetConfig } from '@/config/assets';
+import { assetConfig, ENABLED_ASSET_TICKERS } from '@/config/assets';
 import getDisplaySymbol from '@/utils/get-display-symbol';
 import { getRecentTokens, addToRecentTokens } from '@/utils/recent-tokens';
-import { useWallet } from '@tetherto/wdk-react-native-provider';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
 import { ArrowLeft, Search, X } from 'lucide-react-native';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
@@ -30,7 +29,6 @@ interface Token {
 export default function ReceiveSelectTokenScreen() {
   const insets = useSafeAreaInsets();
   const router = useDebouncedNavigation();
-  const { wallet } = useWallet();
   const [searchQuery, setSearchQuery] = useState('');
   const [recentTokens, setRecentTokens] = useState<string[]>([]);
 
@@ -42,27 +40,20 @@ export default function ReceiveSelectTokenScreen() {
     loadRecentTokens();
   }, []);
 
-  // Create token list from enabled assets
   const tokens: Token[] = useMemo(() => {
-    if (!wallet?.enabledAssets) {
-      return [];
-    }
+    return ENABLED_ASSET_TICKERS.map(assetSymbol => {
+      const config = assetConfig[assetSymbol];
+      if (!config) return null;
 
-    return wallet.enabledAssets
-      .map(assetSymbol => {
-        const config = assetConfig[assetSymbol as keyof typeof assetConfig];
-        if (!config) return null;
-
-        return {
-          id: assetSymbol,
-          symbol: getDisplaySymbol(assetSymbol),
-          name: config.name,
-          icon: config.icon,
-          color: config.color,
-        };
-      })
-      .filter(Boolean) as Token[];
-  }, [wallet?.enabledAssets]);
+      return {
+        id: assetSymbol,
+        symbol: getDisplaySymbol(assetSymbol),
+        name: config.name,
+        icon: config.icon,
+        color: config.color,
+      };
+    }).filter(Boolean) as Token[];
+  }, []);
 
   const filteredTokens = useMemo(() => {
     if (!searchQuery) return tokens;
@@ -75,7 +66,6 @@ export default function ReceiveSelectTokenScreen() {
 
   const handleSelectToken = useCallback(
     async (token: Token) => {
-      // Save token to recent tokens
       const updatedRecent = await addToRecentTokens(token.name, 'receive');
       setRecentTokens(updatedRecent);
 

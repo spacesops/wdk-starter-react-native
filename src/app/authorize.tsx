@@ -1,4 +1,5 @@
-import { useWallet } from '@tetherto/wdk-react-native-provider';
+import { useAppWalletManager } from '@/hooks/use-app-wallet-manager';
+import { useWdkApp } from '@spacesops/wdk-react-native-core';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
 import { Shield } from 'lucide-react-native';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
@@ -12,7 +13,7 @@ import {
   loadStoredWalletAddresses,
 } from '@/utils/wallet-address-guard';
 
-/** Brief pause after WDK init before keychain biometric prompt (worklet settle). */
+/** Brief pause before biometric prompt (worklet settle). */
 const UNLOCK_READY_DELAY_MS = 450;
 
 function isBiometricUserCancel(message: string): boolean {
@@ -41,22 +42,30 @@ function isSecureStorageUnlockError(message: string): boolean {
 export default function AuthorizeScreen() {
   const insets = useSafeAreaInsets();
   const router = useDebouncedNavigation();
-  const { wallet, unlockWallet, isInitialized, isUnlocked } = useWallet();
+  const { workletState } = useWdkApp();
+  const { wallets, initializeWallet, refreshWalletList, isInitializing } = useAppWalletManager();
   const [isUnlocking, setIsUnlocking] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [listReady, setListReady] = useState(false);
   const unlockInFlightRef = useRef(false);
   const hasAutoTriggeredRef = useRef(false);
+
+  useEffect(() => {
+    refreshWalletList()
+      .catch(err => console.error('Failed to refresh wallet list:', err))
+      .finally(() => setListReady(true));
+  }, [refreshWalletList]);
 
   const handleAuthorize = useCallback(async () => {
     if (unlockInFlightRef.current) {
       return;
     }
 
-    if (!isInitialized) {
+    if (!listReady || !workletState.isReady) {
       return;
     }
 
-    if (!wallet) {
+    if (wallets.length === 0 || !wallets.some(w => w.exists)) {
       Alert.alert('Error', 'No wallet found');
       router.replace('/onboarding');
       return;
@@ -67,13 +76,17 @@ export default function AuthorizeScreen() {
     setError(null);
 
     const addressesBeforeUnlock = await loadStoredWalletAddresses();
+    const walletId = wallets.find((wallet) => wallet.exists)?.identifier;
+    if (!walletId) {
+      Alert.alert('Error', 'No wallet found');
+      router.replace('/onboarding');
+      unlockInFlightRef.current = false;
+      setIsUnlocking(false);
+      return;
+    }
 
     try {
-      const isDone = await unlockWallet();
-      if (!isDone) {
-        setError('Could not unlock wallet. Tap the screen to try again.');
-        return;
-      }
+      await initializeWallet({ walletId });
 
       const addressesAfterUnlock = await loadStoredWalletAddresses();
       const drift = findAddressDrift(addressesBeforeUnlock, addressesAfterUnlock);
@@ -112,15 +125,10 @@ export default function AuthorizeScreen() {
       unlockInFlightRef.current = false;
       setIsUnlocking(false);
     }
-  }, [isInitialized, router, unlockWallet, wallet]);
+  }, [initializeWallet, listReady, router, wallets, workletState.isReady]);
 
   useEffect(() => {
-    if (isUnlocked) {
-      router.replace('/wallet');
-      return;
-    }
-
-    if (!isInitialized || !wallet || hasAutoTriggeredRef.current) {
+    if (!listReady || !workletState.isReady || wallets.length === 0 || hasAutoTriggeredRef.current) {
       return;
     }
 
@@ -130,9 +138,9 @@ export default function AuthorizeScreen() {
     }, UNLOCK_READY_DELAY_MS);
 
     return () => clearTimeout(timer);
-  }, [handleAuthorize, isInitialized, isUnlocked, router, wallet]);
+  }, [handleAuthorize, listReady, wallets.length, workletState.isReady]);
 
-  const isPreparing = !isInitialized || !wallet;
+  const isPreparing = !listReady || !workletState.isReady || isInitializing;
   const showSpinner = isPreparing || isUnlocking;
 
   return (

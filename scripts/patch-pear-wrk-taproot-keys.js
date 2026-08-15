@@ -13,7 +13,7 @@ const projectRoot = path.join(__dirname, '..');
 const workletPath = path.join(
   projectRoot,
   'node_modules',
-  '@tetherto',
+  '@spacesops',
   'pear-wrk-wdk',
   'src',
   'wdk-worklet.js'
@@ -21,12 +21,10 @@ const workletPath = path.join(
 const providerWorkerBundlePath = path.join(
   projectRoot,
   'node_modules',
-  '@tetherto',
-  'wdk-react-native-provider',
-  'lib',
-  'module',
-  'services',
-  'wdk-service',
+  '@spacesops',
+  'pear-wrk-wdk',
+  'generated',
+  'bundle',
   'wdk-worklet.mobile.bundle.js'
 );
 
@@ -173,11 +171,15 @@ function patchWorklet (source) {
 
   const deriveStart = source.indexOf('rpc.onDeriveTaprootAddressesFromPaths');
   if (deriveStart < 0) {
-    throw new Error('deriveTaprootAddressesFromPaths handler not found in wdk-worklet.js');
+    console.warn(
+      '[patch-pear-wrk-taproot-keys] deriveTaprootAddressesFromPaths not in pear-wrk worklet; skipping worklet patch (wallet-btc method may still apply)'
+    );
+    return { source, changed: false };
   }
   const deriveEnd = source.indexOf('\nrpc.onDispose', deriveStart);
   if (deriveEnd < 0) {
-    throw new Error('Could not locate end of deriveTaprootAddressesFromPaths handler');
+    console.warn('[patch-pear-wrk-taproot-keys] Could not locate end of deriveTaprootAddressesFromPaths handler');
+    return { source, changed: false };
   }
 
   source = source.slice(0, deriveStart) + DERIVE_HANDLER_NEW + source.slice(deriveEnd);
@@ -196,6 +198,18 @@ function resolveWalletBtcAccountPaths () {
   };
 
   add(path.join(projectRoot, 'node_modules', '@wdk', 'wallet-btc', 'src', 'wallet-account-btc.js'));
+  add(path.join(projectRoot, 'node_modules', '@spacesops', 'wdk-wallet-btc', 'src', 'wallet-account-btc.js'));
+  add(path.join(
+    projectRoot,
+    'node_modules',
+    '@spacesops',
+    'pear-wrk-wdk',
+    'node_modules',
+    '@spacesops',
+    'wdk-wallet-btc',
+    'src',
+    'wallet-account-btc.js'
+  ));
   add(path.join(
     projectRoot,
     'node_modules',
@@ -209,10 +223,15 @@ function resolveWalletBtcAccountPaths () {
   ));
   add(path.join(projectRoot, '..', 'wdk-wallet-btc', 'src', 'wallet-account-btc.js'));
 
-  const pearPkgPath = path.join(projectRoot, 'node_modules', '@tetherto', 'pear-wrk-wdk', 'package.json');
-  if (fs.existsSync(pearPkgPath)) {
+  const pearPkgCandidates = [
+    path.join(projectRoot, 'node_modules', '@spacesops', 'pear-wrk-wdk', 'package.json'),
+    path.join(projectRoot, 'node_modules', '@tetherto', 'pear-wrk-wdk', 'package.json'),
+  ];
+  for (const pearPkgPath of pearPkgCandidates) {
+    if (!fs.existsSync(pearPkgPath)) continue;
     try {
-      const dep = JSON.parse(fs.readFileSync(pearPkgPath, 'utf8')).dependencies?.['@wdk/wallet-btc'];
+      const deps = JSON.parse(fs.readFileSync(pearPkgPath, 'utf8')).dependencies || {};
+      const dep = deps['@spacesops/wdk-wallet-btc'] || deps['@wdk/wallet-btc'];
       if (typeof dep === 'string' && dep.startsWith('file:')) {
         const pearWrkDir = path.dirname(pearPkgPath);
         const resolved = path.resolve(pearWrkDir, dep.replace(/^file:/, ''));
@@ -266,10 +285,9 @@ function patchWalletBtc () {
 
 function invalidateWorkerBundleIfNeeded (changed) {
   if (!changed) return;
-  if (fs.existsSync(providerWorkerBundlePath)) {
-    fs.unlinkSync(providerWorkerBundlePath);
-    console.log('Removed stale wdk-worklet.mobile.bundle.js — will regenerate on next build/postinstall');
-  }
+  // Core ships a pre-packed worklet. Do not delete it — source patches apply
+  // only if gen:bundle is run later.
+  console.log('Taproot source patched; shipped worklet bundle left intact (run npm run gen:bundle to rebuild)');
 }
 
 function main () {
