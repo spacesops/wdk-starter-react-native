@@ -25,3 +25,7 @@
 - Official docs: https://docs.wallet.tether.io
 - For any WDK question, consult the official documentation before making assumptions
 - API references, configuration guides, and usage examples are available for every module
+
+## pear-wrk-wdk worklet changes
+
+Worklet/runtime features (networks, HRPC handlers, bundled wallet modules) must ship through **`pear-wrk-wdk` repackaging** (`schema.json` → dependency pins → `gen:mobile-bundle` → publish), **not** app postinstall patches to pear. See `.cursor/rules/pear-wrk-repack.mdc`.

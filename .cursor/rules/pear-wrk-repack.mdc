@@ -1,0 +1,43 @@
+---
+description: Worklet features must ship via pear-wrk-wdk repackaging, never app-side pear patches
+globs: "{pear-wrk-wdk/**,wdk-react-native-core/**,scripts/patch-pear*.js,scripts/*wdk-bundle*,src/config/get-chains-config.ts,package.json}"
+alwaysApply: false
+---
+
+# pear-wrk-wdk: repack, do not patch
+
+Only the JS packed into `@spacesops/pear-wrk-wdk` runs on device. App `node_modules` copies of wallet packages are for types only.
+
+## When a feature belongs in the worklet
+
+Use this path (in order):
+
+1. **`pear-wrk-wdk/schema.json`** — add or extend `walletModules` / `requiredNetworks` / HRPC schema if needed.
+2. **`pear-wrk-wdk/package.json`** — add **exact** `dependencies` pins for every new wallet module and native addon the bundle links.
+3. **Regenerate** — `npm run gen:mobile-bundle` in `pear-wrk-wdk` (updates `generated/wallet-modules.js`, bundle, `pear-linked-addons.json`).
+4. **Release chain** — publish pear → bump pin in `@spacesops/wdk-react-native-core` → bump app. Local dev may use npm `overrides` to `file:../pear-wrk-wdk` until publish.
+5. **App layer only** — chain configs (`get-chains-config.ts`), token configs, UI network lists. Do **not** reimplement worklet logic in the app.
+
+## Forbidden for new worklet behavior
+
+- ❌ Postinstall scripts that edit `node_modules/@spacesops/pear-wrk-wdk` bundle or `src/rpc-handlers.js` to add handlers, networks, or wallet managers.
+- ❌ New `scripts/patch-pear-wrk-*.js` files or extending existing pear patches for features that should live in the bundle.
+- ❌ Expecting app `overrides` or hoisted wallet packages to fix runtime behavior — they never execute on device.
+
+Legacy pear patches (e.g. taproot key material) may remain until upstream/pear absorbs them; **do not add new patches** — fold the fix into pear and republish instead.
+
+## Examples
+
+```text
+# ✅ Enable TON for USDT
+schema.json → walletModules.ton
+package.json → @tetherto/wdk-wallet-ton exact pin
+gen:mobile-bundle → publish pear → bump core
+app → get-chains-config ton + get-token-configs + assets supportedNetworks
+
+# ❌ Wrong
+postinstall patch that injects ton into pear bundle or rpc-handlers
+app-only chain config without pear wallet manager (init fails: No wallet manager)
+```
+
+After pear changes, consumers need a **native rebuild** if `pear-linked-addons.json` changes.
