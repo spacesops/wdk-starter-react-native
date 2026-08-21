@@ -4,16 +4,13 @@
 			"path": "."
 		},
 		{
-			"path": "../wdk-wallet-btc"
-		},
-		{
-			"path": "../wdk-react-native-provider"
+			"path": "../wdk-react-native-core"
 		},
 		{
 			"path": "../pear-wrk-wdk"
 		},
 		{
-			"path": "../spaces-hex-tool"
+			"path": "../react-native-bare-kit"
 		}
 	],
 	"settings": {}

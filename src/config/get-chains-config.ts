@@ -68,9 +68,15 @@ const getChainsConfig = () => {
       blockchain: 'ton',
       tonApiClient: {
         url: 'https://tonapi.io',
+        ...(process.env.EXPO_PUBLIC_TONAPI_API_KEY
+          ? { apiKey: process.env.EXPO_PUBLIC_TONAPI_API_KEY }
+          : {}),
       },
       tonClient: {
         url: 'https://toncenter.com/api/v2/jsonRPC',
+        ...(process.env.EXPO_PUBLIC_TON_CENTER_API_KEY
+          ? { secretKey: process.env.EXPO_PUBLIC_TON_CENTER_API_KEY }
+          : {}),
       },
       paymasterToken: {
         address: 'EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs',
