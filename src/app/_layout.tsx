@@ -10,6 +10,7 @@ import { View } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import 'react-native-reanimated';
 import getChainsConfig from '@/config/get-chains-config';
+import getIndexerConfig from '@/config/get-indexer-config';
 import getTokenConfigs from '@/config/get-token-configs';
 import { Toaster } from 'sonner-native';
 import { colors } from '@/constants/colors';
@@ -42,6 +43,7 @@ export default function RootLayout() {
         <WdkAppProvider
           networkConfigs={getChainsConfig()}
           tokenConfigs={getTokenConfigs()}
+          indexerConfig={getIndexerConfig()}
         >
           <HistoricalPriceSync />
           <NavigationThemeProvider value={CustomDarkTheme}>

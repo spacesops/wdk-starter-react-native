@@ -6,10 +6,12 @@ import type { TokenConfigs } from '@spacesops/wdk-react-native-core';
  */
 const ALL_TOKEN_CONFIGS: TokenConfigs = {
   bitcoin: {
-    native: { address: null, symbol: 'BTC', name: 'Bitcoin', decimals: 8 },
+    indexerBlockchain: 'bitcoin',
+    native: { address: null, symbol: 'BTC', name: 'Bitcoin', decimals: 8, indexerToken: 'btc' },
     tokens: [],
   },
   ethereum: {
+    indexerBlockchain: 'ethereum',
     native: { address: null, symbol: 'ETH', name: 'Ethereum', decimals: 18 },
     tokens: [
       {
@@ -24,9 +26,16 @@ const ALL_TOKEN_CONFIGS: TokenConfigs = {
         name: 'Tether Gold',
         decimals: 6,
       },
+      {
+        address: '0x07041776f5007ACa2A54844F50503a18A72A8b68',
+        symbol: 'USAT',
+        name: 'Tether America USD',
+        decimals: 6,
+      },
     ],
   },
   polygon: {
+    indexerBlockchain: 'polygon',
     native: { address: null, symbol: 'MATIC', name: 'Polygon', decimals: 18 },
     tokens: [
       {
@@ -38,6 +47,7 @@ const ALL_TOKEN_CONFIGS: TokenConfigs = {
     ],
   },
   arbitrum: {
+    indexerBlockchain: 'arbitrum',
     native: { address: null, symbol: 'ETH', name: 'Ethereum', decimals: 18 },
     tokens: [
       {
@@ -84,5 +94,12 @@ const ALL_TOKEN_CONFIGS: TokenConfigs = {
 };
 
 const getTokenConfigs = (): TokenConfigs => ALL_TOKEN_CONFIGS;
+
+/** Networks that have WDK Indexer transaction history enabled. */
+export const INDEXER_WALLET_NETWORKS = (
+  Object.entries(ALL_TOKEN_CONFIGS) as [string, TokenConfigs[string]][]
+)
+  .filter(([, config]) => config.indexerBlockchain)
+  .map(([network]) => network);
 
 export default getTokenConfigs;

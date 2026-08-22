@@ -3,7 +3,7 @@
     "name": "SpacesWallet",
     "slug": "spaces-wallet",
     "owner": "koine",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "wdkstarterreactnative",
@@ -86,7 +86,9 @@
       ],
       "./plugins/withAndroidSubprojects.js",
       "./plugins/withAndroidGradleNode.js",
+      "./plugins/withAndroidProguardRules.js",
       "./plugins/withDisableSwiftUICoreAutolink.js",
+      "./plugins/withSwiftNioModularHeaders.js",
       "./plugins/withLibveritasIosLinkerFix.js"
     ],
     "experiments": {

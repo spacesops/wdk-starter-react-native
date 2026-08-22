@@ -66,12 +66,8 @@ const getChainsConfig = () => {
     ton: {
       chainId: 607,
       blockchain: 'ton',
-      tonApiClient: {
-        url: 'https://tonapi.io',
-        ...(process.env.EXPO_PUBLIC_TONAPI_API_KEY
-          ? { apiKey: process.env.EXPO_PUBLIC_TONAPI_API_KEY }
-          : {}),
-      },
+      // wdk-wallet-ton reads only tonClient (TON Center) for balances/transfers.
+      // tonApiClient is not wired upstream; getFeeRates() calls tonapi.io/v2 without auth.
       tonClient: {
         url: 'https://toncenter.com/api/v2/jsonRPC',
         ...(process.env.EXPO_PUBLIC_TON_CENTER_API_KEY

@@ -39,11 +39,10 @@ Status key: `open` · `blocked` · `optional` · `done`
 
 ## Core (`@spacesops/wdk-react-native-core`)
 
-### [open] Transaction history API
+### [done] Transaction history API
 
-- **App impact:** Activity screen empty; wallet recent activity / chart feed stubbed to `[]`; mock XAUT transfers disabled.
-- **Missing:** Former `resolveWalletTransactions` (or equivalent indexer-backed history) is not in core.
-- **Refs:** `src/app/activity.tsx`, `src/app/wallet.tsx` (`walletTransactions`), `src/utils/mock-xaut-transfers-patch.ts`, `src/components/HistoricalPriceSync.tsx`
+- **Shipped in core:** `TransactionService` + `useWalletTransactions` call WDK Indexer `token-transfers` when `indexerConfig` is passed to `WdkAppProvider`.
+- **App:** `get-indexer-config.ts` wires `EXPO_PUBLIC_WDK_INDEXER_*`; wallet Activity + `HistoricalPriceSync` consume the hook.
 
 ### [optional] Export shared enums
 

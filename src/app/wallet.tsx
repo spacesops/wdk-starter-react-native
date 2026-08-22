@@ -4,6 +4,7 @@ import {
   useRefreshBalance,
   useWallet,
   useWalletManager,
+  useWalletTransactions,
 } from '@spacesops/wdk-react-native-core';
 import { Balance } from '@tetherto/wdk-uikit-react-native';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
@@ -25,7 +26,8 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { LineChart } from 'react-native-chart-kit';
 import { AssetConfig, assetConfig, AssetTicker } from '../config/assets';
-import getTokenConfigs from '../config/get-token-configs';
+import getTokenConfigs, { INDEXER_WALLET_NETWORKS } from '../config/get-token-configs';
+import { useEnsureWalletAddresses } from '@/hooks/use-ensure-wallet-addresses';
 import { FiatCurrency, pricingService } from '../services/pricing-service';
 import {
   buildBtcDailyBalanceTable,
@@ -81,6 +83,7 @@ export default function WalletScreen() {
   const { isInitialized, addresses: nestedAddresses } = useWallet(
     currentWalletId ? { walletId: currentWalletId } : undefined
   );
+  useEnsureWalletAddresses(INDEXER_WALLET_NETWORKS, currentWalletId);
   const { mutate: refreshBalance } = useRefreshBalance();
   const tokenConfigs = useMemo(() => getTokenConfigs(), []);
   const {
@@ -93,7 +96,18 @@ export default function WalletScreen() {
     [balanceResults, tokenConfigs, isLoadingBalances]
   );
   const addresses = useMemo(() => flattenWalletAddresses(nestedAddresses), [nestedAddresses]);
-  const walletTransactions = useMemo(() => ({ list: [] as any[], isLoading: false }), []);
+  const {
+    data: walletTransactionList = [],
+    isLoading: isLoadingTransactions,
+    refetch: refetchTransactions,
+  } = useWalletTransactions(0, tokenConfigs, {
+    enabled: isInitialized && Boolean(currentWalletId),
+    walletId: currentWalletId,
+  });
+  const walletTransactions = useMemo(
+    () => ({ list: walletTransactionList, isLoading: isLoadingTransactions }),
+    [walletTransactionList, isLoadingTransactions]
+  );
   const isLoading = isLoadingBalances;
   const [refreshing, setRefreshing] = useState(false);
   const [aggregatedBalances, setAggregatedBalances] = useState<AggregatedBalance>([]);
@@ -332,8 +346,7 @@ export default function WalletScreen() {
     setRefreshing(true);
     try {
       refreshBalance({ accountIndex: 0, type: 'wallet' });
-      await refetch();
-      await loadChartData();
+      await Promise.all([refetch(), refetchTransactions(), loadChartData()]);
     } catch (error) {
       console.error('Failed to refresh wallet data:', error);
     } finally {

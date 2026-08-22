@@ -171,7 +171,7 @@ export default function SettingsScreen() {
           <View style={styles.infoCard}>
             <View style={styles.infoRow}>
               <Text style={styles.infoLabel}>Version</Text>
-              <Text style={styles.infoValue}>1.0.1</Text>
+              <Text style={styles.infoValue}>1.0.2</Text>
             </View>
 
             <View style={[styles.infoRow, styles.infoRowLast]}>

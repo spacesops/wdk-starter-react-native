@@ -1,11 +1,8 @@
 const { getDefaultConfig } = require('expo/metro-config');
-const fs = require('fs');
 const path = require('path');
 
 const projectRoot = __dirname;
 const appNodeModules = path.resolve(projectRoot, 'node_modules');
-const localWalletBtc = path.resolve(projectRoot, '../wdk-wallet-btc');
-const localWdkCore = path.resolve(projectRoot, '../wdk-react-native-core');
 
 /**
  * Node core-module polyfills previously provided by
@@ -70,22 +67,5 @@ config.resolver = {
     return context.resolveRequest(context, moduleName, platform);
   },
 };
-
-if (fs.existsSync(localWdkCore)) {
-  config.watchFolders = [...(config.watchFolders || []), localWdkCore];
-  config.resolver.extraNodeModules = {
-    ...config.resolver.extraNodeModules,
-    '@spacesops/wdk-react-native-core': localWdkCore,
-  };
-}
-
-if (fs.existsSync(localWalletBtc)) {
-  config.watchFolders = [...(config.watchFolders || []), localWalletBtc];
-  config.resolver.extraNodeModules = {
-    ...config.resolver.extraNodeModules,
-    '@wdk/wallet-btc': localWalletBtc,
-    '@spacesops/wdk-wallet-btc': localWalletBtc,
-  };
-}
 
 module.exports = config;

@@ -1,38 +1,122 @@
-import { useWallet, useWalletManager } from '@spacesops/wdk-react-native-core';
+import {
+  useWallet,
+  useWalletManager,
+  useWalletTransactions,
+  type WalletTransaction,
+} from '@spacesops/wdk-react-native-core';
 import { Transaction, TransactionList } from '@tetherto/wdk-uikit-react-native';
-import React, { useMemo, useState } from 'react';
+import React, { useMemo } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Header from '@/components/header';
 import { colors } from '@/constants/colors';
+import getTokenConfigs, { INDEXER_WALLET_NETWORKS } from '@/config/get-token-configs';
+import { useEnsureWalletAddresses } from '@/hooks/use-ensure-wallet-addresses';
+import { FiatCurrency, pricingService } from '@/services/pricing-service';
+import formatTokenAmount from '@/utils/format-token-amount';
+import { isSentByWalletUI } from '@/services/historical-price-storage';
 import { flattenWalletAddresses } from '@/utils/wallet-addresses';
 import { resolveCurrentWalletId } from '@/utils/resolve-current-wallet-id';
+import { AssetTicker } from '@/config/assets';
 
-/**
- * Activity historically came from useWallet().transactions.
- * @spacesops/wdk-react-native-core does not expose a transaction list yet.
- */
+function tokenToConfigKey(token: string | undefined): string {
+  const t = (token ?? '').toLowerCase();
+  if (t === 'xaut' || t === 'xau' || t.startsWith('xau')) return AssetTicker.XAUT;
+  if (t === 'usat' || t === 'usa' || t.startsWith('usa')) return AssetTicker.USAT;
+  if (t === 'usdt' || t.startsWith('usd')) return AssetTicker.USDT;
+  if (t === 'btc') return AssetTicker.BTC;
+  return t;
+}
+
+async function mapWalletTransactionToUi(
+  tx: WalletTransaction,
+  walletAddresses: string[],
+  index: number
+): Promise<Transaction> {
+  const tokenKey = tokenToConfigKey(tx.token);
+  const amount = parseFloat(tx.amount);
+  const isSent = isSentByWalletUI(tx.from, walletAddresses);
+
+  if (!pricingService.isReady()) {
+    await pricingService.initialize().catch(() => {});
+  }
+  const fiatAmount = await pricingService.getFiatValue(
+    amount,
+    tokenKey as AssetTicker,
+    FiatCurrency.USD
+  );
+
+  return {
+    id: `${tx.transactionHash}-${tx.transferIndex ?? index}`,
+    token: tokenKey.toUpperCase(),
+    amount: formatTokenAmount(amount, tokenKey as AssetTicker),
+    fiatAmount: fiatAmount.toFixed(2),
+    fiatCurrency: FiatCurrency.USD,
+    network: tx.blockchain,
+    type: isSent ? 'sent' : 'received',
+  };
+}
+
 export default function ActivityScreen() {
   const insets = useSafeAreaInsets();
   const { wallets, activeWalletId } = useWalletManager();
   const currentWalletId = resolveCurrentWalletId(activeWalletId, wallets);
-  const { addresses } = useWallet(
+  const tokenConfigs = useMemo(() => getTokenConfigs(), []);
+  const { isInitialized, addresses: nestedAddresses } = useWallet(
     currentWalletId ? { walletId: currentWalletId } : undefined
   );
-  const [transactions] = useState<Transaction[]>([]);
+  useEnsureWalletAddresses(INDEXER_WALLET_NETWORKS, currentWalletId);
+  const {
+    data: walletTransactionList = [],
+    isLoading,
+    isError,
+  } = useWalletTransactions(0, tokenConfigs, {
+    enabled: isInitialized && Boolean(currentWalletId),
+    walletId: currentWalletId,
+  });
 
-  // Keep address flattening wired so we can restore sent/received once txs return.
-  useMemo(() => flattenWalletAddresses(addresses), [addresses]);
+  const walletAddresses = useMemo(
+    () =>
+      Object.values(flattenWalletAddresses(nestedAddresses)).map((a) =>
+        a.toLowerCase()
+      ),
+    [nestedAddresses]
+  );
+
+  const [transactions, setTransactions] = React.useState<Transaction[]>([]);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      const mapped = await Promise.all(
+        walletTransactionList.map((tx, index) =>
+          mapWalletTransactionToUi(tx, walletAddresses, index)
+        )
+      );
+      if (!cancelled) {
+        setTransactions(mapped);
+      }
+    };
+    load().catch(() => {
+      if (!cancelled) setTransactions([]);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [walletTransactionList, walletAddresses]);
 
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
-      <Header isLoading={false} title="Activity" />
+      <Header isLoading={isLoading} title="Activity" />
       {transactions.length === 0 ? (
         <View style={styles.empty}>
-          <Text style={styles.emptyTitle}>No activity yet</Text>
+          <Text style={styles.emptyTitle}>
+            {isLoading ? 'Loading activity…' : 'No activity yet'}
+          </Text>
           <Text style={styles.emptySubtitle}>
-            Transaction history is not available with the current WDK core. Balances and sends still
-            work.
+            {isError
+              ? 'Could not load transaction history from the WDK Indexer.'
+              : 'Transfers appear here once indexed for your wallet addresses.'}
           </Text>
         </View>
       ) : (
