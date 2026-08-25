@@ -6,6 +6,10 @@ import {
 } from '@spacesops/wdk-react-native-core';
 import React, { useEffect, useMemo, useRef } from 'react';
 import getTokenConfigs from '@/config/get-token-configs';
+import {
+  DISPLAY_WALLET_NETWORKS,
+  useEnsureWalletAddresses,
+} from '@/hooks/use-ensure-wallet-addresses';
 import { pricingService } from '@/services/pricing-service';
 import {
   clearAllHistoricalPriceData,
@@ -28,10 +32,16 @@ export function HistoricalPriceSync() {
   const { isInitialized } = useWallet(
     currentWalletId ? { walletId: currentWalletId } : undefined
   );
+  const { addressesSettled } = useEnsureWalletAddresses(
+    DISPLAY_WALLET_NETWORKS,
+    currentWalletId
+  );
   const {
     data: balanceResults,
     isLoading: isLoadingBalances,
-  } = useBalancesForWallet(0, tokenConfigs, { enabled: isInitialized });
+  } = useBalancesForWallet(0, tokenConfigs, {
+    enabled: isInitialized && addressesSettled,
+  });
   const activityTokenConfigs = useMemo(
     () => filterTokenConfigsByNonZeroBalance(tokenConfigs, balanceResults),
     [tokenConfigs, balanceResults]

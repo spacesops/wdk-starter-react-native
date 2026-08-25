@@ -1,6 +1,10 @@
 import { Network, NetworkSelector } from '@/components/NetworkSelector';
 import { assetConfig, AssetTicker } from '@/config/assets';
 import getTokenConfigs from '@/config/get-token-configs';
+import {
+  DISPLAY_WALLET_NETWORKS,
+  useEnsureWalletAddresses,
+} from '@/hooks/use-ensure-wallet-addresses';
 import { networkConfigs } from '@/config/networks';
 import formatAmount from '@/utils/format-amount';
 import {
@@ -31,8 +35,12 @@ export default function SelectNetworkScreen() {
     currentWalletId ? { walletId: currentWalletId } : undefined
   );
   const tokenConfigs = useMemo(() => getTokenConfigs(), []);
+  const { addressesSettled } = useEnsureWalletAddresses(
+    DISPLAY_WALLET_NETWORKS,
+    currentWalletId
+  );
   const { data: balanceResults, isLoading } = useBalancesForWallet(0, tokenConfigs, {
-    enabled: isInitialized,
+    enabled: isInitialized && addressesSettled,
   });
   const balances = useMemo(
     () => createLegacyBalances(balanceResults, tokenConfigs, isLoading),

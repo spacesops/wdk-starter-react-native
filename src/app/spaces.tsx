@@ -21,6 +21,10 @@ import { resolveCurrentWalletId } from '@/utils/resolve-current-wallet-id';
 import { pricingService, FiatCurrency, getPricingServiceHostname } from '@/services/pricing-service';
 import { AssetTicker } from '@/config/assets';
 import getTokenConfigs from '@/config/get-token-configs';
+import {
+  DISPLAY_WALLET_NETWORKS,
+  useEnsureWalletAddresses,
+} from '@/hooks/use-ensure-wallet-addresses';
 import { NetworkType } from '@/config/networks';
 import { WDKService } from '@/services/wdk-service';
 import {
@@ -987,10 +991,14 @@ export default function SpacesScreen() {
     currentWalletId ? { walletId: currentWalletId } : undefined
   );
   const tokenConfigs = useMemo(() => getTokenConfigs(), []);
+  const { addressesSettled } = useEnsureWalletAddresses(
+    DISPLAY_WALLET_NETWORKS,
+    currentWalletId
+  );
   const { data: balanceResults, isLoading: isLoadingBalances } = useBalancesForWallet(
     0,
     tokenConfigs,
-    { enabled: isInitialized }
+    { enabled: isInitialized && addressesSettled }
   );
   const balances = useMemo(
     () => createLegacyBalances(balanceResults, tokenConfigs, isLoadingBalances),

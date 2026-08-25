@@ -38,7 +38,7 @@ export default function SettingsScreen() {
   const router = useDebouncedNavigation();
   const { wallets, activeWalletId, deleteWallet, getMnemonic } = useWalletManager();
   const currentWalletId = resolveCurrentWalletId(activeWalletId, wallets);
-  const { addresses: flatAddresses, isLoading: isLoadingAddresses } = useEnsureWalletAddresses(
+  const { addresses: flatAddresses, failedNetworks } = useEnsureWalletAddresses(
     DISPLAY_WALLET_NETWORKS,
     currentWalletId
   );
@@ -176,23 +176,16 @@ export default function SettingsScreen() {
           </View>
 
           <View style={styles.addressCard}>
-            {isLoadingAddresses && Object.keys(flatAddresses).length === 0 ? (
-              <View style={styles.addressLoadingRow}>
-                <ActivityIndicator size="small" color={colors.primary} />
-                <Text style={styles.addressLoadingText}>Loading addresses...</Text>
-              </View>
-            ) : null}
+            {DISPLAY_WALLET_NETWORKS.map((network, index, array) => {
+              const address = flatAddresses[network];
+              const isNetworkLoading = !address && !failedNetworks.includes(network);
+              const isLast = index === array.length - 1;
 
-            {DISPLAY_WALLET_NETWORKS.filter(network => flatAddresses[network]).map(
-              (network, index, array) => {
-                const address = flatAddresses[network];
+              if (address) {
                 return (
                   <TouchableOpacity
                     key={network}
-                    style={[
-                      styles.addressRow,
-                      index === array.length - 1 ? styles.addressRowLast : null,
-                    ]}
+                    style={[styles.addressRow, isLast ? styles.addressRowLast : null]}
                     onPress={() => handleCopyAddress(address, getNetworkName(network))}
                     activeOpacity={0.7}
                   >
@@ -204,11 +197,24 @@ export default function SettingsScreen() {
                   </TouchableOpacity>
                 );
               }
-            )}
 
-            {!isLoadingAddresses && !DISPLAY_WALLET_NETWORKS.some(network => flatAddresses[network]) ? (
-              <Text style={styles.addressEmptyText}>No addresses available</Text>
-            ) : null}
+              return (
+                <View
+                  key={network}
+                  style={[styles.addressRow, isLast ? styles.addressRowLast : null]}
+                >
+                  <View style={styles.addressContent}>
+                    <Text style={styles.networkLabel}>{getNetworkName(network)}</Text>
+                    <Text style={styles.addressValue}>
+                      {isNetworkLoading ? 'Loading address…' : 'Address unavailable'}
+                    </Text>
+                  </View>
+                  {isNetworkLoading ? (
+                    <ActivityIndicator size="small" color={colors.primary} />
+                  ) : null}
+                </View>
+              );
+            })}
           </View>
         </View>
 

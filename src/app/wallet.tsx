@@ -26,8 +26,11 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { LineChart } from 'react-native-chart-kit';
 import { AssetConfig, assetConfig, AssetTicker } from '../config/assets';
-import getTokenConfigs, { INDEXER_WALLET_NETWORKS } from '../config/get-token-configs';
-import { useEnsureWalletAddresses } from '@/hooks/use-ensure-wallet-addresses';
+import getTokenConfigs from '../config/get-token-configs';
+import {
+  DISPLAY_WALLET_NETWORKS,
+  useEnsureWalletAddresses,
+} from '@/hooks/use-ensure-wallet-addresses';
 import { FiatCurrency, pricingService } from '../services/pricing-service';
 import {
   buildBtcDailyBalanceTable,
@@ -146,14 +149,16 @@ export default function WalletScreen() {
   const { isInitialized, addresses: nestedAddresses } = useWallet(
     currentWalletId ? { walletId: currentWalletId } : undefined
   );
-  useEnsureWalletAddresses(INDEXER_WALLET_NETWORKS, currentWalletId);
+  const { addressesSettled } = useEnsureWalletAddresses(DISPLAY_WALLET_NETWORKS, currentWalletId);
   const { mutate: refreshBalance } = useRefreshBalance();
   const tokenConfigs = useMemo(() => getTokenConfigs(), []);
   const {
     data: balanceResults,
     isLoading: isLoadingBalances,
     refetch,
-  } = useBalancesForWallet(0, tokenConfigs, { enabled: isInitialized });
+  } = useBalancesForWallet(0, tokenConfigs, {
+    enabled: isInitialized && addressesSettled,
+  });
   const balances = useMemo(
     () => createLegacyBalances(balanceResults, tokenConfigs, isLoadingBalances),
     [balanceResults, tokenConfigs, isLoadingBalances]

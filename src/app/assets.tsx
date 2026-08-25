@@ -2,6 +2,10 @@ import { FiatCurrency, pricingService } from '@/services/pricing-service';
 import { AssetTicker } from '@/config/assets';
 import getTokenConfigs from '@/config/get-token-configs';
 import {
+  DISPLAY_WALLET_NETWORKS,
+  useEnsureWalletAddresses,
+} from '@/hooks/use-ensure-wallet-addresses';
+import {
   useBalancesForWallet,
   useWallet,
   useWalletManager,
@@ -28,8 +32,12 @@ export default function AssetsScreen() {
     currentWalletId ? { walletId: currentWalletId } : undefined
   );
   const tokenConfigs = useMemo(() => getTokenConfigs(), []);
+  const { addressesSettled } = useEnsureWalletAddresses(
+    DISPLAY_WALLET_NETWORKS,
+    currentWalletId
+  );
   const { data: balanceResults, isLoading } = useBalancesForWallet(0, tokenConfigs, {
-    enabled: isInitialized,
+    enabled: isInitialized && addressesSettled,
   });
   const balances = useMemo(
     () => createLegacyBalances(balanceResults, tokenConfigs, isLoading),

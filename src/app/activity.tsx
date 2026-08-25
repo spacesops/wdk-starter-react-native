@@ -11,8 +11,11 @@ import { StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Header from '@/components/header';
 import { colors } from '@/constants/colors';
-import getTokenConfigs, { INDEXER_WALLET_NETWORKS } from '@/config/get-token-configs';
-import { useEnsureWalletAddresses } from '@/hooks/use-ensure-wallet-addresses';
+import getTokenConfigs from '@/config/get-token-configs';
+import {
+  DISPLAY_WALLET_NETWORKS,
+  useEnsureWalletAddresses,
+} from '@/hooks/use-ensure-wallet-addresses';
 import { FiatCurrency, pricingService } from '@/services/pricing-service';
 import formatTokenAmount from '@/utils/format-token-amount';
 import { isSentByWalletUI } from '@/services/historical-price-storage';
@@ -67,11 +70,16 @@ export default function ActivityScreen() {
   const { isInitialized, addresses: nestedAddresses } = useWallet(
     currentWalletId ? { walletId: currentWalletId } : undefined
   );
-  useEnsureWalletAddresses(INDEXER_WALLET_NETWORKS, currentWalletId);
+  const { addressesSettled } = useEnsureWalletAddresses(
+    DISPLAY_WALLET_NETWORKS,
+    currentWalletId
+  );
   const {
     data: balanceResults,
     isLoading: isLoadingBalances,
-  } = useBalancesForWallet(0, tokenConfigs, { enabled: isInitialized });
+  } = useBalancesForWallet(0, tokenConfigs, {
+    enabled: isInitialized && addressesSettled,
+  });
   const activityTokenConfigs = useMemo(
     () => filterTokenConfigsByNonZeroBalance(tokenConfigs, balanceResults),
     [tokenConfigs, balanceResults]
