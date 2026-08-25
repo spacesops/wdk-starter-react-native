@@ -11,6 +11,9 @@
 		},
 		{
 			"path": "../react-native-bare-kit"
+		},
+		{
+			"path": "../nacho"
 		}
 	],
 	"settings": {}

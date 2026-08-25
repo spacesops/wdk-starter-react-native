@@ -245,8 +245,8 @@ export async function syncHistoricalPrices(
 
   for (const ticker of HISTORICAL_PRICE_TOKENS) {
     const tokenKey = ticker.toLowerCase();
-    const earliestMs = mergedDates[tokenKey] ?? chartStartMs;
-    const startMs = Math.max(earliestMs, chartStartMs);
+    // Chart USD bands need the full window of market prices, independent of activity.
+    const startMs = chartStartMs;
     const existing = storedPrices[tokenKey]?.data ?? [];
 
     if (startMs >= todayMidnightMs + DAY_MS) continue;
@@ -287,14 +287,99 @@ export async function syncHistoricalPrices(
   notifyHistoricalPricesUpdated();
 }
 
+/**
+ * Ensure BTC/XAU₮ USD price history covers the chart window (last 100 days).
+ * Fetches any missing ranges from the pricing service so holdings can be valued
+ * even when activity does not date acquisitions.
+ */
+export async function ensureChartUsdPrices(
+  stored: HistoricalPricesMap,
+  pricingService: PricingServiceLike
+): Promise<HistoricalPricesMap> {
+  const nowMs = Date.now();
+  const todayMidnightMs = dayMidnightMs(nowMs);
+  const chartStartMs = nowMs - CHART_DAYS_MS;
+  const updated: HistoricalPricesMap = { ...stored };
+  let changed = false;
+
+  for (const ticker of HISTORICAL_PRICE_TOKENS) {
+    const tokenKey = ticker.toLowerCase();
+    const existing = stored[tokenKey]?.data ?? [];
+    const ranges = missingDayRanges(existing, chartStartMs, todayMidnightMs);
+    if (ranges.length === 0) continue;
+
+    let merged = existing;
+    for (const range of ranges) {
+      try {
+        const newPoints = await pricingService.getHistoricalPrice({
+          from: ticker,
+          to: 'USD',
+          start: range.startMs,
+          end: range.endMs,
+        });
+        merged = mergePriceSeries(merged, newPoints);
+        changed = true;
+      } catch (err) {
+        console.warn(
+          `[HistoricalPrice] ensureChartUsdPrices failed ${ticker} ${range.startMs}-${range.endMs}:`,
+          err
+        );
+      }
+    }
+    updated[tokenKey] = { lastUpdated: nowMs, data: merged };
+  }
+
+  if (changed) {
+    await saveHistoricalPrices(updated);
+    notifyHistoricalPricesUpdated();
+  }
+  return updated;
+}
+
 
 /** Token display colors for chart lines (hex); lighter values for better contrast on dark background */
 export const TOKEN_CHART_COLORS: Record<string, string> = {
-  btc: '#FFB366',
-  xaut: '#E8C547',
-  usdt: '#4DB6AC',
-  usat: '#64B5F6',
+  btc: '#F7931A',
+  xaut: '#D4AF37',
+  usdt: '#3A6E56',
+  usat: '#3A6E56',
+  usd: '#3A6E56',
 };
+
+/** Vivid stroke colors for the indexed performance line chart on dark backgrounds. */
+export const PERFORMANCE_LINE_COLORS: Record<string, string> = {
+  btc: '#FF9200',
+  xaut: '#FFCA00',
+  usd: '#20E874',
+  usdt: '#20E874',
+  usat: '#20E874',
+};
+
+/** Legend order for the stacked holdings chart (bottom → top). */
+export const HOLDING_STACK_LEGEND: Array<{ key: string; label: string }> = [
+  { key: 'usd', label: 'USD' },
+  { key: 'xaut', label: 'XAU₮' },
+  { key: 'btc', label: 'BTC' },
+];
+
+function hexToRgba(hex: string, opacity = 1): string {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return `rgba(${r},${g},${b},${opacity})`;
+}
+
+/** Normalize indexer/provider token strings to chart balance keys. */
+export function tokenToChartKey(token: string | undefined): string {
+  const t = (token ?? '').toString().toLowerCase();
+  if (t === 'xaut' || t === 'xau' || t.startsWith('xau')) return 'xaut';
+  if (t === 'usat' || t === 'usa' || t.startsWith('usa')) return 'usat';
+  if (t === 'usdt' || t.startsWith('usd')) return 'usdt';
+  if (t === 'btc') return 'btc';
+  return t;
+}
+
+const BALANCE_TOKEN_KEYS = ['btc', 'xaut', 'usdt', 'usat'] as const;
 
 export interface ChartDataset {
   data: number[];
@@ -305,7 +390,7 @@ export interface ChartDataset {
 export interface PriceChartData {
   labels: string[];
   datasets: ChartDataset[];
-  legend: string[];
+  legend?: string[];
 }
 
 /**
@@ -343,7 +428,7 @@ export function isSentByWalletUI(
 }
 
 /**
- * Compute token balances (btc, xaut) as of endOfDayMs by replaying transactions chronologically.
+ * Compute token balances (btc, xaut, usdt, usat) as of endOfDayMs by replaying transactions chronologically.
  * Uses the same balance logic as the wallet UI: isSentByWalletUI(tx.from, walletAddresses).
  * Sent subtracts, received adds. walletAddresses must match UI (Object.values(addresses).map(addr => addr?.toLowerCase())).
  */
@@ -358,12 +443,12 @@ export function getBalanceAsOfTimestamp(
     const tb = b.timestamp < 1e12 ? b.timestamp * 1000 : b.timestamp;
     return ta - tb;
   });
-  const balance: Record<string, number> = { btc: 0, xaut: 0 };
+  const balance: Record<string, number> = { btc: 0, xaut: 0, usdt: 0, usat: 0 };
   for (const tx of sorted) {
     const tsMs = tx.timestamp < 1e12 ? tx.timestamp * 1000 : tx.timestamp;
     if (tsMs > endMs) break;
-    const tokenKey = (tx.token ?? '').toLowerCase();
-    if (tokenKey !== 'btc' && tokenKey !== 'xaut') continue;
+    const tokenKey = tokenToChartKey(tx.token);
+    if (!(BALANCE_TOKEN_KEYS as readonly string[]).includes(tokenKey)) continue;
     const amount = Number(tx.amount) || 0;
     const isSent = isSentByWalletUI(tx.from, walletAddresses);
     const current = balance[tokenKey] ?? 0;
@@ -376,117 +461,292 @@ export function getBalanceAsOfTimestamp(
   return balance;
 }
 
+/** Snapshot of wallet holdings (human units) keyed by chart token. */
+export type CurrentHoldings = Partial<Record<(typeof BALANCE_TOKEN_KEYS)[number], number>>;
+
 /**
- * Build LineChart-ready data for portfolio value (USD) over time (BTC only).
- * For each day: portfolio value = BTC price × BTC balance (as of end of that day).
- * Days with no BTC holdings (portfolio value 0) are omitted from the chart.
+ * Balance for charting: replayed transfer history plus any holdings the indexer
+ * never credited (treated as acquired before the chart window).
+ */
+function resolveChartBalance(
+  tokenKey: string,
+  replayed: number,
+  undatedGap: number
+): number {
+  return Math.max(0, replayed + undatedGap);
+}
+
+function undatedHoldingGap(
+  tokenKey: string,
+  replayedToday: Record<string, number>,
+  currentHoldings: CurrentHoldings
+): number {
+  const current = currentHoldings[tokenKey as keyof CurrentHoldings] ?? 0;
+  const replayed = replayedToday[tokenKey] ?? 0;
+  return Math.max(0, current - replayed);
+}
+
+function getPriceAt(
+  points: { tsMs: number; price: number }[],
+  tsMs: number
+): number {
+  if (points.length === 0) return 0;
+  let i = 0;
+  while (i < points.length && points[i].tsMs <= tsMs) i++;
+  if (i === 0) return points[0].price;
+  if (i >= points.length) return points[points.length - 1].price;
+  const a = points[i - 1];
+  const b = points[i];
+  const t = (tsMs - a.tsMs) / (b.tsMs - a.tsMs);
+  return a.price * (1 - t) + b.price * t;
+}
+
+function downsampleAligned<T>(items: T[], maxPoints: number): T[] {
+  if (items.length <= maxPoints) return items;
+  const step = (items.length - 1) / (maxPoints - 1);
+  const out: T[] = [];
+  for (let i = 0; i < maxPoints; i++) {
+    const idx = i === maxPoints - 1 ? items.length - 1 : Math.round(i * step);
+    out.push(items[idx]);
+  }
+  return out;
+}
+
+function makeChartDataset(
+  data: number[],
+  tokenKey: string,
+  strokeWidth = 1,
+  colors: Record<string, string> = TOKEN_CHART_COLORS,
+  /** When set, ignores chart-kit's default stroke opacity (0.2 for bezier lines). */
+  lineOpacity?: number
+): ChartDataset {
+  const hex = colors[tokenKey] ?? '#999';
+  return {
+    data,
+    color:
+      lineOpacity !== undefined
+        ? () => hexToRgba(hex, lineOpacity)
+        : (opacity = 1) => hexToRgba(hex, opacity),
+    strokeWidth,
+  };
+}
+
+/** Rebase a price series to 100 at the first positive sample (indexed performance). */
+function toIndexed100(prices: number[]): number[] {
+  const base = prices.find((p) => p > 0);
+  if (!base) return prices.map(() => 100);
+  return prices.map((p) => (p > 0 ? (p / base) * 100 : 100));
+}
+
+export type ChartStackToken = 'btc' | 'xaut' | 'usd';
+
+/** Bottom → top band order for the stacked holdings chart. */
+export const DEFAULT_CHART_STACK_ORDER: ChartStackToken[] = ['usd', 'xaut', 'btc'];
+
+/** Move one token to the bottom; other tokens keep their relative order. */
+export function moveTokenToChartStackBottom(
+  order: readonly ChartStackToken[],
+  token: ChartStackToken
+): ChartStackToken[] {
+  const rest = order.filter((t) => t !== token);
+  return [token, ...rest];
+}
+
+/** Quote unit for holdings chart denomination (same tokens as stack bands). */
+export type ChartQuoteUnit = ChartStackToken;
+
+export const DEFAULT_CHART_QUOTE_UNIT: ChartQuoteUnit = 'usd';
+
+function toQuoteUnits(
+  btcUsd: number,
+  xautUsd: number,
+  usdUsd: number,
+  btcPrice: number,
+  xautPrice: number,
+  quote: ChartQuoteUnit
+): PortfolioDayValues {
+  if (quote === 'usd') {
+    return { btc: btcUsd, xaut: xautUsd, usd: usdUsd };
+  }
+  const divisor = quote === 'btc' ? btcPrice : xautPrice;
+  if (divisor <= 0) {
+    return { btc: 0, xaut: 0, usd: 0 };
+  }
+  return {
+    btc: btcUsd / divisor,
+    xaut: xautUsd / divisor,
+    usd: usdUsd / divisor,
+  };
+}
+
+/** Spot prices for each asset expressed in the chosen quote unit (for performance indexing). */
+function toPerformancePricesInQuote(
+  btcPrice: number,
+  xautPrice: number,
+  quote: ChartQuoteUnit
+): PortfolioDayValues {
+  if (quote === 'usd') {
+    return { btc: btcPrice, xaut: xautPrice, usd: 1 };
+  }
+  if (quote === 'btc') {
+    if (btcPrice <= 0) return { btc: 1, xaut: 0, usd: 0 };
+    return { btc: 1, xaut: xautPrice / btcPrice, usd: 1 / btcPrice };
+  }
+  if (xautPrice <= 0) return { btc: 0, xaut: 1, usd: 0 };
+  return { btc: btcPrice / xautPrice, xaut: 1, usd: 1 / xautPrice };
+}
+
+type PortfolioDayValues = { btc: number; xaut: number; usd: number };
+
+function buildStackedDatasetsFromDayValues(
+  days: PortfolioDayValues[],
+  stackOrder: readonly ChartStackToken[]
+): ChartDataset[] {
+  const order = stackOrder.length === 3 ? stackOrder : DEFAULT_CHART_STACK_ORDER;
+  const cumulativeByDay = days.map((d) => {
+    let cum = 0;
+    return order.map((key) => {
+      cum += d[key];
+      return cum;
+    });
+  });
+
+  // react-native-chart-kit fills each series to the baseline; paint top → bottom (back → front).
+  const datasets: ChartDataset[] = [];
+  for (let layer = order.length - 1; layer >= 0; layer--) {
+    const tokenKey = order[layer];
+    const data = cumulativeByDay.map((cums) => cums[layer]);
+    datasets.push(makeChartDataset(data, tokenKey));
+  }
+  return datasets;
+}
+
+/**
+ * Stacked holding value over time in the chosen quote unit (USD, BTC, or XAU₮).
+ * Values are derived from USD notionals using daily BTC/XAU₮ prices as the pivot.
  */
 export function buildPortfolioValueChartData(
   stored: HistoricalPricesMap,
   transactions: TransactionForBalance[],
   walletAddresses: string[],
-  maxPoints = 80
+  maxPoints = 80,
+  currentHoldings: CurrentHoldings = {},
+  stackOrder: readonly ChartStackToken[] = DEFAULT_CHART_STACK_ORDER,
+  quoteUnit: ChartQuoteUnit = DEFAULT_CHART_QUOTE_UNIT
 ): PriceChartData | null {
-  const btcPoints = stored.btc?.data ?? [];
-  if (btcPoints.length === 0) return null;
-
   const nowMs = Date.now();
   const todayMidnightMs = Math.floor(nowMs / DAY_MS) * DAY_MS;
-  const chartStartMs = nowMs - CHART_DAYS_MS;
-  const uniqueTs = btcPoints
-    .map((p) => toMs(p.ts))
-    .filter((ts) => ts >= chartStartMs)
-    .sort((a, b) => a - b);
-  let uniqueTsDedup = Array.from(new Set(uniqueTs)).sort((a, b) => a - b);
-  const storedMinMs = uniqueTsDedup[0];
-  const storedMaxMs = uniqueTsDedup[uniqueTsDedup.length - 1];
-  console.log('[PortfolioChart] stored BTC price range:', storedMinMs != null ? new Date(storedMinMs).toISOString().slice(0, 10) : 'none', 'to', storedMaxMs != null ? new Date(storedMaxMs).toISOString().slice(0, 10) : 'none', 'today:', new Date(todayMidnightMs).toISOString().slice(0, 10));
-  if (storedMaxMs != null && storedMaxMs < todayMidnightMs) {
-    const missingDays: number[] = [];
-    for (let dayMs = storedMaxMs + DAY_MS; dayMs <= todayMidnightMs; dayMs += DAY_MS) {
-      missingDays.push(dayMs);
-    }
-    uniqueTsDedup = [...uniqueTsDedup, ...missingDays].sort((a, b) => a - b);
-    console.log('[PortfolioChart] extended timeline to today; added', missingDays.length, 'days (sync may not have fetched these yet)');
-  }
-  if (uniqueTsDedup.length === 0) return null;
+  const chartStartMs = Math.floor((nowMs - CHART_DAYS_MS) / DAY_MS) * DAY_MS;
 
-  const btcSorted = btcPoints
-    .map((p) => ({ ...p, tsMs: toMs(p.ts) }))
-    .filter((p) => p.tsMs >= chartStartMs)
-    .sort((a, b) => a.tsMs - b.tsMs);
+  const toSortedPrices = (key: string) =>
+    (stored[key]?.data ?? [])
+      .map((p) => ({ ...p, tsMs: toMs(p.ts) }))
+      .sort((a, b) => a.tsMs - b.tsMs);
 
-  const getPriceAt = (points: { tsMs: number; price: number }[], tsMs: number): number => {
-    if (points.length === 0) return 0;
-    let i = 0;
-    while (i < points.length && points[i].tsMs <= tsMs) i++;
-    if (i === 0) return points[0].price;
-    if (i >= points.length) return points[points.length - 1].price;
-    const a = points[i - 1];
-    const b = points[i];
-    const t = (tsMs - a.tsMs) / (b.tsMs - a.tsMs);
-    return a.price * (1 - t) + b.price * t;
-  };
+  const btcSorted = toSortedPrices('btc');
+  const xautSorted = toSortedPrices('xaut');
+  const endOfTodayMs = todayMidnightMs + DAY_MS - 1;
+  const replayedToday = getBalanceAsOfTimestamp(
+    transactions,
+    walletAddresses,
+    endOfTodayMs
+  );
+  const btcGap = undatedHoldingGap('btc', replayedToday, currentHoldings);
+  const xautGap = undatedHoldingGap('xaut', replayedToday, currentHoldings);
+  const usdtGap = undatedHoldingGap('usdt', replayedToday, currentHoldings);
+  const usatGap = undatedHoldingGap('usat', replayedToday, currentHoldings);
 
-  const labels: string[] = [];
-  const portfolioValues: number[] = [];
-  let lastDrawnMs = 0;
-  for (const tsMs of uniqueTsDedup) {
-    const endOfDayMs = Math.floor(tsMs / DAY_MS) * DAY_MS + DAY_MS - 1;
-    const bal = getBalanceAsOfTimestamp(transactions, walletAddresses, endOfDayMs);
-    const btcBalance = bal.btc ?? 0;
-    if (btcBalance <= 0) continue;
-    const btcPrice = getPriceAt(btcSorted, tsMs);
-    const value = btcPrice * btcBalance;
-    if (value <= 0) continue;
-    const d = new Date(tsMs);
-    const dateStr = `${d.getMonth() + 1}/${d.getDate()}`;
-    labels.push(dateStr);
-    portfolioValues.push(value);
-    lastDrawnMs = tsMs;
-    console.log('[PortfolioChart]', dateStr, 'BTC balance:', btcBalance, 'BTC price:', btcPrice, 'portfolio USD:', value);
+  type DayPoint = PortfolioDayValues & { tsMs: number; total: number };
+  const days: DayPoint[] = [];
+  for (let dayMs = chartStartMs; dayMs <= todayMidnightMs; dayMs += DAY_MS) {
+    const endOfDayMs = dayMs + DAY_MS - 1;
+    const replayed = getBalanceAsOfTimestamp(transactions, walletAddresses, endOfDayMs);
+    const btcBal = resolveChartBalance('btc', replayed.btc ?? 0, btcGap);
+    const xautBal = resolveChartBalance('xaut', replayed.xaut ?? 0, xautGap);
+    const usdtBal = resolveChartBalance('usdt', replayed.usdt ?? 0, usdtGap);
+    const usatBal = resolveChartBalance('usat', replayed.usat ?? 0, usatGap);
+    const btcPrice = getPriceAt(btcSorted, dayMs);
+    const xautPrice = getPriceAt(xautSorted, dayMs);
+    const btcUsd = Math.max(0, btcBal * btcPrice);
+    const xautUsd = Math.max(0, xautBal * xautPrice);
+    const usdUsd = Math.max(0, usdtBal + usatBal);
+    const quoted = toQuoteUnits(btcUsd, xautUsd, usdUsd, btcPrice, xautPrice, quoteUnit);
+    const total = quoted.btc + quoted.xaut + quoted.usd;
+    days.push({ tsMs: dayMs, ...quoted, total });
   }
 
-  if (portfolioValues.length === 0) return null;
-  const skippedAfterLast = uniqueTsDedup.filter((ts) => ts > lastDrawnMs).length;
-  console.log('[PortfolioChart] chart points:', labels.length, 'amounts (USD):', portfolioValues);
-  console.log('[PortfolioChart] last drawn date:', lastDrawnMs ? new Date(lastDrawnMs).toISOString().slice(0, 10) : 'none', skippedAfterLast > 0 ? `(${skippedAfterLast} days after that skipped: no BTC balance)` : '');
-
-  let sortedLabels: string[];
-  let sortedValues: number[];
-  if (portfolioValues.length <= maxPoints) {
-    sortedLabels = labels;
-    sortedValues = portfolioValues;
-  } else {
-    const step = (portfolioValues.length - 1) / (maxPoints - 1);
-    sortedLabels = [];
-    sortedValues = [];
-    for (let i = 0; i < maxPoints; i++) {
-      const idx = i === maxPoints - 1 ? portfolioValues.length - 1 : Math.round(i * step);
-      sortedLabels.push(labels[idx]);
-      sortedValues.push(portfolioValues[idx]);
-    }
+  const firstIdx = days.findIndex((d) => d.total > 0);
+  if (firstIdx < 0) return null;
+  let used = downsampleAligned(days.slice(firstIdx), maxPoints);
+  if (used.length === 1) {
+    used = [used[0], { ...used[0], tsMs: used[0].tsMs + DAY_MS }];
   }
 
-  if (sortedValues.length === 1) {
-    sortedLabels.push(sortedLabels[0]);
-    sortedValues.push(sortedValues[0]);
-  }
+  const labels = used.map((d) => {
+    const date = new Date(d.tsMs);
+    return `${date.getMonth() + 1}/${date.getDate()}`;
+  });
 
-  const hex = TOKEN_CHART_COLORS.btc ?? '#999';
-  const r = parseInt(hex.slice(1, 3), 16);
-  const g = parseInt(hex.slice(3, 5), 16);
-  const b = parseInt(hex.slice(5, 7), 16);
+  console.log('[PortfolioChart] stacked holdings:', used.length, 'points, quote:', quoteUnit);
+
   return {
-    labels: sortedLabels,
+    labels,
+    datasets: buildStackedDatasetsFromDayValues(used, stackOrder),
+  };
+}
+
+/**
+ * Indexed price performance (rebased to 100) for BTC, XAU₮, and USD over the same 100-day
+ * window, with all series expressed in the chosen quote unit.
+ */
+export function buildIndexedPerformanceChartData(
+  stored: HistoricalPricesMap,
+  maxPoints = 80,
+  quoteUnit: ChartQuoteUnit = DEFAULT_CHART_QUOTE_UNIT
+): PriceChartData | null {
+  const nowMs = Date.now();
+  const todayMidnightMs = Math.floor(nowMs / DAY_MS) * DAY_MS;
+  const chartStartMs = Math.floor((nowMs - CHART_DAYS_MS) / DAY_MS) * DAY_MS;
+
+  const toSortedPrices = (key: string) =>
+    (stored[key]?.data ?? [])
+      .map((p) => ({ ...p, tsMs: toMs(p.ts) }))
+      .sort((a, b) => a.tsMs - b.tsMs);
+
+  const btcSorted = toSortedPrices('btc');
+  const xautSorted = toSortedPrices('xaut');
+  if (btcSorted.length === 0 && xautSorted.length === 0) return null;
+
+  type DayPoint = { tsMs: number; btc: number; xaut: number; usd: number };
+  const days: DayPoint[] = [];
+  for (let dayMs = chartStartMs; dayMs <= todayMidnightMs; dayMs += DAY_MS) {
+    const btcPrice = getPriceAt(btcSorted, dayMs);
+    const xautPrice = getPriceAt(xautSorted, dayMs);
+    const quoted = toPerformancePricesInQuote(btcPrice, xautPrice, quoteUnit);
+    days.push({ tsMs: dayMs, ...quoted });
+  }
+
+  let used = downsampleAligned(days, maxPoints);
+  if (used.length === 1) {
+    used = [used[0], { ...used[0], tsMs: used[0].tsMs + DAY_MS }];
+  }
+
+  const labels = used.map((d) => {
+    const date = new Date(d.tsMs);
+    return `${date.getMonth() + 1}/${date.getDate()}`;
+  });
+
+  const btcIndexed = toIndexed100(used.map((d) => d.btc));
+  const xautIndexed = toIndexed100(used.map((d) => d.xaut));
+  const usdIndexed = toIndexed100(used.map((d) => d.usd));
+
+  return {
+    labels,
     datasets: [
-      {
-        data: sortedValues,
-        color: (opacity = 1) => `rgba(${r},${g},${b},${opacity})`,
-        strokeWidth: 2,
-      },
+      makeChartDataset(btcIndexed, 'btc', 3, PERFORMANCE_LINE_COLORS, 0.5),
+      makeChartDataset(xautIndexed, 'xaut', 3, PERFORMANCE_LINE_COLORS, 0.5),
+      makeChartDataset(usdIndexed, 'usd', 3, PERFORMANCE_LINE_COLORS, 0.5),
     ],
-    legend: ['Portfolio (USD)'],
   };
 }
 
