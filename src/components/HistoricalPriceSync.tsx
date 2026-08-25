@@ -1,4 +1,5 @@
 import {
+  useBalancesForWallet,
   useWallet,
   useWalletManager,
   useWalletTransactions,
@@ -11,6 +12,7 @@ import {
   syncHistoricalPrices,
 } from '@/services/historical-price-storage';
 import { resolveCurrentWalletId } from '@/utils/resolve-current-wallet-id';
+import { filterTokenConfigsByNonZeroBalance } from '@/utils/filter-token-configs-by-balance';
 
 const shouldClearPrices =
   typeof process !== 'undefined' && process.env.EXPO_PUBLIC_CLEAR_PRICES === 'true';
@@ -26,8 +28,21 @@ export function HistoricalPriceSync() {
   const { isInitialized } = useWallet(
     currentWalletId ? { walletId: currentWalletId } : undefined
   );
-  const { data: walletTransactionList = [] } = useWalletTransactions(0, tokenConfigs, {
-    enabled: isInitialized && Boolean(currentWalletId),
+  const {
+    data: balanceResults,
+    isLoading: isLoadingBalances,
+  } = useBalancesForWallet(0, tokenConfigs, { enabled: isInitialized });
+  const activityTokenConfigs = useMemo(
+    () => filterTokenConfigsByNonZeroBalance(tokenConfigs, balanceResults),
+    [tokenConfigs, balanceResults]
+  );
+  const balancesReady = !isLoadingBalances && Boolean(balanceResults);
+  const { data: walletTransactionList = [] } = useWalletTransactions(0, activityTokenConfigs, {
+    enabled:
+      isInitialized &&
+      Boolean(currentWalletId) &&
+      balancesReady &&
+      Object.keys(activityTokenConfigs).length > 0,
     walletId: currentWalletId,
   });
   const lastSyncKeyRef = useRef<string>('');

@@ -18,6 +18,10 @@ export default function OnBoardingScreen() {
     router.push('/wallet-setup/import-wallet');
   };
 
+  const handleRestoreKeystore = () => {
+    router.push('/wallet-setup/import-keystore');
+  };
+
   useEffect(() => {
     SplashScreen.hideAsync();
   }, []);
@@ -41,6 +45,13 @@ export default function OnBoardingScreen() {
             iconName: 'download',
             variant: 'tinted',
             onPress: handleImportWallet,
+          },
+          {
+            id: 3,
+            title: 'Restore Keystore',
+            iconName: 'file-key',
+            variant: 'tinted',
+            onPress: handleRestoreKeystore,
           },
         ]}
       />

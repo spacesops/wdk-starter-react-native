@@ -15,6 +15,8 @@ export default function WalletSetupLayout() {
       <Stack.Screen name="confirm-phrase" />
       <Stack.Screen name="import-wallet" />
       <Stack.Screen name="import-name-wallet" />
+      <Stack.Screen name="import-keystore" />
+      <Stack.Screen name="import-keystore-confirm" />
       <Stack.Screen name="complete" options={{ animation: 'fade' }} />
     </Stack>
   );

@@ -1,4 +1,4 @@
-import { Download, Wallet } from 'lucide-react-native';
+import { Download, FileKey, Wallet } from 'lucide-react-native';
 import React from 'react';
 import { Image, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { colors } from '@/constants/colors';
@@ -52,6 +52,12 @@ export const OnBoardingWelcome: React.FC<Props> = ({ title, subtitle, actionButt
                 )}
                 {button.iconName === 'download' && (
                   <Download
+                    size={20}
+                    color={button.variant === 'filled' ? colors.black : colors.primary}
+                  />
+                )}
+                {button.iconName === 'file-key' && (
+                  <FileKey
                     size={20}
                     color={button.variant === 'filled' ? colors.black : colors.primary}
                   />

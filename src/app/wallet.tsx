@@ -58,6 +58,10 @@ import formatUSDValue from '@/utils/format-usd-value';
 import useWalletAvatar from '@/hooks/use-wallet-avatar';
 import { colors } from '@/constants/colors';
 import { createLegacyBalances } from '@/utils/legacy-balances';
+import {
+  filterTokenConfigsByNonZeroBalance,
+  tokenConfigsFingerprint,
+} from '@/utils/filter-token-configs-by-balance';
 import { resolveCurrentWalletId } from '@/utils/resolve-current-wallet-id';
 import { flattenWalletAddresses } from '@/utils/wallet-addresses';
 import { getWalletName } from '@/config/avatar-options';
@@ -69,7 +73,9 @@ const chartInnerPadding = 6;
 const chartLineWidth =
   Dimensions.get('window').width - chartSectionHorizontalPadding * 2 - chartInnerPadding * 2;
 /** Left inset inside the SVG for y-axis labels (chart-kit's paddingRight). */
-const chartYAxisPadding =24;
+const chartYAxisPadding = 52;
+/** Top inset so the highest y-axis label isn't clipped (SVG text baseline sits at paddingTop). */
+const chartLabelPaddingTop = 20;
 /** Space below the plot area inside react-native-chart-kit's SVG for x-axis date labels. */
 const chartLabelPaddingBottom = 2;
 
@@ -83,16 +89,18 @@ function buildChartXAxisConfig(labelCount: number) {
   if (labelCount <= 1) {
     return { yAxisInterval: 1, hidePointsAtIndex: [] as number[] };
   }
-  const step = Math.max(1, Math.floor(labelCount / 7));
+  // Aim for ~4 labels across the 100-day window so date text doesn't overlap.
+  const step = Math.max(1, Math.floor(labelCount / 11));
   const edgeInset = Math.max(1, Math.ceil(step / 3));
   const start = Math.min(edgeInset, labelCount - 2);
+  // Stop before the final point so the current-date (rightmost) label is never shown.
   const end = Math.max(labelCount - 1 - edgeInset, start);
   const show = new Set<number>();
-  for (let i = start; i <= end; i += step) {
+  for (let i = start; i < end; i += step) {
     show.add(i);
   }
   show.add(start);
-  show.add(end);
+  show.delete(labelCount - 1);
   const hidePointsAtIndex = Array.from({ length: labelCount }, (_, i) => i).filter(
     (i) => !show.has(i)
   );
@@ -151,12 +159,25 @@ export default function WalletScreen() {
     [balanceResults, tokenConfigs, isLoadingBalances]
   );
   const addresses = useMemo(() => flattenWalletAddresses(nestedAddresses), [nestedAddresses]);
+  const activityTokenConfigs = useMemo(
+    () => filterTokenConfigsByNonZeroBalance(tokenConfigs, balanceResults),
+    [tokenConfigs, balanceResults]
+  );
+  const activityTokensKey = useMemo(
+    () => tokenConfigsFingerprint(activityTokenConfigs),
+    [activityTokenConfigs]
+  );
+  const balancesReady = !isLoadingBalances && Boolean(balanceResults);
   const {
     data: walletTransactionList = [],
     isLoading: isLoadingTransactions,
     refetch: refetchTransactions,
-  } = useWalletTransactions(0, tokenConfigs, {
-    enabled: isInitialized && Boolean(currentWalletId),
+  } = useWalletTransactions(0, activityTokenConfigs, {
+    enabled:
+      isInitialized &&
+      Boolean(currentWalletId) &&
+      balancesReady &&
+      Object.keys(activityTokenConfigs).length > 0,
     walletId: currentWalletId,
   });
   const walletTransactions = useMemo(
@@ -400,6 +421,12 @@ export default function WalletScreen() {
     getAggregatedBalances().then(setAggregatedBalances);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [balances]);
+
+  // Refetch activity when the non-zero-balance token set changes (npm core may omit tokensKey).
+  useEffect(() => {
+    if (!balancesReady || Object.keys(activityTokenConfigs).length === 0) return;
+    refetchTransactions();
+  }, [activityTokensKey, balancesReady, activityTokenConfigs, refetchTransactions]);
 
   useEffect(() => {
     getTransactions().then(setTransactions);
@@ -997,7 +1024,7 @@ const styles = StyleSheet.create({
   chart: {
     marginVertical: 0,
     borderRadius: 12,
-    paddingTop: 4,
+    paddingTop: chartLabelPaddingTop,
     paddingBottom: chartLabelPaddingBottom,
     paddingRight: chartYAxisPadding,
   },

@@ -11,10 +11,9 @@
 		},
 		{
 			"path": "../react-native-bare-kit"
-		},
-		{
-			"path": "../nacho"
 		}
 	],
-	"settings": {}
+	"settings": {
+		"java.configuration.updateBuildConfiguration": "disabled"
+	}
 }

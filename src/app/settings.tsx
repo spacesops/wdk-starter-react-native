@@ -11,18 +11,32 @@ import {
 import { useWalletManager } from '@spacesops/wdk-react-native-core';
 import * as Clipboard from 'expo-clipboard';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
-import { Copy, Info, Shield, Trash2, Wallet } from 'lucide-react-native';
+import { Copy, Download, Info, Shield, Trash2, Wallet } from 'lucide-react-native';
 import React, { useEffect, useState } from 'react';
-import { ActivityIndicator, Alert, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import {
+  ActivityIndicator,
+  Alert,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { toast } from 'sonner-native';
 import { colors } from '@/constants/colors';
 import { resolveCurrentWalletId } from '@/utils/resolve-current-wallet-id';
+import {
+  buildKeystoreBackup,
+  keystoreBackupFileName,
+} from '@/services/keystore-backup';
+import { saveKeystoreJson } from '@/services/keystore-file';
+import getErrorMessage from '@/utils/get-error-message';
 
 export default function SettingsScreen() {
   const insets = useSafeAreaInsets();
   const router = useDebouncedNavigation();
-  const { wallets, activeWalletId, deleteWallet } = useWalletManager();
+  const { wallets, activeWalletId, deleteWallet, getMnemonic } = useWalletManager();
   const currentWalletId = resolveCurrentWalletId(activeWalletId, wallets);
   const { addresses: flatAddresses, isLoading: isLoadingAddresses } = useEnsureWalletAddresses(
     DISPLAY_WALLET_NETWORKS,
@@ -30,15 +44,52 @@ export default function SettingsScreen() {
   );
   const avatar = useWalletAvatar();
   const [walletDisplayName, setWalletDisplayName] = useState('My Wallet');
+  const [isBackingUp, setIsBackingUp] = useState(false);
 
   useEffect(() => {
     getWalletName().then(setWalletDisplayName);
   }, []);
 
+  const runKeystoreBackup = async () => {
+    setIsBackingUp(true);
+    try {
+      const mnemonic = await getMnemonic(currentWalletId ?? undefined);
+      if (!mnemonic) {
+        toast.error('Could not unlock recovery phrase');
+        return;
+      }
+      const backup = await buildKeystoreBackup(mnemonic);
+      await saveKeystoreJson(keystoreBackupFileName(), backup);
+      toast.success('Keystore backup ready to save');
+    } catch (error) {
+      console.error('Failed to backup keystore:', error);
+      toast.error(getErrorMessage(error, 'Failed to backup keystore'));
+    } finally {
+      setIsBackingUp(false);
+    }
+  };
+
+  const handleBackupKeystore = () => {
+    Alert.alert(
+      'Backup Keystore',
+      'This creates an unencrypted JSON file that includes your recovery phrase and wallet data. Anyone with this file can control your funds. Only share it with yourself on a trusted device.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Continue',
+          style: 'destructive',
+          onPress: () => {
+            void runKeystoreBackup();
+          },
+        },
+      ]
+    );
+  };
+
   const handleDeleteWallet = () => {
     Alert.alert(
       'Delete Wallet',
-      'This will permanently delete your wallet and all associated data. Make sure you have backed up your recovery phrase. This action cannot be undone.',
+      'This will permanently delete your wallet and all associated data. Use Backup Keystore before deleting. This action cannot be undone.',
       [
         {
           text: 'Cancel',
@@ -161,6 +212,35 @@ export default function SettingsScreen() {
           </View>
         </View>
 
+        {/* Security / Backup */}
+        <View style={styles.section}>
+          <View style={styles.sectionHeader}>
+            <Download size={20} color={colors.primary} />
+            <Text style={styles.sectionTitle}>Security</Text>
+          </View>
+
+          <TouchableOpacity
+            style={[styles.backupButton, isBackingUp && styles.backupButtonDisabled]}
+            onPress={handleBackupKeystore}
+            disabled={isBackingUp}
+            activeOpacity={0.7}
+          >
+            {isBackingUp ? (
+              <ActivityIndicator size="small" color={colors.black} />
+            ) : (
+              <Download size={20} color={colors.black} />
+            )}
+            <Text style={styles.backupButtonText}>
+              {isBackingUp ? 'Preparing backup…' : 'Backup Keystore'}
+            </Text>
+          </TouchableOpacity>
+
+          <Text style={styles.backupWarningText}>
+            Exports an unencrypted JSON file with your recovery phrase and Spaces metadata. Protect
+            this file like cash.
+          </Text>
+        </View>
+
         {/* About Section */}
         <View style={styles.section}>
           <View style={styles.sectionHeader}>
@@ -194,8 +274,8 @@ export default function SettingsScreen() {
           </TouchableOpacity>
 
           <Text style={styles.warningText}>
-            Deleting your wallet will remove all data from this device. Make sure you have backed up
-            your recovery phrase before proceeding.
+            Deleting your wallet will remove all data from this device. Use Backup Keystore before
+            proceeding.
           </Text>
         </View>
       </ScrollView>
@@ -301,6 +381,29 @@ const styles = StyleSheet.create({
     color: colors.textSecondary,
     textAlign: 'center',
     paddingVertical: 16,
+  },
+  backupButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.primary,
+    borderRadius: 12,
+    paddingVertical: 16,
+    marginBottom: 12,
+    gap: 8,
+  },
+  backupButtonDisabled: {
+    opacity: 0.7,
+  },
+  backupButtonText: {
+    color: colors.black,
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  backupWarningText: {
+    fontSize: 12,
+    color: colors.textSecondary,
+    lineHeight: 18,
   },
   dangerSection: {
     paddingHorizontal: 20,

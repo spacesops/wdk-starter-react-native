@@ -2,6 +2,7 @@ import {
   useWallet,
   useWalletManager,
   useWalletTransactions,
+  useBalancesForWallet,
   type WalletTransaction,
 } from '@spacesops/wdk-react-native-core';
 import { Transaction, TransactionList } from '@tetherto/wdk-uikit-react-native';
@@ -17,6 +18,7 @@ import formatTokenAmount from '@/utils/format-token-amount';
 import { isSentByWalletUI } from '@/services/historical-price-storage';
 import { flattenWalletAddresses } from '@/utils/wallet-addresses';
 import { resolveCurrentWalletId } from '@/utils/resolve-current-wallet-id';
+import { filterTokenConfigsByNonZeroBalance } from '@/utils/filter-token-configs-by-balance';
 import { AssetTicker } from '@/config/assets';
 
 function tokenToConfigKey(token: string | undefined): string {
@@ -67,11 +69,24 @@ export default function ActivityScreen() {
   );
   useEnsureWalletAddresses(INDEXER_WALLET_NETWORKS, currentWalletId);
   const {
+    data: balanceResults,
+    isLoading: isLoadingBalances,
+  } = useBalancesForWallet(0, tokenConfigs, { enabled: isInitialized });
+  const activityTokenConfigs = useMemo(
+    () => filterTokenConfigsByNonZeroBalance(tokenConfigs, balanceResults),
+    [tokenConfigs, balanceResults]
+  );
+  const balancesReady = !isLoadingBalances && Boolean(balanceResults);
+  const {
     data: walletTransactionList = [],
     isLoading,
     isError,
-  } = useWalletTransactions(0, tokenConfigs, {
-    enabled: isInitialized && Boolean(currentWalletId),
+  } = useWalletTransactions(0, activityTokenConfigs, {
+    enabled:
+      isInitialized &&
+      Boolean(currentWalletId) &&
+      balancesReady &&
+      Object.keys(activityTokenConfigs).length > 0,
     walletId: currentWalletId,
   });
 
@@ -84,6 +99,7 @@ export default function ActivityScreen() {
   );
 
   const [transactions, setTransactions] = React.useState<Transaction[]>([]);
+  const showLoading = isLoadingBalances || isLoading;
 
   React.useEffect(() => {
     let cancelled = false;
@@ -107,11 +123,11 @@ export default function ActivityScreen() {
 
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
-      <Header isLoading={isLoading} title="Activity" />
+      <Header isLoading={showLoading} title="Activity" />
       {transactions.length === 0 ? (
         <View style={styles.empty}>
           <Text style={styles.emptyTitle}>
-            {isLoading ? 'Loading activity…' : 'No activity yet'}
+            {showLoading ? 'Loading activity…' : 'No activity yet'}
           </Text>
           <Text style={styles.emptySubtitle}>
             {isError
