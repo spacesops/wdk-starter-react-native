@@ -1755,10 +1755,18 @@ export default function SpacesScreen() {
             const fd = findData as Record<string, unknown>;
             if (fd.success === false) {
               console.log('[Spaces] Find Spaces — find-handles success:false, skipping My Spaces merge');
+              toast.info('No subspaces found');
             } else {
               const parsed = parseFindHandlesResponse(findData);
               console.log('[Spaces] Find Spaces — parsed handles:', JSON.stringify(parsed));
-              if (parsed.length > 0) {
+              if (parsed.length === 0) {
+                toast.info('No subspaces found');
+              } else {
+                toast.success(
+                  parsed.length === 1
+                    ? 'Found 1 subspace'
+                    : `Found ${parsed.length} subspaces`
+                );
                 setMySpaces((prev) => {
                   const seen = new Set(prev.map((s) => mySpacesRowKey(s.subspace, s.spaceName)));
                   const toAdd = parsed.filter((p) => !seen.has(mySpacesRowKey(p.subspace, p.spaceName)));
@@ -3794,7 +3802,7 @@ export default function SpacesScreen() {
 
     loadBtcPrice();
 
-    // Refresh BTC price every 30 seconds
+    // Refresh BTC price every 10 minutes
     const interval = setInterval(async () => {
       try {
         if (pricingService.isReady()) {
@@ -3807,7 +3815,7 @@ export default function SpacesScreen() {
       } catch {
         showPricingUnavailableToast();
       }
-    }, 30000); // 30 seconds
+    }, 600_000); // 10 minutes
 
     return () => clearInterval(interval);
   }, []);

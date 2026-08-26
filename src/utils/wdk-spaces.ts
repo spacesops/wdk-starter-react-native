@@ -38,8 +38,8 @@ function hasKeyMaterial(entry: DerivedTaprootAddressEntry | undefined): boolean 
 }
 
 /**
- * Derive Taproot addresses / scriptPubKeys / optional key material for BIP-relative paths
- * via worklet `callMethodByPath` → `getAccountByPath`.
+ * Derive Taproot addresses / scriptPubKeys / optional key material for BIP-relative paths.
+ * Prefers the worklet batch HRPC; falls back to per-path callMethodByPath.
  */
 async function deriveTaprootAddressesFromPaths(
   relativePaths: string[],
@@ -47,6 +47,29 @@ async function deriveTaprootAddressesFromPaths(
 ): Promise<{ addressesJson: string }> {
   if (!Array.isArray(relativePaths)) {
     throw new Error('relativePaths must be an array of path suffix strings');
+  }
+
+  const batch = (
+    AccountService as {
+      deriveTaprootAddressesFromPaths?: (
+        paths: string[],
+        opts?: { network?: string; includeKeyMaterial?: boolean }
+      ) => Promise<{ addressesJson: string }>;
+    }
+  ).deriveTaprootAddressesFromPaths;
+
+  if (typeof batch === 'function') {
+    try {
+      return await batch(relativePaths, {
+        network: 'bitcoin',
+        includeKeyMaterial: options?.includeKeyMaterial,
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!/deriveTaprootAddressesFromPaths is not available/.test(msg)) {
+        throw e;
+      }
+    }
   }
 
   const wantKeys = Boolean(options?.includeKeyMaterial);
@@ -116,12 +139,6 @@ async function deriveTaprootAddressesFromPaths(
   return { addressesJson: JSON.stringify(entries) };
 }
 
-function missingOnchainUpdate(method: string): never {
-  throw new Error(
-    `${method} is not available in @spacesops/wdk-react-native-core yet — needs a dedicated pear HRPC method`
-  );
-}
-
 /**
  * Spaces helpers on top of WDKService / AccountService.
  */
@@ -131,14 +148,42 @@ export const WDKSpaces = {
   deriveTaprootAddressesFromPaths,
 
   async quoteUpdateTransactionWithHexTX(
-    _params: UpdateOnchainHexParams
+    params: UpdateOnchainHexParams
   ): Promise<{ txHex: string; fee?: string }> {
-    return missingOnchainUpdate('quoteUpdateTransactionWithHexTX');
+    const result = await AccountService.callAccountMethod<
+      { hex?: string; txHex?: string; fee?: string | number } | string
+    >(
+      params.network,
+      params.fundingAccountIndex,
+      'quoteUpdateTransactionWithHexTX',
+      params.options
+    );
+    const txHex =
+      typeof result === 'string' ? result : result?.txHex || result?.hex || '';
+    if (!txHex) {
+      throw new Error('quoteUpdateTransactionWithHexTX returned no transaction hex');
+    }
+    const fee =
+      typeof result === 'object' && result?.fee != null ? String(result.fee) : undefined;
+    return fee != null ? { txHex, fee } : { txHex };
   },
 
   async updateTransactionWithHex(
-    _params: UpdateOnchainHexParams
+    params: UpdateOnchainHexParams
   ): Promise<{ hash: string; fee: string }> {
-    return missingOnchainUpdate('updateTransactionWithHex');
+    const result = await AccountService.callAccountMethod<{
+      hash?: string;
+      fee?: string | number;
+    }>(
+      params.network,
+      params.fundingAccountIndex,
+      'updateTransactionWithHex',
+      params.options
+    );
+    const hash = result?.hash ? String(result.hash) : '';
+    if (!hash) {
+      throw new Error('updateTransactionWithHex returned no transaction hash');
+    }
+    return { hash, fee: result?.fee != null ? String(result.fee) : '0' };
   },
 };

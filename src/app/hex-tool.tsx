@@ -55,6 +55,42 @@ const RECORD_TYPES: { type: RecordType; label: string }[] = [
 
 const KEY_CATEGORIES = ['Spaces Protocol', 'Payment Addresses', 'Identity & Keys', 'General'] as const;
 
+function firstParam(value: string | string[] | undefined): string {
+  if (value == null) return '';
+  return (Array.isArray(value) ? value[0] : value).trim();
+}
+
+function tryApplyRecordsHex(hexParam: string | string[] | undefined) {
+  const h = firstParam(hexParam);
+  if (!/^[0-9A-Fa-f]+$/.test(h) || h.length % 2 !== 0) {
+    return null;
+  }
+  try {
+    return applyInternalWireSplit(decodeRecordSet(hexToBytes(h.toUpperCase())));
+  } catch {
+    return null;
+  }
+}
+
+function tryApplyRecordsJson(jsonParam: string | string[] | undefined) {
+  const text = firstParam(jsonParam);
+  if (!text) return null;
+  const candidates = [text];
+  try {
+    candidates.unshift(decodeURIComponent(text));
+  } catch {
+    // not URI-encoded
+  }
+  for (const candidate of candidates) {
+    try {
+      return applyInternalWireSplit(jsonToRows(validateJsonRecords(JSON.parse(candidate))));
+    } catch {
+      // try next encoding
+    }
+  }
+  return null;
+}
+
 function getPlaceholder(row: RecordRow): string {
   if (row.key && RECOMMENDED_KEYS[row.key]) {
     return RECOMMENDED_KEYS[row.key].placeholder;
@@ -79,6 +115,7 @@ export default function HexToolScreen() {
     chainPresence: chainPresenceParam,
     hexToolMode: hexToolModeParam,
     primaryRecordsHex: primaryRecordsHexParam,
+    primaryRecordsJson: primaryRecordsJsonParam,
     scriptPubKeyHex: scriptPubKeyHexParam,
     taprootDerivationPath: taprootDerivationPathParam,
   } = useLocalSearchParams<{
@@ -93,6 +130,8 @@ export default function HexToolScreen() {
     hexToolMode?: HexToolMode;
     /** Primary zone records hex when editing attributes. */
     primaryRecordsHex?: string;
+    /** Certrelay attributes as wire JSON, used if hex decode fails. */
+    primaryRecordsJson?: string;
     scriptPubKeyHex?: string;
     taprootDerivationPath?: string;
   }>();
@@ -171,23 +210,28 @@ export default function HexToolScreen() {
             ? chainPresenceParam
             : undefined;
 
+        if (seedFromSubspace && attributesMode) {
+          const applied =
+            tryApplyRecordsHex(primaryRecordsHexParam) ??
+            tryApplyRecordsJson(primaryRecordsJsonParam);
+          if (!cancelled) {
+            if (applied && applied.visibleRows.length > 0) {
+              setSeqVersion(applied.seqVersion);
+              setTableRows(applied.visibleRows);
+              setHexString(applied.hex);
+            } else {
+              setSeqVersion(0);
+              setTableRows([]);
+              setHexString('');
+            }
+          }
+          return;
+        }
+
         if (seedFromSubspace && chainPresence != null) {
           let nextHex = '';
           let nextRows: RecordRow[] = [];
-          if (chainPresence === 'off-chain') {
-            nextHex = '';
-            nextRows = [];
-          } else if (attributesMode) {
-            const h = primaryRecordsHexParam ? String(primaryRecordsHexParam).trim() : '';
-            if (/^[0-9A-Fa-f]*$/.test(h) && h.length % 2 === 0 && h.length > 0) {
-              nextHex = h.toUpperCase();
-              try {
-                nextRows = decodeRecordSet(hexToBytes(nextHex));
-              } catch {
-                nextRows = [];
-              }
-            }
-          } else {
+          if (chainPresence !== 'off-chain') {
             const h = listnumsLastDataHex ? String(listnumsLastDataHex).trim() : '';
             if (/^[0-9A-Fa-f]*$/.test(h) && h.length % 2 === 0 && h.length > 0) {
               nextHex = h.toUpperCase();
@@ -266,6 +310,7 @@ export default function HexToolScreen() {
     chainPresenceParam,
     hexToolModeParam,
     primaryRecordsHexParam,
+    primaryRecordsJsonParam,
   ]);
 
   useEffect(() => {

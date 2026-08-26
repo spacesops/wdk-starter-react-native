@@ -1210,9 +1210,13 @@ export default function SubspaceScreen() {
     return 'Unknown';
   };
 
-  /** Hex Tool after chain check: disabled while loading or when listnums says off-chain. */
-  const isHexToolEnabled =
-    Boolean(spaceData) && !chainResolutionLoading && spaceData?.chainPresence !== 'off-chain';
+  const handleStatusLabel = getStatusText();
+  /** Edit Attributes: Committed (off-chain cert records) or On-chain. */
+  const isEditAttributesEnabled =
+    !chainResolutionLoading &&
+    (handleStatusLabel === 'Committed' || handleStatusLabel === 'On-chain');
+  /** Edit Fallback writes on-chain data; only once listnums resolved to On-chain. */
+  const isEditFallbackEnabled = !chainResolutionLoading && handleStatusLabel === 'On-chain';
 
   const handleForHexTool = `${subspace}@${spaceName.toLowerCase()}`;
 
@@ -1228,17 +1232,32 @@ export default function SubspaceScreen() {
   };
 
   const handleEditAttributes = async () => {
-    if (editAttributesLoading) return;
+    if (!isEditAttributesEnabled || editAttributesLoading) return;
     setEditAttributesLoading(true);
     try {
       console.log('[Subspace] Edit Attributes: certrelay query for', handleForHexTool);
       const result = await loadPrimaryRecordsFromCertrelay(handleForHexTool);
+      const recordsHex = result.recordsHex?.trim();
+      const attributesJson =
+        result.attributes.length > 0
+          ? JSON.stringify(
+              result.attributes.map((attr) => ({
+                type: 'txt' as const,
+                key: attr.key,
+                value: attr.values.join(''),
+              }))
+            )
+          : undefined;
+      if (result.warning && !recordsHex && result.attributes.length === 0) {
+        toast.error(result.warning);
+      }
       router.push({
         pathname: '/hex-tool',
         params: {
           ...hexToolBaseParams,
           hexToolMode: 'attributes',
-          ...(result.recordsHex?.trim() ? { primaryRecordsHex: result.recordsHex.trim() } : {}),
+          ...(recordsHex ? { primaryRecordsHex: recordsHex } : {}),
+          ...(attributesJson ? { primaryRecordsJson: encodeURIComponent(attributesJson) } : {}),
         },
       });
     } catch (error) {
@@ -1806,18 +1825,20 @@ export default function SubspaceScreen() {
             </TouchableOpacity>
           ) : null}
 
-          {/* Edit Attributes / Edit Fallback — only when listnums resolved to on-chain */}
+          {/* Edit Attributes: Committed or On-chain. Edit Fallback: On-chain only. */}
           <View style={styles.hexToolButtonRow}>
             <TouchableOpacity
               style={[
                 styles.hexToolButton,
                 styles.hexToolButtonHalf,
-                (!isHexToolEnabled || editAttributesLoading) && styles.hexToolButtonDisabled,
+                (!isEditAttributesEnabled || editAttributesLoading) && styles.hexToolButtonDisabled,
               ]}
               onPress={() => void handleEditAttributes()}
               activeOpacity={0.7}
-              disabled={!isHexToolEnabled || editAttributesLoading}
-              accessibilityState={{ disabled: !isHexToolEnabled || editAttributesLoading }}
+              disabled={!isEditAttributesEnabled || editAttributesLoading}
+              accessibilityState={{
+                disabled: !isEditAttributesEnabled || editAttributesLoading,
+              }}
               accessibilityLabel="Edit attributes and publish to certrelay"
             >
               {editAttributesLoading ? (
@@ -1830,7 +1851,7 @@ export default function SubspaceScreen() {
               style={[
                 styles.hexToolButton,
                 styles.hexToolButtonHalf,
-                !isHexToolEnabled && styles.hexToolButtonDisabled,
+                !isEditFallbackEnabled && styles.hexToolButtonDisabled,
               ]}
               onPress={() => {
                 router.push({
@@ -1846,8 +1867,8 @@ export default function SubspaceScreen() {
                 });
               }}
               activeOpacity={0.7}
-              disabled={!isHexToolEnabled}
-              accessibilityState={{ disabled: !isHexToolEnabled }}
+              disabled={!isEditFallbackEnabled}
+              accessibilityState={{ disabled: !isEditFallbackEnabled }}
               accessibilityLabel="Edit on-chain fallback data"
             >
               <Text style={styles.hexToolButtonText}>Edit Fallback</Text>

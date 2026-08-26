@@ -1,6 +1,6 @@
 # WDK core / pear gaps (Spaces Wallet)
 
-Track follow-ups after migrating to `@spacesops/wdk-react-native-core` (currently `1.0.0-beta.65` → pear `1.1.1-beta.51`).
+Track follow-ups after migrating to `@spacesops/wdk-react-native-core` (currently `1.0.0-beta.76` → pear `1.1.1-beta.52`).
 
 Status key: `open` · `blocked` · `optional` · `done`
 
@@ -12,22 +12,19 @@ Status key: `open` · `blocked` · `optional` · `done`
 
 - **Shipped via pear repack** (`1.1.1-beta.51`): `schema.json` `walletModules` for `@tetherto/wdk-wallet-ton`, `-tron`, `-solana` + `gen:mobile-bundle` — not app postinstall patches.
 - **App:** `get-chains-config.ts`, `get-token-configs.ts`, `assets.ts` USDT networks, gas-fee calculator, Settings address preload.
-- **Follow-up:** Publish pear → core `beta.65` → remove `file:`/`overrides` when on npm pins. **Native rebuild** required after bundle/addon change.
+- **Follow-up:** Publish pear → core `beta.76` → remove `file:`/`overrides` when on npm pins. **Native rebuild** required after bundle/addon change.
 
-### [blocked] Path-based on-chain update (`priorAcct` over HRPC)
+### [done] Path-based on-chain update (`priorAcct` over HRPC)
 
-- **App impact:** Subspace “Update on-chain” (`WDKSpaces.quoteUpdateTransactionWithHexTX` / `updateTransactionWithHex`) throws stubs.
-- **Why:** `WalletAccountBtc` methods take a live `priorAcct` object; that cannot cross HRPC as JSON.
-- **Fix options:**
-  1. Pear worklet helper that resolves `priorAccountRelativePath` via `getAccountByPath` and calls the account methods inside the worklet, or
-  2. wallet-btc variants that accept a path string instead of `priorAcct`.
-- **Refs:** `UPDATE_TX_HEX.md`, `src/utils/wdk-spaces.ts`, `src/app/subspace.tsx`
+- **App impact:** Subspace “Update on-chain” calls `AccountService.quoteUpdateTransactionWithHexTX` / `updateTransactionWithHex`.
+- **Fix:** Pear worklet rewrites `priorAccountRelativePath` → live `priorAcct` via `getAccountByPath` inside `callMethod`. Core wraps those account methods.
+- **Refs:** `pear-wrk-wdk/src/rpc-handlers.js`, `wdk-react-native-core` `AccountService`, `src/utils/wdk-spaces.ts`
 
-### [optional] Batch `deriveTaprootAddressesFromPaths` HRPC
+### [done] Batch `deriveTaprootAddressesFromPaths` HRPC
 
-- **App impact:** None blocking — app polyfills via `AccountService.callAccountMethodByPath` (`getAddress` → `getScriptPubKeyHex` → optional `getTaprootKeyMaterialHex`).
-- **Why optional:** Fewer round-trips / one atomic RPC for Find Spaces and path reservation.
-- **Note:** Postinstall still logs that `deriveTaprootAddressesFromPaths` is absent from the worklet; that is expected until this lands.
+- **App impact:** Find Spaces / path reservation use one worklet round-trip instead of per-path `callMethodByPath`.
+- **Fix:** Pear `deriveTaprootAddressesFromPaths` HRPC (schema id 9) + core `AccountService.deriveTaprootAddressesFromPaths`. App falls back to the per-path polyfill until the new pear bundle is consumed.
+- **Follow-up:** After pack, `scripts/patch-pear-wrk-taproot-keys.js` is obsolete (`getTaprootKeyMaterialHex` is already in wallet-btc).
 
 ### [optional] Confirm memo coinselect fix upstream
 

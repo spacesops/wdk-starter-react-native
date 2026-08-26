@@ -54,7 +54,7 @@
     "@react-navigation/native": "^7.1.8",
     "@reduxjs/toolkit": "^2.9.0",
     "@spacesops/react-native-bare-kit": "0.11.0-beta.49",
-    "@spacesops/wdk-react-native-core": "^1.0.0-beta.74",
+    "@spacesops/wdk-react-native-core": "^1.0.0-beta.76",
     "@spacesprotocol/react-native-libveritas": "^0.4.2",
     "@tetherto/wdk-pricing-bitfinex-http": "^1.0.0-beta.1",
     "@tetherto/wdk-pricing-provider": "^1.0.0-beta.1",

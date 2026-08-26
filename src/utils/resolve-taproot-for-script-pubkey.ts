@@ -1,9 +1,13 @@
 import getChainsConfig from '@/config/get-chains-config';
+import { deriveBip86TaprootFromMnemonic } from '@/utils/derive-bip86-taproot';
+import { getMnemonicWithoutWorklet } from '@/utils/mnemonic-from-secure-storage';
 import { WDKSpaces } from '@/utils/wdk-spaces';
 import {
   buildSpacesScanDerivationPaths,
   fullPathToWalletRelativePath,
   getBitcoinTaprootPathPrefix,
+  getSpacesAccountNumber,
+  parseSpacesScanPathIndex,
 } from '@/utils/spaces-scan-paths';
 import { scriptPubKeyHexToTaprootAddress } from '@/utils/taproot-address-to-spk';
 
@@ -18,7 +22,27 @@ export type TaprootKeyMaterial = {
   tweakedPrivateKeyHex?: string;
 };
 
-async function derivePathWithKeys(
+function toKeyMaterial(params: {
+  address: string;
+  relativePath: string;
+  derivationPath: string;
+  scriptPubKeyHex?: string;
+  internalPubKeyHex?: string;
+  privateKeyHex?: string;
+  tweakedPrivateKeyHex?: string;
+}): TaprootKeyMaterial {
+  return {
+    address: params.address,
+    priorAccountRelativePath: params.relativePath,
+    derivationPath: params.derivationPath,
+    scriptPubKeyHex: params.scriptPubKeyHex,
+    internalPubKeyHex: params.internalPubKeyHex,
+    privateKeyHex: params.privateKeyHex,
+    tweakedPrivateKeyHex: params.tweakedPrivateKeyHex,
+  };
+}
+
+async function derivePathWithWorklet(
   fullPath: string,
   relativePath: string
 ): Promise<TaprootKeyMaterial | null> {
@@ -40,15 +64,73 @@ async function derivePathWithKeys(
   const encodedAddress = entry.scriptPubKeyHex
     ? scriptPubKeyHexToTaprootAddress(entry.scriptPubKeyHex, bitcoinNetwork)
     : null;
-  return {
+  return toKeyMaterial({
     address: entry.address || encodedAddress || '',
-    priorAccountRelativePath: relativePath,
+    relativePath,
     derivationPath: fullPath,
     scriptPubKeyHex: entry.scriptPubKeyHex,
     internalPubKeyHex: entry.internalPubKeyHex,
     privateKeyHex: entry.privateKeyHex,
     tweakedPrivateKeyHex: entry.tweakedPrivateKeyHex,
+  });
+}
+
+async function derivePathLocally(params: {
+  mnemonic: string;
+  storedPath?: string;
+  targetSpk?: string;
+}): Promise<TaprootKeyMaterial | null> {
+  const { coinType } = getBitcoinTaprootPathPrefix();
+  const account = getSpacesAccountNumber();
+  const bitcoinNetwork = (getChainsConfig().bitcoin as { network?: string } | undefined)?.network;
+  const target = params.targetSpk?.trim().toLowerCase();
+
+  const tryIndex = (index: number) => {
+    const derived = deriveBip86TaprootFromMnemonic({
+      mnemonic: params.mnemonic,
+      account,
+      index,
+      coinType,
+      network: bitcoinNetwork,
+    });
+    if (target && derived.scriptPubKeyHex.toLowerCase() !== target) {
+      return null;
+    }
+    return toKeyMaterial({
+      address: derived.address,
+      relativePath: derived.relativePath,
+      derivationPath: derived.fullPath,
+      scriptPubKeyHex: derived.scriptPubKeyHex,
+      internalPubKeyHex: derived.internalPubKeyHex,
+      privateKeyHex: derived.privateKeyHex,
+      tweakedPrivateKeyHex: derived.tweakedPrivateKeyHex,
+    });
   };
+
+  const storedIndex = params.storedPath ? parseSpacesScanPathIndex(params.storedPath) : null;
+  if (storedIndex !== null) {
+    const fromStored = tryIndex(storedIndex);
+    if (fromStored) {
+      return fromStored;
+    }
+    console.warn(
+      '[Spaces] local BIP-86 derive did not match script pubkey at stored path',
+      params.storedPath
+    );
+  }
+
+  const gap = buildSpacesScanDerivationPaths().length;
+  for (let index = 0; index < gap; index++) {
+    if (index === storedIndex) {
+      continue;
+    }
+    const matched = tryIndex(index);
+    if (matched) {
+      return matched;
+    }
+  }
+
+  return null;
 }
 
 export async function resolveTaprootForScriptPubKey(
@@ -59,13 +141,29 @@ export async function resolveTaprootForScriptPubKey(
   const encodedAddress = scriptPubKeyHexToTaprootAddress(scriptPubKeyHex, bitcoinNetwork);
   const { bip, coinType } = getBitcoinTaprootPathPrefix();
   const target = scriptPubKeyHex.trim().toLowerCase();
-
   const storedPath = options?.derivationPath?.trim();
+
+  try {
+    const mnemonic = await getMnemonicWithoutWorklet();
+    if (mnemonic) {
+      const local = await derivePathLocally({
+        mnemonic,
+        storedPath,
+        targetSpk: target,
+      });
+      if (local) {
+        return local;
+      }
+    }
+  } catch (e) {
+    console.warn('[Spaces] resolveTaprootForScriptPubKey local derive failed', e);
+  }
+
   if (storedPath) {
     const rel = fullPathToWalletRelativePath(storedPath, bip, coinType);
     if (rel) {
       try {
-        const derived = await derivePathWithKeys(storedPath, rel);
+        const derived = await derivePathWithWorklet(storedPath, rel);
         if (derived) {
           return derived;
         }
@@ -85,7 +183,7 @@ export async function resolveTaprootForScriptPubKey(
   for (let idx = 0; idx < rels.length; idx++) {
     const rel = rels[idx]!;
     try {
-      const derived = await derivePathWithKeys(
+      const derived = await derivePathWithWorklet(
         fullPaths[idx] ?? `m/${bip}'/${coinType}'/${rel}`,
         rel
       );
@@ -102,7 +200,7 @@ export async function resolveTaprootForScriptPubKey(
     return {
       address: encodedAddress,
       priorAccountRelativePath: '',
-      derivationPath: '',
+      derivationPath: storedPath ?? '',
     };
   }
   return null;
