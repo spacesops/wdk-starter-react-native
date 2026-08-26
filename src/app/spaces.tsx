@@ -6,6 +6,7 @@ import { useFocusEffect } from '@react-navigation/native';
 import {
   ActivityIndicator,
   Alert,
+  Keyboard,
   Modal,
   ScrollView,
   StyleSheet,
@@ -35,6 +36,7 @@ import {
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import getChainsConfig from '@/config/get-chains-config';
 import { createLegacyBalances } from '@/utils/legacy-balances';
+import { getMnemonicWithoutWorklet } from '@/utils/mnemonic-from-secure-storage';
 import { getWalletAddress } from '@/utils/wallet-addresses';
 import {
   buildSpacesScanDerivationPaths,
@@ -48,7 +50,10 @@ import {
   formatMySpacesThirdColumnLabel,
   pipelineSnapshotFieldsFromUpdate,
 } from '@/utils/space-pipeline';
-import { resolveNextAvailableTaprootPath } from '@/utils/resolve-next-spaces-path';
+import {
+  resolveNextAvailableTaprootPath,
+  type NextAvailableTaprootPath,
+} from '@/utils/resolve-next-spaces-path';
 import { WDKSpaces } from '@/utils/wdk-spaces';
 import { registerPurchaseStatusPollStarter } from '@/utils/purchase-poll-bridge';
 import {
@@ -467,7 +472,7 @@ function resolvePurchasePaymentAmountSats(params: {
   sptrFee6: number | null;
   sptrFee48: number | null;
 }): number {
-  if (params.completelyFree) return 0;
+  if (params.completelyFree && !params.takeOnchain) return 0;
   if (params.discountPercent === null || params.priceSats === null) {
     return params.serverTotalPrice;
   }
@@ -598,6 +603,98 @@ function buildSimulatedTransactionId(jobId: number): string {
   const timeHex = Date.now().toString(16).padStart(12, '0');
   const tail = `${jobHex}${timeHex}`.slice(0, 64 - prefix.length);
   return `${prefix}${tail}`.padEnd(64, '0').slice(0, 64);
+}
+
+type SpacePathReservationRow = {
+  subspace: string;
+  spaceName: string;
+  scriptPubKeyHex?: string;
+  taprootDerivationPath?: string;
+};
+
+async function persistReservedTaprootPath(
+  jobId: number | string | null | undefined,
+  nextPath: NextAvailableTaprootPath
+): Promise<void> {
+  if (jobId == null || jobId === '') {
+    return;
+  }
+  const storageKey = `spaces_purchase_${jobId}`;
+  try {
+    const existingRaw = await AsyncStorage.getItem(storageKey);
+    const existing = existingRaw ? JSON.parse(existingRaw) : {};
+    await AsyncStorage.setItem(
+      storageKey,
+      JSON.stringify({
+        ...existing,
+        script_pubkey: nextPath.scriptPubKeyHex,
+        taproot_derivation_path: nextPath.fullPath,
+        taproot_receive_address: nextPath.address,
+      })
+    );
+  } catch (storageErr) {
+    console.warn('[Spaces] Failed to persist taproot path on purchase blob:', storageErr);
+  }
+}
+
+/**
+ * First-time purchases reserve m/86'/0'/{account}'/0/{max+1} on the Spaces
+ * account. Renewals / Find Spaces rows reuse the existing script pubkey.
+ */
+async function reserveTaprootPathForPurchase(params: {
+  baseUrl: string;
+  subspaceTrimmed: string;
+  spaceNameLower: string;
+  jobId?: number | string | null;
+  mySpaces: SpacePathReservationRow[];
+  /** When set, derive BIP-86 locally and skip the worklet. */
+  mnemonic?: string;
+}): Promise<NextAvailableTaprootPath | null> {
+  const { baseUrl, subspaceTrimmed, spaceNameLower, jobId, mySpaces, mnemonic } = params;
+  const prior = mySpaces.find(
+    (s) => s.subspace === subspaceTrimmed && s.spaceName === spaceNameLower
+  );
+  const existingSpk = prior?.scriptPubKeyHex?.trim();
+  if (existingSpk) {
+    return {
+      scriptPubKeyHex: existingSpk,
+      fullPath: prior?.taprootDerivationPath ?? '',
+      relativePath: '',
+      address: '',
+    };
+  }
+
+  const otherRows = mySpaces.filter(
+    (s) => !(s.subspace === subspaceTrimmed && s.spaceName === spaceNameLower)
+  );
+  const reservedPaths = otherRows
+    .map((s) => s.taprootDerivationPath)
+    .filter((path): path is string => Boolean(path?.trim()));
+  const reservedSpks = otherRows
+    .map((s) => s.scriptPubKeyHex)
+    .filter((spk): spk is string => Boolean(spk?.trim()));
+
+  console.log('[Spaces] Resolving next Taproot path (max used index + 1)…');
+  const nextPath = await resolveNextAvailableTaprootPath({
+    baseUrl,
+    reservedDerivationPaths: reservedPaths,
+    reservedScriptPubKeys: reservedSpks,
+    mnemonic,
+  });
+  if (!nextPath) {
+    return null;
+  }
+
+  console.log('[Spaces] Reserved Taproot path for purchase:', {
+    fullPath: nextPath.fullPath,
+    scriptPubKeyHex: `${nextPath.scriptPubKeyHex.slice(0, 16)}…`,
+    address: nextPath.address,
+    hasPrivateKey: Boolean(nextPath.privateKeyHex),
+    hasTweakedPrivateKey: Boolean(nextPath.tweakedPrivateKeyHex),
+  });
+
+  await persistReservedTaprootPath(jobId, nextPath);
+  return nextPath;
 }
 
 type PostPurchaseWatchState = {
@@ -1008,6 +1105,7 @@ export default function SpacesScreen() {
   const [spaceName, setSpaceName] = useState<string>('');
   /** Avoid repeating the "select space name first" warning on every subspace keystroke. */
   const subspaceBeforeSpaceNameWarnedRef = useRef(false);
+  const selectingSpaceNameRef = useRef(false);
   /** Throttle pricing-unavailable toasts during the 30s refresh interval. */
   const pricingUnavailableToastAtRef = useRef(0);
   /** Latest availability/quote refresh (for stale-quote recovery after POST/PUT failures). */
@@ -1025,13 +1123,8 @@ export default function SpacesScreen() {
     pointerJobId: number | null;
   } | null>(null);
   /** Taproot path + script pubkey reserved after PUT confirm (first-time purchase). */
-  const purchaseTaprootPathRef = useRef<{
-    fullPath: string;
-    relativePath: string;
-    scriptPubKeyHex: string;
-    address: string;
-  } | null>(null);
-  const [showDropdown, setShowDropdown] = useState(false);
+  const purchaseTaprootPathRef = useRef<NextAvailableTaprootPath | null>(null);
+  const [spaceNameFocused, setSpaceNameFocused] = useState(false);
   const [buttonState, setButtonState] = useState<
     'available' | 'taken' | 'reserved' | 'loading' | null
   >(null);
@@ -1048,6 +1141,18 @@ export default function SpacesScreen() {
   const [sptrFee48, setSptrFee48] = useState<number | null>(null);
   const [takeOnchain, setTakeOnchain] = useState(false);
   const [spaceNameOptions, setSpaceNameOptions] = useState<string[]>(SPACE_NAME_OPTIONS);
+  const filteredSpaceNameOptions = useMemo(() => {
+    const query = spaceName.trim();
+    if (!query) {
+      return spaceNameOptions;
+    }
+    const prefix = query.toLowerCase();
+    return spaceNameOptions.filter(option => option.toLowerCase().startsWith(prefix));
+  }, [spaceName, spaceNameOptions]);
+
+  const showSpaceNameSuggestions =
+    spaceNameFocused && filteredSpaceNameOptions.length > 0;
+
   const [btcPriceUSD, setBtcPriceUSD] = useState<number | null>(null);
   const [quoteId, setQuoteId] = useState<number | null>(null);
   const [handle, setHandle] = useState<string | null>(null);
@@ -1131,6 +1236,8 @@ export default function SpacesScreen() {
       tenantQuotePaymentConfirmed?: boolean | null;
     }[]
   >([]);
+  const mySpacesRef = useRef(mySpaces);
+  mySpacesRef.current = mySpaces;
   const [jobPollingState, setJobPollingState] = useState<
     Record<
       number,
@@ -1844,6 +1951,20 @@ export default function SpacesScreen() {
     try {
       while (attempt < maxAttempts) {
         try {
+          const stillTracked = mySpacesRef.current.some(
+            (s) =>
+              s.jobId === jobId ||
+              s.sptrJobId === jobId ||
+              (s.subspace === subspace && s.spaceName === spaceNameLower)
+          );
+          if (!stillTracked && attempt > 0) {
+            console.log(
+              `[Spaces] Stopping poll for job ${jobId}: ${subspace}@${spaceNameLower} no longer in My Spaces`
+            );
+            updatePollingState(Date.now(), false);
+            return null;
+          }
+
           // Set next check time (for first attempt, this is immediate, then uses delay)
           const nextCheckTime = attempt === 0 ? Date.now() : Date.now() + delay;
           updatePollingState(nextCheckTime, true);
@@ -1860,6 +1981,13 @@ export default function SpacesScreen() {
 
           try {
             response = await fetch(unifiedStatusUrl);
+            if (response.status === 404) {
+              console.warn(
+                `[Spaces] No purchase row for ${subspace}@${spaceName} — stopping poll for job ${jobId}`
+              );
+              updatePollingState(Date.now(), false);
+              return null;
+            }
             data = await response.json();
             if (data.success && data.unified_status) {
               unifiedStatus = data.unified_status as UnifiedStatus;
@@ -1878,6 +2006,14 @@ export default function SpacesScreen() {
           }
 
           if (!data.success) {
+            const message = String(data.message || '');
+            if (/purchase not found/i.test(message)) {
+              console.warn(
+                `[Spaces] ${message} — stopping poll for job ${jobId}`
+              );
+              updatePollingState(Date.now(), false);
+              return null;
+            }
             throw new Error(data.message || 'Failed to fetch job status');
           }
 
@@ -2350,8 +2486,8 @@ export default function SpacesScreen() {
         return;
       }
 
-      // Free coupon path: skip transaction composition entirely
-      if (completelyFree) {
+      // Free coupon path: skip tx composition. Bundled pointer still costs sats, so fall through.
+      if (completelyFree && !takeOnchain) {
         setButtonState('loading');
         setIsButtonEnabled(false);
         setButtonLabel('Requesting...');
@@ -2359,8 +2495,11 @@ export default function SpacesScreen() {
         try {
           const currentSubspace = subspace.trim();
           const currentSpaceName = spaceName.toLowerCase();
+          const priorRowForPath = mySpaces.find(
+            (s) => s.subspace === currentSubspace && s.spaceName === currentSpaceName
+          );
+          const needsTaprootPath = !priorRowForPath?.scriptPubKeyHex?.trim();
 
-          // Add to My Spaces
           const newSpace = {
             subspace: currentSubspace,
             spaceName: currentSpaceName,
@@ -2379,7 +2518,6 @@ export default function SpacesScreen() {
             return [...prev, newSpace];
           });
 
-          // PUT to confirm purchase
           const url = `${SPACES_API_BASE_URL}/spaces/${currentSpaceName}/${currentSubspace}?app=${SPACES_APP_NAME}&format=json`;
           console.log(`[Spaces API] PUT ${url} (free coupon)`);
 
@@ -2398,59 +2536,181 @@ export default function SpacesScreen() {
           const data = await response.json();
           console.log(`[Spaces API] PUT ${url} - Success (free coupon)`, data);
 
-            if (data.job_id) {
-              const d = data as Record<string, unknown>;
-              const { pointerJobId, pointerPurchaseId } = pointerIdsFromPurchaseResponse(d);
-              const resolvedPurchaseIdFree = purchaseIdFromRecord(d);
-              setCurrentJobId(data.job_id);
-              setCurrentJobData({
-                handle: data.handle || purchaseData.handle,
-                subspace: currentSubspace,
-                spaceName: currentSpaceName,
-              });
+          if (data.job_id) {
+            const d = data as Record<string, unknown>;
+            const { pointerJobId, pointerPurchaseId } = pointerIdsFromPurchaseResponse(d);
+            const resolvedPurchaseIdFree = purchaseIdFromRecord(d);
+            const parsedPurchaseId = resolvedPurchaseIdFree ?? NaN;
+            const parsedJobId =
+              typeof data.job_id === 'number'
+                ? data.job_id
+                : data.job_id != null
+                  ? Number(data.job_id)
+                  : NaN;
 
-              setMySpaces((prev) =>
-                prev.map((space) =>
-                  space.subspace === currentSubspace && space.spaceName === currentSpaceName
-                    ? {
-                        ...space,
-                        jobId: data.job_id,
-                        purchaseId: resolvedPurchaseIdFree,
-                        sptrJobId: pointerJobId,
-                        sptrPurchaseId: pointerPurchaseId,
-                        hasSptr: pointerJobId != null && pointerJobId > 0,
-                        status: 'pending_payment' as UnifiedStatus,
-                      }
-                    : space
-                )
-              );
+            setCurrentJobId(data.job_id);
+            setCurrentJobData({
+              handle: data.handle || purchaseData.handle,
+              subspace: currentSubspace,
+              spaceName: currentSpaceName,
+            });
 
-              if (data.handle) {
-                const storageKey = `spaces_purchase_${data.job_id}`;
-                const storageData = {
-                  job_id: data.job_id,
-                  handle: data.handle,
-                  quote_id: data.quote_id,
-                  purchase_id: resolvedPurchaseIdFree ?? data.purchase_id,
-                  sptr_job_id: pointerJobId,
-                  sptr_purchase_id: pointerPurchaseId,
-                  has_sptr: pointerJobId != null && pointerJobId > 0,
-                  timestamp: Date.now(),
-                };
+            setMySpaces((prev) =>
+              prev.map((space) =>
+                space.subspace === currentSubspace && space.spaceName === currentSpaceName
+                  ? {
+                      ...space,
+                      jobId: data.job_id,
+                      purchaseId: resolvedPurchaseIdFree,
+                      sptrJobId: pointerJobId,
+                      sptrPurchaseId: pointerPurchaseId,
+                      hasSptr: pointerJobId != null && pointerJobId > 0,
+                      status: 'pending_payment' as UnifiedStatus,
+                    }
+                  : space
+              )
+            );
+
+            if (Number.isFinite(parsedPurchaseId) && Number.isFinite(parsedJobId)) {
+              pendingPaymentCallbackRef.current = {
+                jobId: parsedJobId,
+                purchaseId: parsedPurchaseId,
+              };
+            } else {
+              pendingPaymentCallbackRef.current = null;
+            }
+
+            if (data.handle) {
+              const storageKey = `spaces_purchase_${data.job_id}`;
+              const storageData = {
+                job_id: data.job_id,
+                handle: data.handle,
+                quote_id: data.quote_id,
+                purchase_id: resolvedPurchaseIdFree ?? data.purchase_id,
+                sptr_job_id: pointerJobId,
+                sptr_purchase_id: pointerPurchaseId,
+                has_sptr: pointerJobId != null && pointerJobId > 0,
+                timestamp: Date.now(),
+              };
               await AsyncStorage.setItem(storageKey, JSON.stringify(storageData));
               console.log('[Spaces] Stored purchase data:', storageKey);
+            } else if (data.job_id != null && Number.isFinite(parsedPurchaseId)) {
+              const storageKey = `spaces_purchase_${data.job_id}`;
+              await AsyncStorage.setItem(
+                storageKey,
+                JSON.stringify({
+                  job_id: data.job_id,
+                  purchase_id: parsedPurchaseId,
+                  timestamp: Date.now(),
+                })
+              );
+            }
+
+            let reservedPath: NextAvailableTaprootPath | null = null;
+            try {
+              let mnemonic: string | undefined;
+              try {
+                mnemonic = (await getMnemonicWithoutWorklet(currentWalletId ?? undefined)) ?? undefined;
+              } catch (mnemonicErr) {
+                console.error('[Spaces] Free-coupon getMnemonic failed:', mnemonicErr);
+              }
+              if (!mnemonic) {
+                console.error('[Spaces] Free-coupon: no mnemonic; refusing worklet getAccountByPath');
+              } else {
+                reservedPath = await reserveTaprootPathForPurchase({
+                  baseUrl: SPACES_API_BASE_URL,
+                  subspaceTrimmed: currentSubspace,
+                  spaceNameLower: currentSpaceName,
+                  jobId: data.job_id,
+                  mySpaces,
+                  mnemonic,
+                });
+              }
+            } catch (reserveErr) {
+              console.error('[Spaces] Free-coupon Taproot reservation failed:', reserveErr);
+            }
+
+            if (needsTaprootPath && !reservedPath) {
+              console.error('[Spaces] No available Taproot path for first-time free purchase');
+              toast.error(
+                'Could not reserve a wallet path for this handle. Use Find Spaces or try again.'
+              );
+              postPurchaseWatchRef.current = null;
+              purchaseTaprootPathRef.current = null;
+              pendingPaymentCallbackRef.current = null;
+            }
+
+            if (reservedPath) {
+              purchaseTaprootPathRef.current = reservedPath;
+              if (needsTaprootPath) {
+                setMySpaces((prev) =>
+                  prev.map((space) =>
+                    space.subspace === currentSubspace && space.spaceName === currentSpaceName
+                      ? {
+                          ...space,
+                          scriptPubKeyHex: reservedPath.scriptPubKeyHex,
+                          taprootDerivationPath: reservedPath.fullPath,
+                          chainPresence: 'off-chain' as const,
+                        }
+                      : space
+                  )
+                );
+              }
+            }
+
+            const simulatedTxid = buildSimulatedTransactionId(
+              Number.isFinite(parsedJobId) ? parsedJobId : Number(data.job_id)
+            );
+            const pendingPurchaseId =
+              Number.isFinite(parsedPurchaseId) ? parsedPurchaseId : undefined;
+            const scriptPubKeyHex =
+              reservedPath?.scriptPubKeyHex?.trim() ?? priorRowForPath?.scriptPubKeyHex?.trim();
+
+            let watchOk = false;
+            let callbackOk = false;
+            if (scriptPubKeyHex) {
+              try {
+                const registration = await registerPurchasePaymentOnServer({
+                  baseUrl: SPACES_API_BASE_URL,
+                  transactionId: simulatedTxid,
+                  jobId: Number.isFinite(parsedJobId) ? parsedJobId : Number(data.job_id),
+                  spaceNameLower: currentSpaceName,
+                  subspaceTrimmed: currentSubspace,
+                  handle: data.handle || purchaseData.handle,
+                  paymentWatch: postPurchaseWatchRef.current,
+                  pendingPurchaseId,
+                  scriptPubKeyHex,
+                  logLabel: 'free-coupon',
+                });
+                watchOk = registration.watchOk;
+                callbackOk = registration.callbackOk;
+                console.log('[Spaces] Free-coupon simulated payment registration:', {
+                  purchaseId: registration.purchaseId,
+                  watchOk,
+                  callbackOk,
+                  simulatedTxid,
+                });
+              } catch (regError) {
+                console.error('[Spaces] Free-coupon simulated payment registration failed:', regError);
+              }
+            } else {
+              console.warn('[Spaces] Skipping simulated payment: no script_pubkey reserved');
             }
 
             pollJobStatus(data.job_id, currentSpaceName, currentSubspace).catch((error) => {
               console.error('[Spaces] Polling failed:', error);
             });
-          }
 
-          // Dismiss confirmation
-          setIsConfirmationMode(false);
-          setPurchaseData(null);
-          setButtonState('available');
-          setIsButtonEnabled(true);
+            if (watchOk && callbackOk) {
+              toast.success(`Requested ${purchaseData.handle} for free!`);
+              setSubspace('');
+              subspaceBeforeSpaceNameWarnedRef.current = false;
+            } else if (watchOk || callbackOk) {
+              toast.info('Free request partially registered — monitoring job status');
+            } else if (scriptPubKeyHex) {
+              toast.error('Could not register simulated payment. Polling job status anyway.');
+            }
+          }
 
           if (priceSats !== null) {
             const blockFee = getBlockFee(selectedDuration, blockFee1, blockFee6, blockFee48);
@@ -2458,8 +2718,6 @@ export default function SpacesScreen() {
               setButtonLabel(calculateTotalPrice(priceSats, blockFee1, blockFee6, blockFee48, selectedDuration, btcPriceUSD, takeOnchain, sptrPrice, sptrFee1, sptrFee6, sptrFee48));
             }
           }
-
-          toast.success(`Requested ${purchaseData.handle} for free!`);
         } catch (error) {
           console.error('[Spaces] Free coupon request failed:', error);
           if (error instanceof SpacesApiHttpError && error.refreshQuote) {
@@ -2476,9 +2734,12 @@ export default function SpacesScreen() {
                   ? error.message
                   : 'Failed to process request'
             );
-            setButtonState('available');
-            setIsButtonEnabled(true);
           }
+        } finally {
+          setIsConfirmationMode(false);
+          setPurchaseData(null);
+          setButtonState('available');
+          setIsButtonEnabled(true);
         }
         return;
       }
@@ -2904,88 +3165,45 @@ export default function SpacesScreen() {
           console.log('[Spaces] Stored minimal purchase id in AsyncStorage:', storageKey);
         }
 
-        if (needsTaprootPath) {
-          const reservedPaths = mySpaces
-            .filter(
-              (s) => !(s.subspace === subspaceTrimmed && s.spaceName === spaceNameLower)
-            )
-            .map((s) => s.taprootDerivationPath)
-            .filter((path): path is string => Boolean(path?.trim()));
-          const reservedSpks = mySpaces
-            .filter(
-              (s) => !(s.subspace === subspaceTrimmed && s.spaceName === spaceNameLower)
-            )
-            .map((s) => s.scriptPubKeyHex)
-            .filter((spk): spk is string => Boolean(spk?.trim()));
+        const reservedPath = await reserveTaprootPathForPurchase({
+          baseUrl: SPACES_API_BASE_URL,
+          subspaceTrimmed,
+          spaceNameLower,
+          jobId: data.job_id,
+          mySpaces,
+        });
 
-          console.log('[Spaces] Resolving next Taproot path (max used index + 1)…');
-          const nextPath = await resolveNextAvailableTaprootPath({
-            baseUrl: SPACES_API_BASE_URL,
-            reservedDerivationPaths: reservedPaths,
-            reservedScriptPubKeys: reservedSpks,
-          });
-
-          if (!nextPath) {
-            console.error('[Spaces] No available Taproot path for first-time purchase');
-            toast.error(
-              'Could not reserve a wallet path for this handle. Use Find Spaces or try again.'
-            );
-            setButtonState('available');
-            setIsButtonEnabled(true);
-            setIsConfirmationMode(false);
-            setPurchaseData(null);
-            postPurchaseWatchRef.current = null;
-            purchaseTaprootPathRef.current = null;
-            pendingPaymentCallbackRef.current = null;
-            return;
-          }
-
-          console.log('[Spaces] Reserved Taproot path for purchase:', {
-            fullPath: nextPath.fullPath,
-            scriptPubKeyHex: `${nextPath.scriptPubKeyHex.slice(0, 16)}…`,
-            address: nextPath.address,
-          });
-
-          purchaseTaprootPathRef.current = nextPath;
-
-          setMySpaces((prev) =>
-            prev.map((space) =>
-              space.subspace === subspaceTrimmed && space.spaceName === spaceNameLower
-                ? {
-                    ...space,
-                    scriptPubKeyHex: nextPath.scriptPubKeyHex,
-                    taprootDerivationPath: nextPath.fullPath,
-                    chainPresence: 'off-chain' as const,
-                  }
-                : space
-            )
+        if (needsTaprootPath && !reservedPath) {
+          console.error('[Spaces] No available Taproot path for first-time purchase');
+          toast.error(
+            'Could not reserve a wallet path for this handle. Use Find Spaces or try again.'
           );
+          setButtonState('available');
+          setIsButtonEnabled(true);
+          setIsConfirmationMode(false);
+          setPurchaseData(null);
+          postPurchaseWatchRef.current = null;
+          purchaseTaprootPathRef.current = null;
+          pendingPaymentCallbackRef.current = null;
+          return;
+        }
 
-          if (data.job_id) {
-            const storageKey = `spaces_purchase_${data.job_id}`;
-            try {
-              const existingRaw = await AsyncStorage.getItem(storageKey);
-              const existing = existingRaw ? JSON.parse(existingRaw) : {};
-              await AsyncStorage.setItem(
-                storageKey,
-                JSON.stringify({
-                  ...existing,
-                  script_pubkey: nextPath.scriptPubKeyHex,
-                  taproot_derivation_path: nextPath.fullPath,
-                  taproot_receive_address: nextPath.address,
-                })
-              );
-            } catch (storageErr) {
-              console.warn('[Spaces] Failed to persist taproot path on purchase blob:', storageErr);
-            }
+        if (reservedPath) {
+          purchaseTaprootPathRef.current = reservedPath;
+          if (needsTaprootPath) {
+            setMySpaces((prev) =>
+              prev.map((space) =>
+                space.subspace === subspaceTrimmed && space.spaceName === spaceNameLower
+                  ? {
+                      ...space,
+                      scriptPubKeyHex: reservedPath.scriptPubKeyHex,
+                      taprootDerivationPath: reservedPath.fullPath,
+                      chainPresence: 'off-chain' as const,
+                    }
+                  : space
+              )
+            );
           }
-        } else if (priorRowForPath?.scriptPubKeyHex?.trim()) {
-          purchaseTaprootPathRef.current = {
-            scriptPubKeyHex: priorRowForPath.scriptPubKeyHex.trim(),
-            fullPath: priorRowForPath.taprootDerivationPath ?? '',
-            relativePath: '',
-            address: '',
-          };
         }
 
         setTxHex(transactionHex);
@@ -3296,7 +3514,7 @@ export default function SpacesScreen() {
 
   const handleSelectSpaceName = (option: string) => {
     setSpaceName(option);
-    setShowDropdown(false);
+    setSpaceNameFocused(false);
   };
 
   // Helper function to shorten address for display
@@ -3948,6 +4166,7 @@ export default function SpacesScreen() {
       if (stored) {
         const loadedSpaces = JSON.parse(stored);
         console.log('[Spaces] Loaded mySpaces from AsyncStorage:', loadedSpaces.length, 'spaces');
+        mySpacesRef.current = loadedSpaces;
         setMySpaces(loadedSpaces);
 
         // Resume polling for active jobs
@@ -4057,6 +4276,7 @@ export default function SpacesScreen() {
           setCompletelyFree(!!data.completely_free);
           setCouponStatus('valid');
           toast.success(data.message || `Coupon applied: ${data.discount_percent}% off`);
+          Keyboard.dismiss();
         } else {
           setDiscountPercent(null);
           setCompletelyFree(false);
@@ -4121,8 +4341,9 @@ export default function SpacesScreen() {
   // Keep confirmation-mode button label in sync when coupon discount changes
   useEffect(() => {
     if (!isConfirmationMode || !purchaseData) return;
+    if (buttonState === 'loading') return;
 
-    if (completelyFree) {
+    if (completelyFree && !takeOnchain) {
       setButtonLabel(`Request ${purchaseData.handle} for free`);
       return;
     }
@@ -4155,7 +4376,7 @@ export default function SpacesScreen() {
     } else {
       setButtonLabel(`Send ${formattedSats} sats for ${purchaseData.handle}`);
     }
-  }, [completelyFree, discountPercent, couponStatus, isConfirmationMode, purchaseData, btcPriceUSD, priceSats, selectedDuration, blockFee1, blockFee6, blockFee48, takeOnchain, sptrPrice, sptrFee1, sptrFee6, sptrFee48]);
+  }, [completelyFree, discountPercent, couponStatus, isConfirmationMode, purchaseData, buttonState, btcPriceUSD, priceSats, selectedDuration, blockFee1, blockFee6, blockFee48, takeOnchain, sptrPrice, sptrFee1, sptrFee6, sptrFee48]);
 
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
@@ -4165,6 +4386,7 @@ export default function SpacesScreen() {
         style={styles.scrollView}
         contentContainerStyle={styles.scrollContent}
         showsVerticalScrollIndicator={false}
+        keyboardShouldPersistTaps="handled"
       >
         {/* Search Section */}
         <View style={styles.section}>
@@ -4195,17 +4417,60 @@ export default function SpacesScreen() {
                 autoCorrect={false}
               />
               <Text style={styles.atSymbol}>@</Text>
-              <TouchableOpacity
-                style={styles.dropdownButton}
-                onPress={() => setShowDropdown(true)}
-                activeOpacity={0.7}
-              >
-                <Text style={[styles.dropdownText, !spaceName && styles.dropdownPlaceholder]}>
-                  {spaceName || 'space_name'}
-                </Text>
-                <ChevronDown size={20} color={colors.textSecondary} />
-              </TouchableOpacity>
+              <View style={styles.spaceNameCombo}>
+                <TextInput
+                  style={styles.spaceNameInput}
+                  placeholder="space_name"
+                  placeholderTextColor={colors.textSecondary}
+                  value={spaceName}
+                  onChangeText={setSpaceName}
+                  onFocus={() => setSpaceNameFocused(true)}
+                  onBlur={() => {
+                    if (selectingSpaceNameRef.current) {
+                      selectingSpaceNameRef.current = false;
+                      return;
+                    }
+                    setSpaceNameFocused(false);
+                  }}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                />
+              </View>
             </View>
+
+            {showSpaceNameSuggestions ? (
+              <View style={styles.spaceNameSuggestions}>
+                <ScrollView
+                  keyboardShouldPersistTaps="handled"
+                  nestedScrollEnabled
+                  style={styles.spaceNameSuggestionsScroll}
+                >
+                  {filteredSpaceNameOptions.map(option => (
+                    <TouchableOpacity
+                      key={option}
+                      style={[
+                        styles.dropdownOption,
+                        spaceName === option && styles.dropdownOptionSelected,
+                      ]}
+                      onPressIn={() => {
+                        selectingSpaceNameRef.current = true;
+                      }}
+                      onPress={() => handleSelectSpaceName(option)}
+                      activeOpacity={0.7}
+                    >
+                      <Text
+                        style={[
+                          styles.dropdownOptionText,
+                          spaceName === option && styles.dropdownOptionTextSelected,
+                        ]}
+                      >
+                        {option}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </ScrollView>
+              </View>
+            ) : null}
 
 
             {/* Confirmation message - Shown in confirmation mode */}
@@ -4720,42 +4985,6 @@ export default function SpacesScreen() {
         </View>
       </ScrollView>
 
-      {/* Dropdown Modal */}
-      <Modal
-        visible={showDropdown}
-        transparent={true}
-        animationType="fade"
-        onRequestClose={() => setShowDropdown(false)}
-      >
-        <TouchableOpacity
-          style={styles.modalOverlay}
-          activeOpacity={1}
-          onPress={() => setShowDropdown(false)}
-        >
-          <View style={styles.dropdownContainer}>
-            {spaceNameOptions.map((option) => (
-              <TouchableOpacity
-                key={option}
-                style={[
-                  styles.dropdownOption,
-                  spaceName === option && styles.dropdownOptionSelected,
-                ]}
-                onPress={() => handleSelectSpaceName(option)}
-                activeOpacity={0.7}
-              >
-                <Text
-                  style={[
-                    styles.dropdownOptionText,
-                    spaceName === option && styles.dropdownOptionTextSelected,
-                  ]}
-                >
-                  {option}
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-        </TouchableOpacity>
-      </Modal>
     </View>
   );
 }
@@ -5010,24 +5239,29 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: colors.borderDark,
   },
-  dropdownButton: {
+  spaceNameCombo: {
     flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
+  },
+  spaceNameInput: {
     backgroundColor: colors.background,
     borderRadius: 8,
     paddingHorizontal: 12,
     paddingVertical: 12,
+    fontSize: 14,
+    color: colors.text,
     borderWidth: 1,
     borderColor: colors.borderDark,
   },
-  dropdownText: {
-    fontSize: 14,
-    color: colors.text,
+  spaceNameSuggestions: {
+    backgroundColor: colors.background,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: colors.borderDark,
+    marginBottom: 16,
+    maxHeight: 160,
   },
-  dropdownPlaceholder: {
-    color: colors.textSecondary,
+  spaceNameSuggestionsScroll: {
+    maxHeight: 160,
   },
   radioGroup: {
     flexDirection: 'row',
@@ -5119,21 +5353,6 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0, 0, 0, 0.5)',
     justifyContent: 'center',
     alignItems: 'center',
-  },
-  dropdownContainer: {
-    backgroundColor: colors.card,
-    borderRadius: 12,
-    minWidth: 200,
-    maxWidth: '80%',
-    paddingVertical: 8,
-    shadowColor: colors.black,
-    shadowOffset: {
-      width: 0,
-      height: 4,
-    },
-    shadowOpacity: 0.3,
-    shadowRadius: 8,
-    elevation: 8,
   },
   dropdownOption: {
     paddingHorizontal: 16,

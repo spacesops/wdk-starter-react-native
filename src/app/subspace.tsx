@@ -25,6 +25,8 @@ import { NetworkType } from '@/config/networks';
 import { WDKService } from '@/services/wdk-service';
 import { FiatCurrency, pricingService } from '@/services/pricing-service';
 import { resolveTaprootForScriptPubKey } from '@/utils/resolve-taproot-for-script-pubkey';
+import { scriptPubKeyHexToTaprootAddress } from '@/utils/taproot-address-to-spk';
+import getChainsConfig from '@/config/get-chains-config';
 import {
   buildSpacesScanDerivationPaths,
   fullPathToWalletRelativePath,
@@ -84,6 +86,8 @@ type MySpaceRow = {
   /** Must match `pollJobStatus` unified API when resuming on My Spaces. */
   unifiedStatusPurchaseType?: 'subname' | 'pointer';
   scriptPubKeyHex?: string;
+  /** BIP-86 full derivation path reserved at purchase time. */
+  taprootDerivationPath?: string;
   chainPresence?: 'on-chain' | 'off-chain';
   listnumsLastDataHex?: string;
   /** Tx that created the latest on-chain num (from listnums) — required to spend the 1077-sat output. */
@@ -108,6 +112,7 @@ function mergeMySpaceRowIntoSpaceData(
     jobId: space.jobId ?? prev?.jobId,
     unifiedStatusPurchaseType: space.unifiedStatusPurchaseType ?? prev?.unifiedStatusPurchaseType,
     scriptPubKeyHex: space.scriptPubKeyHex ?? prev?.scriptPubKeyHex ?? scriptPubKeyHexParam,
+    taprootDerivationPath: space.taprootDerivationPath ?? prev?.taprootDerivationPath,
     chainPresence: space.chainPresence ?? prev?.chainPresence,
     listnumsLastDataHex: space.listnumsLastDataHex ?? prev?.listnumsLastDataHex,
     priorTxid: space.priorTxid ?? prev?.priorTxid,
@@ -744,38 +749,42 @@ export default function SubspaceScreen() {
       setTaprootAddressLoading(false);
       return;
     }
+
+    const bitcoinNetwork = (getChainsConfig().bitcoin as { network?: string } | undefined)?.network;
+    const encoded = scriptPubKeyHexToTaprootAddress(spk, bitcoinNetwork);
+    setTaprootReceiveAddress(encoded);
+    setTaprootDerivationPath(spaceData?.taprootDerivationPath?.trim() || null);
+    setTaprootAddressLoading(false);
+
     let cancelled = false;
-    setTaprootAddressLoading(true);
-    resolveTaprootForScriptPubKey(spk)
+    resolveTaprootForScriptPubKey(spk, {
+      derivationPath: spaceData?.taprootDerivationPath,
+    })
       .then((r) => {
-        if (!cancelled) {
-          setTaprootReceiveAddress(r?.address ?? null);
-          setTaprootDerivationPath(r?.derivationPath ?? null);
-          setTaprootKeyMaterial(
-            r
-              ? {
-                  internalPubKeyHex: r.internalPubKeyHex,
-                  privateKeyHex: r.privateKeyHex,
-                  tweakedPrivateKeyHex: r.tweakedPrivateKeyHex,
-                }
-              : null
-          );
+        if (cancelled) return;
+        if (r?.address) {
+          setTaprootReceiveAddress(r.address);
         }
+        if (r?.derivationPath?.trim()) {
+          setTaprootDerivationPath(r.derivationPath);
+        }
+        setTaprootKeyMaterial(
+          r
+            ? {
+                internalPubKeyHex: r.internalPubKeyHex,
+                privateKeyHex: r.privateKeyHex,
+                tweakedPrivateKeyHex: r.tweakedPrivateKeyHex,
+              }
+            : null
+        );
       })
       .catch(() => {
-        if (!cancelled) {
-          setTaprootReceiveAddress(null);
-          setTaprootDerivationPath(null);
-          setTaprootKeyMaterial(null);
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setTaprootAddressLoading(false);
+        // Address/path already filled from script pubkey / stored row.
       });
     return () => {
       cancelled = true;
     };
-  }, [spaceData?.scriptPubKeyHex]);
+  }, [spaceData?.scriptPubKeyHex, spaceData?.taprootDerivationPath]);
 
   useEffect(() => {
     if (showUpdateOnchainModal) {
@@ -1213,6 +1222,9 @@ export default function SubspaceScreen() {
     seedWireFromSubspace: '1' as const,
     ...(spaceData?.chainPresence != null ? { chainPresence: spaceData.chainPresence } : {}),
     ...(spaceData?.scriptPubKeyHex ? { scriptPubKeyHex: spaceData.scriptPubKeyHex } : {}),
+    ...(spaceData?.taprootDerivationPath
+      ? { taprootDerivationPath: spaceData.taprootDerivationPath }
+      : {}),
   };
 
   const handleEditAttributes = async () => {
@@ -1269,7 +1281,9 @@ export default function SubspaceScreen() {
     }
     setUpdateOnchainStep('quoting');
     try {
-      const dest = await resolveTaprootForScriptPubKey(spaceData!.scriptPubKeyHex!);
+      const dest = await resolveTaprootForScriptPubKey(spaceData!.scriptPubKeyHex!, {
+        derivationPath: spaceData?.taprootDerivationPath,
+      });
       if (!dest) {
         toast.error('Script pubkey does not match any configured Spaces scan path');
         setUpdateOnchainStep('intro');

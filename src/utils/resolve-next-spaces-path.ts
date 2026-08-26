@@ -1,15 +1,22 @@
+import { deriveBip86TaprootFromMnemonic } from '@/utils/derive-bip86-taproot';
+import getChainsConfig from '@/config/get-chains-config';
 import {
   buildSpacesScanDerivationPaths,
   fullPathToWalletRelativePath,
   getBitcoinTaprootPathPrefix,
+  getSpacesAccountNumber,
+  parseSpacesScanPathIndex,
 } from '@/utils/spaces-scan-paths';
-import { WDKSpaces } from '@/utils/wdk-spaces';
+import { WDKSpaces, type DerivedTaprootAddressEntry } from '@/utils/wdk-spaces';
 
 export type NextAvailableTaprootPath = {
   fullPath: string;
   relativePath: string;
   scriptPubKeyHex: string;
   address: string;
+  internalPubKeyHex?: string;
+  privateKeyHex?: string;
+  tweakedPrivateKeyHex?: string;
 };
 
 function normalizeSpk(spk: string): string {
@@ -18,12 +25,7 @@ function normalizeSpk(spk: string): string {
 
 /** Last `/0/{index}` segment of a Spaces taproot scan path. */
 export function parseTaprootPathAddressIndex(fullPath: string): number | null {
-  const match = fullPath.trim().match(/\/0\/(\d+)$/);
-  if (!match) {
-    return null;
-  }
-  const idx = Number.parseInt(match[1]!, 10);
-  return Number.isFinite(idx) && idx >= 0 ? idx : null;
+  return parseSpacesScanPathIndex(fullPath);
 }
 
 export function maxUsedTaprootPathIndex(params: {
@@ -34,7 +36,7 @@ export function maxUsedTaprootPathIndex(params: {
   let max = -1;
 
   for (const path of params.reservedDerivationPaths ?? []) {
-    const idx = parseTaprootPathAddressIndex(path);
+    const idx = parseSpacesScanPathIndex(path);
     if (idx !== null && idx > max) {
       max = idx;
     }
@@ -58,40 +60,22 @@ export function maxUsedTaprootPathIndex(params: {
   return max;
 }
 
-async function isScriptPubKeyOnChain(baseUrl: string, scriptPubKeyHex: string): Promise<boolean> {
-  const b = baseUrl.replace(/\/$/, '');
-  const url = `${b}/api/listnums-by-spk?script_pubkey=${encodeURIComponent(scriptPubKeyHex.trim())}`;
-  try {
-    const res = await fetch(url);
-    if (!res.ok) {
-      console.warn('[Spaces] listnums-by-spk (path scan)', { status: res.status, url });
-      return false;
-    }
-    const text = await res.text();
-    let body: unknown;
-    try {
-      body = text ? JSON.parse(text) : null;
-    } catch {
-      body = null;
-    }
-    const nums = (body as { nums?: unknown[] } | null)?.nums;
-    return Array.isArray(nums) && nums.length > 0;
-  } catch (e) {
-    console.warn('[Spaces] listnums-by-spk (path scan) failed', e);
-    return false;
-  }
-}
-
 /**
- * Next BIP-86 scan path: index one greater than the largest already used in My Spaces.
- * Never reuses a reserved derivation path or script pubkey from another row.
+ * Next Spaces scan path: `m/86'/0'/{account}'/0/{max+1}` where `max` is the
+ * highest address index already assigned to a handle.
+ *
+ * When `mnemonic` is provided, derivation is local (no worklet). Use that on
+ * the free-coupon path — `getAccountByPath` hangs during checkout.
  */
 export async function resolveNextAvailableTaprootPath(params: {
-  baseUrl: string;
-  /** Full BIP-86 paths already assigned in My Spaces — never reuse. */
+  /** Unused; kept so callers can pass the Spaces API base URL. */
+  baseUrl?: string;
+  /** Full BIP-86 Spaces-account paths already assigned in My Spaces — never reuse. */
   reservedDerivationPaths?: Iterable<string>;
-  /** Lowercase hex spks already assigned when derivation path is missing on a row. */
+  /** Kept for callers; index is taken from reserved derivation paths only. */
   reservedScriptPubKeys?: Iterable<string>;
+  /** Wallet mnemonic — derive BIP-86 locally instead of the Bare worklet. */
+  mnemonic?: string;
 }): Promise<NextAvailableTaprootPath | null> {
   const fullPaths = buildSpacesScanDerivationPaths();
   if (fullPaths.length === 0) {
@@ -113,28 +97,55 @@ export async function resolveNextAvailableTaprootPath(params: {
     return null;
   }
 
-  let entries: { address?: string; scriptPubKeyHex?: string }[];
+  const maxFromPaths = maxUsedTaprootPathIndex({
+    reservedDerivationPaths: params.reservedDerivationPaths,
+  });
+  const nextIndex = maxFromPaths + 1;
+  if (nextIndex < 0 || nextIndex >= fullPaths.length) {
+    console.warn('[Spaces] resolveNextAvailableTaprootPath: no unused path after index', maxFromPaths);
+    return null;
+  }
+
+  const rel = rels[nextIndex];
+  const fullPath = fullPaths[nextIndex] ?? `m/${bip}'/${coinType}'/${rel}`;
+  if (!rel) {
+    return null;
+  }
+
+  const mnemonic = params.mnemonic?.trim();
+  if (mnemonic) {
+    try {
+      const bitcoinNetwork = (getChainsConfig().bitcoin as { network?: string } | undefined)?.network;
+      const derived = deriveBip86TaprootFromMnemonic({
+        mnemonic,
+        account: getSpacesAccountNumber(),
+        index: nextIndex,
+        coinType,
+        network: bitcoinNetwork,
+      });
+      console.log('[Spaces] resolveNextAvailableTaprootPath: local BIP-86 derive', {
+        maxFromPaths,
+        fullPath: derived.fullPath,
+        address: derived.address,
+      });
+      return derived;
+    } catch (e) {
+      console.error('[Spaces] local BIP-86 derive failed:', e);
+      return null;
+    }
+  }
+
+  let entry: DerivedTaprootAddressEntry | undefined;
   try {
-    const { addressesJson } = await WDKSpaces.deriveTaprootAddressesFromPaths(rels);
-    entries = JSON.parse(addressesJson) as { address?: string; scriptPubKeyHex?: string }[];
+    const { addressesJson } = await WDKSpaces.deriveTaprootAddressesFromPaths([rel], {
+      includeKeyMaterial: true,
+    });
+    entry = (JSON.parse(addressesJson) as DerivedTaprootAddressEntry[])[0];
   } catch (e) {
     console.error('[Spaces] deriveTaprootAddressesFromPaths failed:', e);
     return null;
   }
 
-  const maxUsedIndex = maxUsedTaprootPathIndex({
-    reservedDerivationPaths: params.reservedDerivationPaths,
-    reservedScriptPubKeys: params.reservedScriptPubKeys,
-    pathEntries: entries,
-  });
-  const nextIndex = maxUsedIndex + 1;
-
-  if (nextIndex >= fullPaths.length) {
-    console.warn('[Spaces] resolveNextAvailableTaprootPath: no paths left after index', maxUsedIndex);
-    return null;
-  }
-
-  const entry = entries[nextIndex];
   const spk = entry?.scriptPubKeyHex?.trim();
   const address = entry?.address?.trim();
   if (!spk || !address) {
@@ -142,25 +153,22 @@ export async function resolveNextAvailableTaprootPath(params: {
     return null;
   }
 
-  const onChain = await isScriptPubKeyOnChain(params.baseUrl, spk);
-  if (onChain) {
-    console.warn(
-      '[Spaces] resolveNextAvailableTaprootPath: next path index already on-chain',
-      nextIndex
-    );
-    return null;
-  }
-
-  const fullPath = fullPaths[nextIndex] ?? `m/${bip}'/${coinType}'/${rels[nextIndex]}`;
   console.log('[Spaces] resolveNextAvailableTaprootPath: selected index', nextIndex, {
-    maxUsedIndex,
+    maxFromPaths,
     fullPath,
+    address,
+    hasPrivateKey: Boolean(entry.privateKeyHex),
+    hasTweakedPrivateKey: Boolean(entry.tweakedPrivateKeyHex),
+    hasInternalPubKey: Boolean(entry.internalPubKeyHex),
   });
 
   return {
     fullPath,
-    relativePath: rels[nextIndex]!,
+    relativePath: rel,
     scriptPubKeyHex: spk,
     address,
+    internalPubKeyHex: entry.internalPubKeyHex,
+    privateKeyHex: entry.privateKeyHex,
+    tweakedPrivateKeyHex: entry.tweakedPrivateKeyHex,
   };
 }

@@ -19,6 +19,31 @@ export function getBitcoinTaprootPathPrefix(): { bip: number; coinType: number }
   return { bip, coinType };
 }
 
+/** Hardened account index for Spaces handles (`m/86'/0'/{account}'/0/x`). */
+export function getSpacesAccountNumber(): number {
+  const accountRaw =
+    process.env.EXPO_PUBLIC_SPACES_ACCOUNT_NUMBER ?? process.env.SPACES_ACCOUNT_NUMBER ?? '0';
+  const account = Number.parseInt(String(accountRaw), 10);
+  return Number.isFinite(account) && account >= 0 ? account : 0;
+}
+
+/**
+ * Address index `x` when `fullPath` is a Spaces scan path
+ * `m/{bip}'/{coin}'/{account}'/0/x` (account from EXPO_PUBLIC_SPACES_ACCOUNT_NUMBER).
+ */
+export function parseSpacesScanPathIndex(fullPath: string): number | null {
+  const { bip, coinType } = getBitcoinTaprootPathPrefix();
+  const account = getSpacesAccountNumber();
+  const match = fullPath
+    .trim()
+    .match(new RegExp(`^m/${bip}'/${coinType}'/${account}'/0/(\\d+)$`));
+  if (!match) {
+    return null;
+  }
+  const idx = Number.parseInt(match[1]!, 10);
+  return Number.isFinite(idx) && idx >= 0 ? idx : null;
+}
+
 /**
  * Strips m/{bip}'/{coin}'/ from a full path → suffix passed to getAccountByPath (e.g. 9'/0/0).
  */
@@ -40,13 +65,10 @@ export function fullPathToWalletRelativePath(
  */
 export function buildSpacesScanDerivationPaths(): string[] {
   const { bip, coinType } = getBitcoinTaprootPathPrefix();
+  const account = getSpacesAccountNumber();
 
-  const accountRaw =
-    process.env.EXPO_PUBLIC_SPACES_ACCOUNT_NUMBER ?? process.env.SPACES_ACCOUNT_NUMBER ?? '0';
   const gapRaw =
     process.env.EXPO_PUBLIC_SPACES_ACCOUNT_GAP ?? process.env.SPACES_ACCOUNT_GAP ?? '1';
-
-  const account = Number.parseInt(String(accountRaw), 10);
   const gap = Number.parseInt(String(gapRaw), 10);
 
   if (!Number.isFinite(account) || account < 0 || !Number.isFinite(gap) || gap < 1) {

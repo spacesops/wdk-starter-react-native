@@ -29,17 +29,27 @@ type TaprootKeyMaterialHex = {
   tweakedPrivateKeyHex?: string;
 } | null;
 
+const derivedByRelativePath = new Map<string, DerivedTaprootAddressEntry>();
+
+function hasKeyMaterial(entry: DerivedTaprootAddressEntry | undefined): boolean {
+  return Boolean(
+    entry?.internalPubKeyHex && entry.privateKeyHex && entry.tweakedPrivateKeyHex
+  );
+}
+
 /**
  * Derive Taproot addresses / scriptPubKeys / optional key material for BIP-relative paths
  * via worklet `callMethodByPath` → `getAccountByPath`.
  */
 async function deriveTaprootAddressesFromPaths(
-  relativePaths: string[]
+  relativePaths: string[],
+  options?: { includeKeyMaterial?: boolean }
 ): Promise<{ addressesJson: string }> {
   if (!Array.isArray(relativePaths)) {
     throw new Error('relativePaths must be an array of path suffix strings');
   }
 
+  const wantKeys = Boolean(options?.includeKeyMaterial);
   const entries: DerivedTaprootAddressEntry[] = [];
 
   for (const rel of relativePaths) {
@@ -47,45 +57,59 @@ async function deriveTaprootAddressesFromPaths(
       throw new Error('Each relative path must be a non-empty string');
     }
     const path = rel.trim();
-
-    const address = await AccountService.callAccountMethodByPath<string>(
-      'bitcoin',
-      path,
-      'getAddress'
-    );
-    if (typeof address !== 'string' || address.length === 0) {
-      throw new Error(`getAddress returned no address for path ${path}`);
+    const cached = derivedByRelativePath.get(path);
+    if (cached && (!wantKeys || hasKeyMaterial(cached))) {
+      entries.push(cached);
+      continue;
     }
 
-    const scriptPubKeyHex = await AccountService.callAccountMethodByPath<string>(
-      'bitcoin',
-      path,
-      'getScriptPubKeyHex',
-      address
-    );
-    if (typeof scriptPubKeyHex !== 'string' || scriptPubKeyHex.length === 0) {
-      throw new Error(`getScriptPubKeyHex returned empty for path ${path}`);
-    }
+    const entry: DerivedTaprootAddressEntry = { ...(cached ?? { address: '', scriptPubKeyHex: '' }) };
 
-    const entry: DerivedTaprootAddressEntry = { address, scriptPubKeyHex };
-
-    try {
-      const keys = await AccountService.callAccountMethodByPath<TaprootKeyMaterialHex>(
+    if (!entry.address) {
+      const address = await AccountService.callAccountMethodByPath<string>(
         'bitcoin',
         path,
-        'getTaprootKeyMaterialHex'
+        'getAddress'
       );
-      if (keys && typeof keys === 'object') {
-        if (keys.internalPubKeyHex) entry.internalPubKeyHex = keys.internalPubKeyHex;
-        if (keys.privateKeyHex) entry.privateKeyHex = keys.privateKeyHex;
-        if (keys.tweakedPrivateKeyHex) {
-          entry.tweakedPrivateKeyHex = keys.tweakedPrivateKeyHex;
-        }
+      if (typeof address !== 'string' || address.length === 0) {
+        throw new Error(`getAddress returned no address for path ${path}`);
       }
-    } catch {
-      // Key material is optional for Find Spaces / path reservation.
+      entry.address = address;
     }
 
+    if (!entry.scriptPubKeyHex) {
+      const scriptPubKeyHex = await AccountService.callAccountMethodByPath<string>(
+        'bitcoin',
+        path,
+        'getScriptPubKeyHex',
+        entry.address
+      );
+      if (typeof scriptPubKeyHex !== 'string' || scriptPubKeyHex.length === 0) {
+        throw new Error(`getScriptPubKeyHex returned empty for path ${path}`);
+      }
+      entry.scriptPubKeyHex = scriptPubKeyHex;
+    }
+
+    if (wantKeys && !hasKeyMaterial(entry)) {
+      try {
+        const keys = await AccountService.callAccountMethodByPath<TaprootKeyMaterialHex>(
+          'bitcoin',
+          path,
+          'getTaprootKeyMaterialHex'
+        );
+        if (keys && typeof keys === 'object') {
+          if (keys.internalPubKeyHex) entry.internalPubKeyHex = keys.internalPubKeyHex;
+          if (keys.privateKeyHex) entry.privateKeyHex = keys.privateKeyHex;
+          if (keys.tweakedPrivateKeyHex) {
+            entry.tweakedPrivateKeyHex = keys.tweakedPrivateKeyHex;
+          }
+        }
+      } catch (e) {
+        console.warn('[Spaces] getTaprootKeyMaterialHex failed for', path, e);
+      }
+    }
+
+    derivedByRelativePath.set(path, entry);
     entries.push(entry);
   }
 

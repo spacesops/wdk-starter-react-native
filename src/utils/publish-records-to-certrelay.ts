@@ -161,6 +161,7 @@ export type PublishRecordsToCertrelayParams = {
   recordsWireHex: string;
   certificate: unknown;
   scriptPubKeyHex: string;
+  derivationPath?: string;
   relayUrls?: string[];
 };
 
@@ -205,7 +206,9 @@ export async function publishRecordsToCertrelay(
     });
   }
 
-  const taproot = await resolveTaprootForScriptPubKey(params.scriptPubKeyHex);
+  const taproot = await resolveTaprootForScriptPubKey(params.scriptPubKeyHex, {
+    derivationPath: params.derivationPath,
+  });
   if (!taproot?.tweakedPrivateKeyHex) {
     throw new Error('Script pubkey does not match any configured Spaces scan path.');
   }

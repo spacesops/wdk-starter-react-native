@@ -80,6 +80,7 @@ export default function HexToolScreen() {
     hexToolMode: hexToolModeParam,
     primaryRecordsHex: primaryRecordsHexParam,
     scriptPubKeyHex: scriptPubKeyHexParam,
+    taprootDerivationPath: taprootDerivationPathParam,
   } = useLocalSearchParams<{
     subspace?: string;
     spaceName?: string;
@@ -93,6 +94,7 @@ export default function HexToolScreen() {
     /** Primary zone records hex when editing attributes. */
     primaryRecordsHex?: string;
     scriptPubKeyHex?: string;
+    taprootDerivationPath?: string;
   }>();
 
   const hexToolMode: HexToolMode = hexToolModeParam === 'attributes' ? 'attributes' : 'fallback';
@@ -462,6 +464,9 @@ export default function HexToolScreen() {
         recordsWireHex: trimmed,
         certificate: payload.certificate,
         scriptPubKeyHex: scriptPubKeyHexParam.trim(),
+        ...(typeof taprootDerivationPathParam === 'string' && taprootDerivationPathParam.trim()
+          ? { derivationPath: taprootDerivationPathParam.trim() }
+          : {}),
       });
       router.back();
     } catch (e) {
