@@ -18,6 +18,8 @@ import {
 import { colors } from '@/constants/colors';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
 import { publishRecordsToCertrelay } from '@/utils/publish-records-to-certrelay';
+import { resolveCurrentWalletId } from '@/utils/resolve-current-wallet-id';
+import { useWalletManager } from '@spacesops/wdk-react-native-core';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Clipboard from 'expo-clipboard';
 import { useLocalSearchParams } from 'expo-router';
@@ -106,6 +108,8 @@ function getKeyLabel(key: string): string {
 export default function HexToolScreen() {
   const insets = useSafeAreaInsets();
   const router = useDebouncedNavigation();
+  const { wallets, activeWalletId } = useWalletManager();
+  const currentWalletId = resolveCurrentWalletId(activeWalletId, wallets);
   const {
     subspace,
     spaceName,
@@ -509,6 +513,7 @@ export default function HexToolScreen() {
         recordsWireHex: trimmed,
         certificate: payload.certificate,
         scriptPubKeyHex: scriptPubKeyHexParam.trim(),
+        walletId: currentWalletId,
         ...(typeof taprootDerivationPathParam === 'string' && taprootDerivationPathParam.trim()
           ? { derivationPath: taprootDerivationPathParam.trim() }
           : {}),

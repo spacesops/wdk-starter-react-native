@@ -24,6 +24,8 @@ import { AssetTicker } from '@/config/assets';
 import { NetworkType } from '@/config/networks';
 import { WDKService } from '@/services/wdk-service';
 import { FiatCurrency, pricingService } from '@/services/pricing-service';
+import { useWalletManager } from '@spacesops/wdk-react-native-core';
+import { resolveCurrentWalletId } from '@/utils/resolve-current-wallet-id';
 import { resolveTaprootForScriptPubKey } from '@/utils/resolve-taproot-for-script-pubkey';
 import { scriptPubKeyHexToTaprootAddress } from '@/utils/taproot-address-to-spk';
 import getChainsConfig from '@/config/get-chains-config';
@@ -680,6 +682,8 @@ function taprootXOnlyPubkeyHexFromScriptPubkeyHex(scriptPubkeyHex: string): stri
 export default function SubspaceScreen() {
   const insets = useSafeAreaInsets();
   const router = useDebouncedNavigation();
+  const { wallets, activeWalletId } = useWalletManager();
+  const currentWalletId = resolveCurrentWalletId(activeWalletId, wallets);
   const {
     subspace,
     spaceName,
@@ -759,6 +763,7 @@ export default function SubspaceScreen() {
     let cancelled = false;
     resolveTaprootForScriptPubKey(spk, {
       derivationPath: spaceData?.taprootDerivationPath,
+      walletId: currentWalletId,
     })
       .then((r) => {
         if (cancelled) return;
@@ -784,7 +789,7 @@ export default function SubspaceScreen() {
     return () => {
       cancelled = true;
     };
-  }, [spaceData?.scriptPubKeyHex, spaceData?.taprootDerivationPath]);
+  }, [spaceData?.scriptPubKeyHex, spaceData?.taprootDerivationPath, currentWalletId]);
 
   useEffect(() => {
     if (showUpdateOnchainModal) {
@@ -1302,6 +1307,7 @@ export default function SubspaceScreen() {
     try {
       const dest = await resolveTaprootForScriptPubKey(spaceData!.scriptPubKeyHex!, {
         derivationPath: spaceData?.taprootDerivationPath,
+        walletId: currentWalletId,
       });
       if (!dest) {
         toast.error('Script pubkey does not match any configured Spaces scan path');

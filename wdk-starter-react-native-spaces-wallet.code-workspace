@@ -11,6 +11,12 @@
 		},
 		{
 			"path": "../react-native-bare-kit"
+		},
+		{
+			"path": "../spacesops"
+		},
+		{
+			"path": "../wdk-wallet-btc"
 		}
 	],
 	"settings": {

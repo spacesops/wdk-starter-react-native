@@ -151,7 +151,7 @@ function electrumCall(socket, method, params, id) {
     };
 
     socket.on('data', onData);
-    socket.write(JSON.stringify({ id, method, params }) + '\n');
+    socket.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
   });
 }
 

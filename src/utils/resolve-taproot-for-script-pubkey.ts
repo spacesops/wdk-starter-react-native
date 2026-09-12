@@ -135,7 +135,7 @@ async function derivePathLocally(params: {
 
 export async function resolveTaprootForScriptPubKey(
   scriptPubKeyHex: string,
-  options?: { derivationPath?: string }
+  options?: { derivationPath?: string; walletId?: string }
 ): Promise<TaprootKeyMaterial | null> {
   const bitcoinNetwork = (getChainsConfig().bitcoin as { network?: string } | undefined)?.network;
   const encodedAddress = scriptPubKeyHexToTaprootAddress(scriptPubKeyHex, bitcoinNetwork);
@@ -144,7 +144,7 @@ export async function resolveTaprootForScriptPubKey(
   const storedPath = options?.derivationPath?.trim();
 
   try {
-    const mnemonic = await getMnemonicWithoutWorklet();
+    const mnemonic = await getMnemonicWithoutWorklet(options?.walletId);
     if (mnemonic) {
       const local = await derivePathLocally({
         mnemonic,

@@ -11,7 +11,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.lcfx.spaceswallet",
-      "buildNumber": "14",
+      "buildNumber": "15",
       "infoPlist": {
         "UIStatusBarStyle": "UIStatusBarStyleLightContent",
         "UIViewControllerBasedStatusBarAppearance": false,
@@ -30,7 +30,7 @@
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
       "package": "com.lcfx.spaceswallet",
-      "versionCode": 14,
+      "versionCode": 15,
       "permissions": [
         "android.permission.CAMERA"
       ]

@@ -18,17 +18,37 @@ const PACKAGES_WITH_BIN_MIRROR = [
   'expo-modules-core',
 ];
 
+/** Eclipse/Java-LS copies of the included Gradle plugin projects. Packaging from these yields a JAR that has the plugin descriptor but not DevLauncherPlugin / ExpoModulesGradlePlugin. */
+const GRADLE_PLUGIN_BIN_MIRRORS = [
+  path.join('expo-dev-launcher', 'expo-dev-launcher-gradle-plugin'),
+  path.join('expo-modules-core', 'expo-module-gradle-plugin'),
+];
+
+function removeDir(relParts, label) {
+  const dir = path.join(projectRoot, 'node_modules', ...relParts);
+  if (!fs.existsSync(dir)) {
+    return false;
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+  console.log(`[patch-expo-android-bin] removed ${label}`);
+  return true;
+}
+
 function main() {
   let removed = 0;
 
   for (const pkg of PACKAGES_WITH_BIN_MIRROR) {
-    const binDir = path.join(projectRoot, 'node_modules', pkg, 'android', 'bin');
-    if (!fs.existsSync(binDir)) {
-      continue;
+    if (removeDir([pkg, 'android', 'bin'], `${pkg}/android/bin`)) {
+      removed += 1;
     }
-    fs.rmSync(binDir, { recursive: true, force: true });
-    console.log(`[patch-expo-android-bin] removed ${pkg}/android/bin`);
-    removed += 1;
+  }
+
+  for (const rel of GRADLE_PLUGIN_BIN_MIRRORS) {
+    if (removeDir([rel, 'bin'], `${rel}/bin`)) {
+      removed += 1;
+      // Force Kotlin to recompile into the plugin JAR (bin copies yield a descriptor-only JAR).
+      removeDir([rel, 'build'], `${rel}/build`);
+    }
   }
 
   if (removed === 0) {
