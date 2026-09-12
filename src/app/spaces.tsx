@@ -68,6 +68,12 @@ import {
   type VerifiedZoneSummary,
 } from '@/utils/extract-zone-attributes';
 import { resolveTaprootPurchaseRequiredSats } from '@/utils/estimate-taproot-memo-fee';
+import {
+  computePurchasePaymentOutputs,
+  hasPurchaseRevenueSplit,
+  type PurchasePaymentOutput,
+} from '@/utils/compute-purchase-payment-outputs';
+import type { BtcPaymentOutput } from '@/services/wdk-service';
 import * as Clipboard from 'expo-clipboard';
 import { toast } from 'sonner-native';
 
@@ -1166,6 +1172,10 @@ export default function SpacesScreen() {
     handle: string;
     total_price: number;
     expiring_blockheight: number;
+    tenant_payment_address?: string;
+    platform_revenue_percent?: number;
+    affiliate_payment_address?: string;
+    affiliate_revenue_percent?: number;
   } | null>(null);
   const [showTxHexModal, setShowTxHexModal] = useState(false);
   const [txHex, setTxHex] = useState<string>('');
@@ -1177,6 +1187,7 @@ export default function SpacesScreen() {
     recipientAddress: string;
     asset: AssetTicker;
     memo?: string;
+    paymentOutputs?: BtcPaymentOutput[];
   } | null>(null);
   type UnifiedStatus =
     | 'pending_payment'
@@ -2343,28 +2354,15 @@ export default function SpacesScreen() {
       setIsButtonEnabled(false);
       setButtonLabel('Broadcasting...');
 
-      let txHash: string;
-
-      if (txHexData.scriptType === 'P2TR' && txHexData.memo) {
-        // P2TR transaction with memo
-        txHash = await WDKService.sendByNetworkWithMemo(
-          txHexData.network,
-          txHexData.accountIndex,
-          txHexData.amount / 100000000, // Convert to BTC
-          txHexData.recipientAddress,
-          txHexData.asset,
-          txHexData.memo
-        );
-      } else {
-        // P2WPKH transaction without memo
-        txHash = await WDKService.sendByNetwork(
-          txHexData.network,
-          txHexData.accountIndex,
-          txHexData.amount / 100000000, // Convert to BTC
-          txHexData.recipientAddress,
-          txHexData.asset
-        );
+      if (!txHex?.trim()) {
+        throw new Error('Transaction hex not available. Compose the transaction again.');
       }
+
+      const txHash = await WDKService.sendRawTransaction(
+        txHexData.network,
+        txHexData.accountIndex,
+        txHex
+      );
 
       console.log('[Spaces] Transaction broadcasted successfully:', txHash);
       const hashStr = typeof txHash === 'object' && txHash !== null ? (txHash as any).hash ?? JSON.stringify(txHash) : String(txHash);
@@ -2841,11 +2839,36 @@ export default function SpacesScreen() {
         // Note: Both methods use confirmationTarget: 1 by default.
         // TODO: Update WDKService to accept conf_target parameter and use getConfTarget(selectedDuration)
         // to match the user's selected duration.
+        const paymentOutputs: BtcPaymentOutput[] = computePurchasePaymentOutputs({
+          totalPriceSats: paymentAmountSats,
+          taprootAddress: purchaseData.taproot_address,
+          tenantPaymentAddress: purchaseData.tenant_payment_address,
+          platformRevenuePercent: purchaseData.platform_revenue_percent,
+          affiliatePaymentAddress: purchaseData.affiliate_payment_address,
+          affiliateRevenuePercent: purchaseData.affiliate_revenue_percent,
+        });
+        const usesRevenueSplit = hasPurchaseRevenueSplit({
+          totalPriceSats: paymentAmountSats,
+          taprootAddress: purchaseData.taproot_address,
+          tenantPaymentAddress: purchaseData.tenant_payment_address,
+        });
+        const extraPaymentOutputCount = Math.max(0, paymentOutputs.length - 1);
+
+        console.log('[Spaces] Purchase payment outputs:', {
+          usesRevenueSplit,
+          outputCount: paymentOutputs.length,
+          paymentOutputs,
+        });
+
+        const btcBalance = balances?.list?.find(
+          (b) => b.networkType === NetworkType.SEGWIT && b.denomination === AssetTicker.BTC
+        );
+        const balanceBTC = btcBalance ? parseFloat(btcBalance.value) : 0;
+        const balanceSats = balanceBTC * 100000000;
+        const requestedSats = paymentAmountSats;
         let transactionHex: string;
 
         if (scriptType === 'P2TR') {
-          // P2TR (Taproot) - use memo method
-          // WDKService expects amount in BTC; total_price is in sats
           const quoteOptions = {
             network: NetworkType.SEGWIT,
             accountIndex: 0,
@@ -2854,32 +2877,23 @@ export default function SpacesScreen() {
             asset: AssetTicker.BTC,
             memo: purchaseData.handle,
           };
-          console.log(
-            '[Spaces] quoteSendByNetworkWithMemoTX options:',
-            JSON.stringify(quoteOptions, null, 2)
-          );
+          console.log('[Spaces] P2TR compose options:', JSON.stringify(quoteOptions, null, 2));
 
-          // Check balance before attempting transaction (including fees)
-          const btcBalance = balances?.list?.find(
-            (b) => b.networkType === NetworkType.SEGWIT && b.denomination === AssetTicker.BTC
-          );
-          // Convert balance from BTC to satoshis (balance.value is in BTC, multiply by 100M)
-          const balanceBTC = btcBalance ? parseFloat(btcBalance.value) : 0;
-          const balanceSats = balanceBTC * 100000000;
-
-          // Estimate transaction fee to check if we have enough balance
-          const requestedSats = paymentAmountSats;
           let quotedFeeSats: number | null = null;
           try {
-            const feeQuote = await WDKService.quoteSendByNetworkWithMemo(
-              quoteOptions.network,
-              quoteOptions.accountIndex,
-              quoteOptions.amount,
-              quoteOptions.recipientAddress,
-              quoteOptions.asset,
-              quoteOptions.memo
-            );
-            quotedFeeSats = Math.round(feeQuote * 100000000);
+            if (usesRevenueSplit) {
+              quotedFeeSats = null;
+            } else {
+              const feeQuote = await WDKService.quoteSendByNetworkWithMemo(
+                quoteOptions.network,
+                quoteOptions.accountIndex,
+                quoteOptions.amount,
+                quoteOptions.recipientAddress,
+                quoteOptions.asset,
+                quoteOptions.memo
+              );
+              quotedFeeSats = Math.round(feeQuote * 100000000);
+            }
           } catch (feeError) {
             console.warn(
               '[Spaces] Fee quote failed; using conservative Taproot memo estimate:',
@@ -2891,45 +2905,44 @@ export default function SpacesScreen() {
             resolveTaprootPurchaseRequiredSats(
               requestedSats,
               purchaseData.handle,
-              quotedFeeSats
+              quotedFeeSats,
+              extraPaymentOutputCount
             );
 
           console.log('[Spaces] Balance check (P2TR):', {
-            balanceBTC: balanceBTC.toFixed(8),
             balanceSats: Math.round(balanceSats),
             requestedAmountSats: requestedSats,
-            requestedAmountBTC: quoteOptions.amount.toFixed(8),
             estimatedFeeSats,
             feeSource,
             totalRequiredSats,
+            extraPaymentOutputCount,
             sufficient: balanceSats >= totalRequiredSats,
           });
 
           if (balanceSats < totalRequiredSats) {
             const shortfall = totalRequiredSats - balanceSats;
-            console.error('[Spaces] Insufficient balance (including fees) - P2TR:', {
-              balanceSats: Math.round(balanceSats),
-              requestedSats,
-              estimatedFeeSats,
-              totalRequiredSats,
-              shortfall,
-            });
             throw new Error(
               `Insufficient balance. Have ${Math.round(balanceSats)} sats, need ${totalRequiredSats} sats (${requestedSats} amount + ${estimatedFeeSats} fee, shortfall: ${shortfall} sats)`
             );
           }
 
-          transactionHex = await WDKService.quoteSendByNetworkWithMemoTX(
-            quoteOptions.network,
-            quoteOptions.accountIndex,
-            quoteOptions.amount,
-            quoteOptions.recipientAddress,
-            quoteOptions.asset,
-            quoteOptions.memo
-          );
+          transactionHex = usesRevenueSplit
+            ? await WDKService.quoteSendByNetworkWithMemoAndOutputsTX(
+                quoteOptions.network,
+                quoteOptions.accountIndex,
+                paymentOutputs,
+                quoteOptions.asset,
+                quoteOptions.memo
+              )
+            : await WDKService.quoteSendByNetworkWithMemoTX(
+                quoteOptions.network,
+                quoteOptions.accountIndex,
+                quoteOptions.amount,
+                quoteOptions.recipientAddress,
+                quoteOptions.asset,
+                quoteOptions.memo
+              );
         } else {
-          // P2WPKH (Native SegWit) - use non-memo method
-          // WDKService expects amount in BTC; total_price is in sats
           const quoteOptions = {
             network: NetworkType.SEGWIT,
             accountIndex: 0,
@@ -2937,68 +2950,63 @@ export default function SpacesScreen() {
             recipientAddress: purchaseData.taproot_address,
             asset: AssetTicker.BTC,
           };
-          console.log(
-            '[Spaces] quoteSendByNetworkTX options:',
-            JSON.stringify(quoteOptions, null, 2)
-          );
+          console.log('[Spaces] P2WPKH compose options:', JSON.stringify(quoteOptions, null, 2));
 
-          // Check balance before attempting transaction (including fees)
-          const btcBalance = balances?.list?.find(
-            (b) => b.networkType === NetworkType.SEGWIT && b.denomination === AssetTicker.BTC
-          );
-          // Convert balance from BTC to satoshis (balance.value is in BTC, multiply by 100M)
-          const balanceBTC = btcBalance ? parseFloat(btcBalance.value) : 0;
-          const balanceSats = balanceBTC * 100000000;
-
-          // Estimate transaction fee to check if we have enough balance
           let estimatedFeeSats = 0;
           let totalRequiredSats = paymentAmountSats;
           try {
-            const feeQuote = await WDKService.quoteSendByNetwork(
-              quoteOptions.network,
-              quoteOptions.accountIndex,
-              quoteOptions.amount,
-              quoteOptions.recipientAddress,
-              quoteOptions.asset
-            );
-            estimatedFeeSats = Math.round(feeQuote * 100000000);
+            if (!usesRevenueSplit) {
+              const feeQuote = await WDKService.quoteSendByNetwork(
+                quoteOptions.network,
+                quoteOptions.accountIndex,
+                quoteOptions.amount,
+                quoteOptions.recipientAddress,
+                quoteOptions.asset
+              );
+              estimatedFeeSats = Math.round(feeQuote * 100000000);
+            } else {
+              estimatedFeeSats = resolveTaprootPurchaseRequiredSats(
+                requestedSats,
+                purchaseData.handle,
+                null,
+                extraPaymentOutputCount
+              ).estimatedFeeSats;
+            }
             totalRequiredSats = paymentAmountSats + estimatedFeeSats;
           } catch (feeError) {
             console.warn('[Spaces] Could not estimate fee, using amount only:', feeError);
           }
 
           console.log('[Spaces] Balance check:', {
-            balanceBTC: balanceBTC.toFixed(8),
             balanceSats: Math.round(balanceSats),
             requestedAmountSats: paymentAmountSats,
-            requestedAmountBTC: quoteOptions.amount.toFixed(8),
             estimatedFeeSats,
             totalRequiredSats,
+            usesRevenueSplit,
             sufficient: balanceSats >= totalRequiredSats,
           });
 
           if (balanceSats < totalRequiredSats) {
             const shortfall = totalRequiredSats - balanceSats;
-            console.error('[Spaces] Insufficient balance (including fees):', {
-              balanceBTC: balanceBTC.toFixed(8),
-              balanceSats: Math.round(balanceSats),
-              requestedAmountSats: paymentAmountSats,
-              estimatedFeeSats,
-              totalRequiredSats,
-              shortfall: Math.round(shortfall),
-            });
             throw new Error(
               `Insufficient balance. Have ${Math.round(balanceSats)} sats, need ${totalRequiredSats} sats (${paymentAmountSats} amount + ${estimatedFeeSats} fee, shortfall: ${shortfall} sats)`
             );
           }
 
-          transactionHex = await WDKService.quoteSendByNetworkTX(
-            quoteOptions.network,
-            quoteOptions.accountIndex,
-            quoteOptions.amount,
-            quoteOptions.recipientAddress,
-            quoteOptions.asset
-          );
+          transactionHex = usesRevenueSplit
+            ? await WDKService.quoteSendByNetworkWithOutputsTX(
+                quoteOptions.network,
+                quoteOptions.accountIndex,
+                paymentOutputs,
+                quoteOptions.asset
+              )
+            : await WDKService.quoteSendByNetworkTX(
+                quoteOptions.network,
+                quoteOptions.accountIndex,
+                quoteOptions.amount,
+                quoteOptions.recipientAddress,
+                quoteOptions.asset
+              );
         }
 
         // Log full transaction hex for verification
@@ -3007,26 +3015,16 @@ export default function SpacesScreen() {
         console.log('[Spaces] Transaction hex generated:', transactionHex.substring(0, 50) + '...');
 
         // Store transaction data for broadcasting
-        if (scriptType === 'P2TR') {
-          setTxHexData({
-            scriptType: 'P2TR',
-            network: NetworkType.SEGWIT,
-            accountIndex: 0,
-            amount: paymentAmountSats,
-            recipientAddress: purchaseData.taproot_address,
-            asset: AssetTicker.BTC,
-            memo: purchaseData.handle,
-          });
-        } else {
-          setTxHexData({
-            scriptType: 'P2WPKH',
-            network: NetworkType.SEGWIT,
-            accountIndex: 0,
-            amount: paymentAmountSats,
-            recipientAddress: purchaseData.taproot_address,
-            asset: AssetTicker.BTC,
-          });
-        }
+        setTxHexData({
+          scriptType,
+          network: NetworkType.SEGWIT,
+          accountIndex: 0,
+          amount: paymentAmountSats,
+          recipientAddress: purchaseData.taproot_address,
+          asset: AssetTicker.BTC,
+          ...(scriptType === 'P2TR' ? { memo: purchaseData.handle } : {}),
+          paymentOutputs,
+        });
 
         // Add subspace to My Spaces list with "purchasing" status
         const subspaceTrimmed = subspace.trim();
@@ -3462,6 +3460,22 @@ export default function SpacesScreen() {
         handle: data.handle,
         total_price: data.total_price,
         expiring_blockheight: data.expiring_blockheight,
+        tenant_payment_address:
+          typeof data.tenant_payment_address === 'string'
+            ? data.tenant_payment_address
+            : undefined,
+        platform_revenue_percent:
+          typeof data.platform_revenue_percent === 'number'
+            ? data.platform_revenue_percent
+            : undefined,
+        affiliate_payment_address:
+          typeof data.affiliate_payment_address === 'string'
+            ? data.affiliate_payment_address
+            : undefined,
+        affiliate_revenue_percent:
+          typeof data.affiliate_revenue_percent === 'number'
+            ? data.affiliate_revenue_percent
+            : undefined,
       });
       setIsConfirmationMode(true);
 
@@ -3762,6 +3776,45 @@ export default function SpacesScreen() {
     sptrFee6,
     sptrFee48,
   ]);
+
+  const purchaseRevenueSplitOutputs = useMemo((): PurchasePaymentOutput[] | null => {
+    if (!purchaseData?.taproot_address || !purchaseData.tenant_payment_address?.trim()) {
+      return null;
+    }
+    const paymentTotal = getDiscountedTotal() ?? purchaseData.total_price;
+    if (paymentTotal <= 0) {
+      return null;
+    }
+    try {
+      return computePurchasePaymentOutputs({
+        totalPriceSats: paymentTotal,
+        taprootAddress: purchaseData.taproot_address,
+        tenantPaymentAddress: purchaseData.tenant_payment_address,
+        platformRevenuePercent: purchaseData.platform_revenue_percent,
+        affiliatePaymentAddress: purchaseData.affiliate_payment_address,
+        affiliateRevenuePercent: purchaseData.affiliate_revenue_percent,
+      });
+    } catch (error) {
+      console.warn('[Spaces] Could not compute revenue split preview:', error);
+      return null;
+    }
+  }, [getDiscountedTotal, purchaseData]);
+
+  const labelPurchaseSplitOutput = useCallback(
+    (output: PurchasePaymentOutput): string => {
+      if (!purchaseData) return 'payment';
+      if (output.address === purchaseData.taproot_address) {
+        const pct = purchaseData.platform_revenue_percent ?? 0;
+        return `platform (${pct}%)`;
+      }
+      if (output.address === purchaseData.affiliate_payment_address) {
+        const pct = purchaseData.affiliate_revenue_percent ?? 0;
+        return `affiliate (${pct}%)`;
+      }
+      return 'tenant share';
+    },
+    [purchaseData]
+  );
 
   // Initialize pricing service and fetch BTC price
   useEffect(() => {
@@ -4567,6 +4620,25 @@ export default function SpacesScreen() {
                         -{(getBlockFee(selectedDuration, blockFee1, blockFee6, blockFee48) ?? 0).toLocaleString()} sats
                       </Text>
                     </View>
+                  )}
+
+                  {purchaseRevenueSplitOutputs && purchaseRevenueSplitOutputs.length > 1 && (
+                    <>
+                      <View style={styles.purchaseOrderRow}>
+                        <Text style={styles.purchaseOrderItemText}>payment split</Text>
+                        <Text style={styles.purchaseOrderPriceText} />
+                      </View>
+                      {purchaseRevenueSplitOutputs.map((output) => (
+                        <View key={`${output.address}-${output.valueSats}`} style={styles.purchaseOrderRow}>
+                          <Text style={styles.purchaseOrderItemText}>
+                            {labelPurchaseSplitOutput(output)} · {shortenAddress(output.address)}
+                          </Text>
+                          <Text style={styles.purchaseOrderPriceText}>
+                            {output.valueSats.toLocaleString()} sats
+                          </Text>
+                        </View>
+                      ))}
+                    </>
                   )}
 
                   <View style={[styles.purchaseOrderRow, styles.purchaseOrderTotalRow]}>

@@ -46,6 +46,27 @@ function unwrapHash(result: unknown): string {
   return String(result);
 }
 
+export type BtcPaymentOutput = {
+  address: string;
+  valueSats: number;
+};
+
+function toWalletOutputs(outputs: BtcPaymentOutput[]) {
+  return outputs.map(({ address, valueSats }) => ({
+    address,
+    value: valueSats,
+  }));
+}
+
+function unwrapTxHex(result: unknown): string {
+  if (typeof result === 'string') return result;
+  if (result && typeof result === 'object') {
+    const obj = result as { txHex?: string; hex?: string };
+    return obj.txHex || obj.hex || String(result);
+  }
+  return String(result);
+}
+
 export const WDKService = {
   getDenominationValue(token: AssetTicker | string): number {
     switch (String(token).toLowerCase()) {
@@ -163,5 +184,51 @@ export const WDKService = {
     );
     if (typeof result === 'string') return result;
     return result?.txHex || result?.hex || String(result);
+  },
+
+  async sendRawTransaction(
+    network: NetworkType | string,
+    accountIndex: number,
+    transactionHex: string
+  ): Promise<string> {
+    const networkName = toNetworkName(network);
+    const result = await AccountService.callAccountMethod(
+      networkName,
+      accountIndex,
+      'sendTransaction',
+      transactionHex
+    );
+    return unwrapHash(result);
+  },
+
+  async quoteSendByNetworkWithOutputsTX(
+    network: NetworkType | string,
+    accountIndex: number,
+    outputs: BtcPaymentOutput[],
+    _asset: AssetTicker | string
+  ): Promise<string> {
+    const networkName = toNetworkName(network);
+    const result = await AccountService.callAccountMethod(
+      networkName,
+      accountIndex,
+      'quoteSendTransactionWithOutputsTX',
+      { outputs: toWalletOutputs(outputs) }
+    );
+    return unwrapTxHex(result);
+  },
+
+  async quoteSendByNetworkWithMemoAndOutputsTX(
+    network: NetworkType | string,
+    accountIndex: number,
+    outputs: BtcPaymentOutput[],
+    _asset: AssetTicker | string,
+    memo: string
+  ): Promise<string> {
+    const result = await callBitcoin(
+      accountIndex,
+      'quoteSendTransactionWithMemoAndOutputsTX',
+      { outputs: toWalletOutputs(outputs), memo }
+    );
+    return unwrapTxHex(result);
   },
 };
