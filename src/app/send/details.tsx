@@ -352,6 +352,9 @@ export default function SendDetailsScreen() {
         numericAmount = numericAmount / tokenPrice;
       }
 
+      const amountSats =
+        assetTicker === AssetTicker.BTC ? Math.round(numericAmount * 100_000_000) : numericAmount;
+
       // Check if Bitcoin script_type is P2TR, and use memo method if so
       let sendResult;
       if (assetTicker === AssetTicker.BTC && networkType === NetworkType.SEGWIT) {
@@ -371,7 +374,7 @@ export default function SendDetailsScreen() {
           sendResult = await WDKService.sendByNetworkWithMemo(
             networkType,
             0, // account index
-            numericAmount,
+            amountSats,
             recipientAddress,
             assetTicker,
             memo
@@ -380,7 +383,7 @@ export default function SendDetailsScreen() {
           sendResult = await WDKService.sendByNetwork(
             networkType,
             0, // account index
-            numericAmount,
+            amountSats,
             recipientAddress,
             assetTicker
           );
@@ -389,7 +392,7 @@ export default function SendDetailsScreen() {
         sendResult = await WDKService.sendByNetwork(
           networkType,
           0, // account index
-          numericAmount,
+          amountSats,
           recipientAddress,
           assetTicker
         );

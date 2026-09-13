@@ -687,7 +687,7 @@ export function buildPortfolioValueChartData(
     return `${date.getMonth() + 1}/${date.getDate()}`;
   });
 
-  console.log('[PortfolioChart] stacked holdings:', used.length, 'points, quote:', quoteUnit);
+  // console.log('[PortfolioChart] stacked holdings:', used.length, 'points, quote:', quoteUnit);
 
   return {
     labels,

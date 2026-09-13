@@ -41,7 +41,8 @@
     "prebuild": "expo prebuild",
     "prebuild:clean": "expo prebuild --clean",
     "env:push:eas": "./scripts/push-env-to-eas.sh",
-    "test:electrs": "./scripts/test-electrs.sh"
+    "test:electrs": "node scripts/test-electrum-connection.mjs",
+    "test:electrum": "node scripts/test-electrum-connection.mjs"
   },
   "dependencies": {
     "@bitcoinerlab/secp256k1": "^1.2.0",

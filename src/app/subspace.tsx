@@ -1596,7 +1596,6 @@ export default function SubspaceScreen() {
       const purchase = sptrQuote.pointerPurchase;
       const taprootAddress = sptrQuote.nextReceiveAddress;
       const totalPriceSats = sptrQuote.postTotalPriceSats;
-      const amountBtc = totalPriceSats / 100_000_000;
       console.log(
         '[Subspace] Take on-chain payment (broadcast only):',
         JSON.stringify(
@@ -1618,7 +1617,7 @@ export default function SubspaceScreen() {
       const result = await WDKService.sendByNetworkWithMemo(
         NetworkType.SEGWIT,
         0,
-        amountBtc,
+        totalPriceSats,
         taprootAddress,
         AssetTicker.BTC,
         paymentMemo

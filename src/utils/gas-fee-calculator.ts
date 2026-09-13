@@ -88,15 +88,11 @@ export const calculateGasFee = async (
       };
     }
 
-    // For Bitcoin, WDKService.quoteSendByNetwork expects amount in BTC and will multiply by 100000000
-    // to convert to satoshis internally. The amount parameter should be in BTC (e.g., 0.0003), not satoshis.
-    // If the amount is already in satoshis (e.g., 30000), we need to divide by 100000000 to convert to BTC.
-    // We check if the amount is > 1 (likely satoshis) and divide if needed, otherwise assume it's already in BTC.
-    let btcAmount = assetTicker === AssetTicker.BTC ? parseFloat(amount!.toFixed(8)) : 1;
-    if (assetTicker === AssetTicker.BTC && amount! > 1) {
-      // Amount appears to be in satoshis, convert to BTC
-      btcAmount = amount! / 100000000;
-    }
+    // Bitcoin quote methods expect amount in satoshis. Callers pass BTC (e.g. 0.0003).
+    const quoteAmountSats =
+      assetTicker === AssetTicker.BTC
+        ? Math.round(parseFloat(amount!.toFixed(8)) * 100_000_000)
+        : 1;
 
     // Check if Bitcoin script_type is P2TR, and use memo method if so
     let gasFee: number;
@@ -117,7 +113,7 @@ export const calculateGasFee = async (
         gasFee = await WDKService.quoteSendByNetworkWithMemo(
           networkType,
           0, // account index
-          btcAmount,
+          quoteAmountSats,
           quoteRecipient,
           assetTicker,
           memo
@@ -126,7 +122,7 @@ export const calculateGasFee = async (
         gasFee = await WDKService.quoteSendByNetwork(
           networkType,
           0, // account index
-          btcAmount,
+          quoteAmountSats,
           quoteRecipient,
           assetTicker
         );
@@ -135,7 +131,7 @@ export const calculateGasFee = async (
       gasFee = await WDKService.quoteSendByNetwork(
         networkType,
         0, // account index
-        btcAmount,
+        quoteAmountSats,
         quoteRecipient,
         assetTicker
       );

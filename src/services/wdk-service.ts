@@ -11,9 +11,9 @@ function toNetworkName(network: NetworkType | string): string {
   return String(network);
 }
 
-function toBtcValue(amount: number): number {
-  // Account methods expect BTC units (not sats), matching previous WDKService.
-  return Number(amount);
+function toValueSats(amount: number): number {
+  // @spacesops/wdk-wallet-btc expects `value` in satoshis (integer).
+  return Math.round(Number(amount));
 }
 
 async function callBitcoin<T>(
@@ -97,7 +97,7 @@ export const WDKService = {
       networkName,
       accountIndex,
       'sendTransaction',
-      { to, value: toBtcValue(amount) }
+      { to, value: toValueSats(amount) }
     );
     return unwrapHash(result);
   },
@@ -113,7 +113,7 @@ export const WDKService = {
     const result = await callBitcoin(
       accountIndex,
       'sendTransactionWithMemo',
-      { to, value: toBtcValue(amount), memo }
+      { to, value: toValueSats(amount), memo }
     );
     return unwrapHash(result);
   },
@@ -130,7 +130,7 @@ export const WDKService = {
       networkName,
       accountIndex,
       'quoteSendTransaction',
-      { to, value: toBtcValue(amount) }
+      { to, value: toValueSats(amount) }
     );
     return unwrapFee(result);
   },
@@ -146,7 +146,7 @@ export const WDKService = {
     const result = await callBitcoin(
       accountIndex,
       'quoteSendTransactionWithMemo',
-      { to, value: toBtcValue(amount), memo }
+      { to, value: toValueSats(amount), memo }
     );
     return unwrapFee(result);
   },
@@ -163,7 +163,7 @@ export const WDKService = {
       networkName,
       accountIndex,
       'quoteSendTransactionTX',
-      { to, value: toBtcValue(amount) }
+      { to, value: toValueSats(amount) }
     );
     if (typeof result === 'string') return result;
     return result?.txHex || result?.hex || String(result);
@@ -180,7 +180,7 @@ export const WDKService = {
     const result = await callBitcoin<{ txHex?: string; hex?: string } | string>(
       accountIndex,
       'quoteSendTransactionWithMemoTX',
-      { to, value: toBtcValue(amount), memo }
+      { to, value: toValueSats(amount), memo }
     );
     if (typeof result === 'string') return result;
     return result?.txHex || result?.hex || String(result);

@@ -69,9 +69,10 @@ import {
 } from '@/utils/extract-zone-attributes';
 import { resolveTaprootPurchaseRequiredSats } from '@/utils/estimate-taproot-memo-fee';
 import {
-  computePurchasePaymentOutputs,
-  hasPurchaseRevenueSplit,
+  resolvePurchaseDiscountedPriceSats,
+  resolvePurchasePaymentOutputs,
   type PurchasePaymentOutput,
+  type PurchaseSplitInput,
 } from '@/utils/compute-purchase-payment-outputs';
 import type { BtcPaymentOutput } from '@/services/wdk-service';
 import * as Clipboard from 'expo-clipboard';
@@ -503,6 +504,55 @@ function resolvePurchasePaymentAmountSats(params: {
     }
   }
   return total;
+}
+
+function formatSendButtonLabel(
+  formattedSats: string,
+  handle: string,
+  formattedUSD?: string
+): string {
+  if (formattedUSD !== undefined) {
+    return `Send ${formattedSats} sats = $${formattedUSD} for\n${handle}`;
+  }
+  return `Send ${formattedSats} sats for\n${handle}`;
+}
+
+function buildPurchaseSplitInput(params: {
+  totalPriceSats: number;
+  priceSats: number | null;
+  discountPercent: number | null;
+  selectedDuration: string;
+  blockFee1: number | null;
+  blockFee6: number | null;
+  blockFee48: number | null;
+  taprootAddress: string;
+  tenantPaymentAddress?: string;
+  platformRevenuePercent?: number;
+  affiliatePaymentAddress?: string;
+  affiliateRevenuePercent?: number;
+}): PurchaseSplitInput {
+  const input: PurchaseSplitInput = {
+    totalPriceSats: params.totalPriceSats,
+    taprootAddress: params.taprootAddress,
+    tenantPaymentAddress: params.tenantPaymentAddress,
+    platformRevenuePercent: params.platformRevenuePercent,
+    affiliatePaymentAddress: params.affiliatePaymentAddress,
+    affiliateRevenuePercent: params.affiliateRevenuePercent,
+  };
+  const blockFee = feeForDuration(
+    params.selectedDuration,
+    params.blockFee1,
+    params.blockFee6,
+    params.blockFee48
+  );
+  if (params.priceSats !== null && blockFee !== null) {
+    input.discountedPriceSats = resolvePurchaseDiscountedPriceSats(
+      params.priceSats,
+      params.discountPercent
+    );
+    input.blockFeeSats = blockFee;
+  }
+  return input;
 }
 
 function buildWatchPaymentRequestUrl(
@@ -1166,6 +1216,12 @@ export default function SpacesScreen() {
   const [couponCode, setCouponCode] = useState<string>('');
   const [discountPercent, setDiscountPercent] = useState<number | null>(null);
   const [completelyFree, setCompletelyFree] = useState(false);
+  const [couponAffiliatePaymentAddress, setCouponAffiliatePaymentAddress] = useState<string | null>(
+    null
+  );
+  const [couponAffiliateRevenuePercent, setCouponAffiliateRevenuePercent] = useState<number | null>(
+    null
+  );
   const [couponStatus, setCouponStatus] = useState<'idle' | 'validating' | 'valid' | 'invalid'>('idle');
   const [purchaseData, setPurchaseData] = useState<{
     taproot_address: string;
@@ -2835,29 +2891,53 @@ export default function SpacesScreen() {
         // - P2WPKH (Native SegWit): Use quoteSendByNetworkTX (no memo required)
         // We use account index 0, which matches what resolveWalletAddresses() uses
         // This ensures we're using the same address that's displayed on the settings page
-        // Pass amount in satoshis directly (WDKService will handle conversion internally)
+        // Pass amount in satoshis (wdk-wallet-btc `value` is always sats).
         // Note: Both methods use confirmationTarget: 1 by default.
         // TODO: Update WDKService to accept conf_target parameter and use getConfTarget(selectedDuration)
         // to match the user's selected duration.
-        const paymentOutputs: BtcPaymentOutput[] = computePurchasePaymentOutputs({
-          totalPriceSats: paymentAmountSats,
-          taprootAddress: purchaseData.taproot_address,
-          tenantPaymentAddress: purchaseData.tenant_payment_address,
-          platformRevenuePercent: purchaseData.platform_revenue_percent,
-          affiliatePaymentAddress: purchaseData.affiliate_payment_address,
-          affiliateRevenuePercent: purchaseData.affiliate_revenue_percent,
-        });
-        const usesRevenueSplit = hasPurchaseRevenueSplit({
-          totalPriceSats: paymentAmountSats,
-          taprootAddress: purchaseData.taproot_address,
-          tenantPaymentAddress: purchaseData.tenant_payment_address,
-        });
+        const paymentResolution = resolvePurchasePaymentOutputs(
+          buildPurchaseSplitInput({
+            totalPriceSats: paymentAmountSats,
+            priceSats,
+            discountPercent,
+            selectedDuration,
+            blockFee1,
+            blockFee6,
+            blockFee48,
+            taprootAddress: purchaseData.taproot_address,
+            tenantPaymentAddress: purchaseData.tenant_payment_address,
+            platformRevenuePercent: purchaseData.platform_revenue_percent,
+            affiliatePaymentAddress: effectiveAffiliatePaymentAddress,
+            affiliateRevenuePercent: effectiveAffiliateRevenuePercent,
+          })
+        );
+        const paymentOutputs: BtcPaymentOutput[] = paymentResolution.outputs;
+        const usesRevenueSplit = paymentResolution.revenueSplitApplied;
         const extraPaymentOutputCount = Math.max(0, paymentOutputs.length - 1);
+        const primaryPaymentOutput = paymentOutputs[0];
+        if (!primaryPaymentOutput) {
+          throw new Error('No payment outputs resolved for purchase');
+        }
+        const singleRecipientAddress = primaryPaymentOutput.address;
+        const singleAmountSats = primaryPaymentOutput.valueSats;
+
+        if (paymentResolution.splitAdjustments?.length) {
+          console.warn('[Spaces] Revenue split adjusted for dust limits:', {
+            adjustments: paymentResolution.splitAdjustments,
+            attemptedSplitOutputs: paymentResolution.attemptedSplitOutputs,
+            resolvedOutputs: paymentOutputs,
+            revenueSplitApplied: usesRevenueSplit,
+          });
+        }
 
         console.log('[Spaces] Purchase payment outputs:', {
           usesRevenueSplit,
           outputCount: paymentOutputs.length,
           paymentOutputs,
+          tenant_payment_address: purchaseData.tenant_payment_address,
+          platform_revenue_percent: purchaseData.platform_revenue_percent,
+          singleRecipientAddress,
+          singleAmountSats,
         });
 
         const btcBalance = balances?.list?.find(
@@ -2872,8 +2952,8 @@ export default function SpacesScreen() {
           const quoteOptions = {
             network: NetworkType.SEGWIT,
             accountIndex: 0,
-            amount: paymentAmountSats / 100000000,
-            recipientAddress: purchaseData.taproot_address,
+            amountSats: singleAmountSats,
+            recipientAddress: singleRecipientAddress,
             asset: AssetTicker.BTC,
             memo: purchaseData.handle,
           };
@@ -2887,12 +2967,12 @@ export default function SpacesScreen() {
               const feeQuote = await WDKService.quoteSendByNetworkWithMemo(
                 quoteOptions.network,
                 quoteOptions.accountIndex,
-                quoteOptions.amount,
+                quoteOptions.amountSats,
                 quoteOptions.recipientAddress,
                 quoteOptions.asset,
                 quoteOptions.memo
               );
-              quotedFeeSats = Math.round(feeQuote * 100000000);
+              quotedFeeSats = Math.round(feeQuote);
             }
           } catch (feeError) {
             console.warn(
@@ -2937,7 +3017,7 @@ export default function SpacesScreen() {
             : await WDKService.quoteSendByNetworkWithMemoTX(
                 quoteOptions.network,
                 quoteOptions.accountIndex,
-                quoteOptions.amount,
+                quoteOptions.amountSats,
                 quoteOptions.recipientAddress,
                 quoteOptions.asset,
                 quoteOptions.memo
@@ -2946,8 +3026,8 @@ export default function SpacesScreen() {
           const quoteOptions = {
             network: NetworkType.SEGWIT,
             accountIndex: 0,
-            amount: paymentAmountSats / 100000000,
-            recipientAddress: purchaseData.taproot_address,
+            amountSats: singleAmountSats,
+            recipientAddress: singleRecipientAddress,
             asset: AssetTicker.BTC,
           };
           console.log('[Spaces] P2WPKH compose options:', JSON.stringify(quoteOptions, null, 2));
@@ -2959,11 +3039,11 @@ export default function SpacesScreen() {
               const feeQuote = await WDKService.quoteSendByNetwork(
                 quoteOptions.network,
                 quoteOptions.accountIndex,
-                quoteOptions.amount,
+                quoteOptions.amountSats,
                 quoteOptions.recipientAddress,
                 quoteOptions.asset
               );
-              estimatedFeeSats = Math.round(feeQuote * 100000000);
+              estimatedFeeSats = Math.round(feeQuote);
             } else {
               estimatedFeeSats = resolveTaprootPurchaseRequiredSats(
                 requestedSats,
@@ -3003,7 +3083,7 @@ export default function SpacesScreen() {
             : await WDKService.quoteSendByNetworkTX(
                 quoteOptions.network,
                 quoteOptions.accountIndex,
-                quoteOptions.amount,
+                quoteOptions.amountSats,
                 quoteOptions.recipientAddress,
                 quoteOptions.asset
               );
@@ -3020,7 +3100,7 @@ export default function SpacesScreen() {
           network: NetworkType.SEGWIT,
           accountIndex: 0,
           amount: paymentAmountSats,
-          recipientAddress: purchaseData.taproot_address,
+          recipientAddress: singleRecipientAddress,
           asset: AssetTicker.BTC,
           ...(scriptType === 'P2TR' ? { memo: purchaseData.handle } : {}),
           paymentOutputs,
@@ -3339,11 +3419,9 @@ export default function SpacesScreen() {
               minimumFractionDigits: 2,
               maximumFractionDigits: 2,
             });
-            setButtonLabel(
-              `Send ${formattedSats} sats = $${formattedUSD} for ${purchaseData.handle}`
-            );
+            setButtonLabel(formatSendButtonLabel(formattedSats, purchaseData.handle, formattedUSD));
           } else {
-            setButtonLabel(`Send ${formattedSats} sats for ${purchaseData.handle}`);
+            setButtonLabel(formatSendButtonLabel(formattedSats, purchaseData.handle));
           }
         }
       }
@@ -3514,12 +3592,10 @@ export default function SpacesScreen() {
           maximumFractionDigits: 2,
         });
         // Update button label with USD
-        const confirmLabel = `Send ${formattedSats} sats = $${formattedUSD} for ${data.handle}`;
-        setButtonLabel(confirmLabel);
+        setButtonLabel(formatSendButtonLabel(formattedSats, data.handle, formattedUSD));
       } else {
         // Update button label without USD if price not available
-        const confirmLabel = `Send ${formattedSats} sats for ${data.handle}`;
-        setButtonLabel(confirmLabel);
+        setButtonLabel(formatSendButtonLabel(formattedSats, data.handle));
       }
       setIsButtonEnabled(true);
       setButtonState('available');
@@ -3777,8 +3853,18 @@ export default function SpacesScreen() {
     sptrFee48,
   ]);
 
+  const effectiveAffiliatePaymentAddress =
+    purchaseData?.affiliate_payment_address?.trim() ||
+    couponAffiliatePaymentAddress?.trim() ||
+    undefined;
+  const effectiveAffiliateRevenuePercent =
+    purchaseData?.affiliate_revenue_percent ?? couponAffiliateRevenuePercent ?? undefined;
+
   const purchaseRevenueSplitOutputs = useMemo((): PurchasePaymentOutput[] | null => {
-    if (!purchaseData?.taproot_address || !purchaseData.tenant_payment_address?.trim()) {
+    const hasRevenueSplit =
+      Boolean(purchaseData?.tenant_payment_address?.trim()) ||
+      Boolean(effectiveAffiliatePaymentAddress);
+    if (!purchaseData?.taproot_address || !hasRevenueSplit) {
       return null;
     }
     const paymentTotal = getDiscountedTotal() ?? purchaseData.total_price;
@@ -3786,34 +3872,66 @@ export default function SpacesScreen() {
       return null;
     }
     try {
-      return computePurchasePaymentOutputs({
-        totalPriceSats: paymentTotal,
-        taprootAddress: purchaseData.taproot_address,
-        tenantPaymentAddress: purchaseData.tenant_payment_address,
-        platformRevenuePercent: purchaseData.platform_revenue_percent,
-        affiliatePaymentAddress: purchaseData.affiliate_payment_address,
-        affiliateRevenuePercent: purchaseData.affiliate_revenue_percent,
-      });
+      const resolution = resolvePurchasePaymentOutputs(
+        buildPurchaseSplitInput({
+          totalPriceSats: paymentTotal,
+          priceSats,
+          discountPercent,
+          selectedDuration,
+          blockFee1,
+          blockFee6,
+          blockFee48,
+          taprootAddress: purchaseData.taproot_address,
+          tenantPaymentAddress: purchaseData.tenant_payment_address,
+          platformRevenuePercent: purchaseData.platform_revenue_percent,
+          affiliatePaymentAddress: effectiveAffiliatePaymentAddress,
+          affiliateRevenuePercent: effectiveAffiliateRevenuePercent,
+        })
+      );
+      const displayOutputs =
+        effectiveAffiliatePaymentAddress && resolution.attemptedSplitOutputs?.length
+          ? resolution.attemptedSplitOutputs
+          : resolution.outputs;
+      if (displayOutputs.length <= 1) {
+        return null;
+      }
+      return displayOutputs;
     } catch (error) {
       console.warn('[Spaces] Could not compute revenue split preview:', error);
       return null;
     }
-  }, [getDiscountedTotal, purchaseData]);
+  }, [
+    blockFee1,
+    blockFee48,
+    blockFee6,
+    couponAffiliatePaymentAddress,
+    couponAffiliateRevenuePercent,
+    discountPercent,
+    effectiveAffiliatePaymentAddress,
+    effectiveAffiliateRevenuePercent,
+    getDiscountedTotal,
+    priceSats,
+    purchaseData,
+    selectedDuration,
+  ]);
 
   const labelPurchaseSplitOutput = useCallback(
     (output: PurchasePaymentOutput): string => {
       if (!purchaseData) return 'payment';
       if (output.address === purchaseData.taproot_address) {
-        const pct = purchaseData.platform_revenue_percent ?? 0;
-        return `platform (${pct}%)`;
+        if (purchaseData.tenant_payment_address?.trim()) {
+          const pct = purchaseData.platform_revenue_percent ?? 0;
+          return `platform (${pct}%+fee)`;
+        }
+        return 'platform (remainder+fee)';
       }
-      if (output.address === purchaseData.affiliate_payment_address) {
-        const pct = purchaseData.affiliate_revenue_percent ?? 0;
+      if (effectiveAffiliatePaymentAddress && output.address === effectiveAffiliatePaymentAddress) {
+        const pct = effectiveAffiliateRevenuePercent ?? 0;
         return `affiliate (${pct}%)`;
       }
       return 'tenant share';
     },
-    [purchaseData]
+    [effectiveAffiliatePaymentAddress, effectiveAffiliateRevenuePercent, purchaseData]
   );
 
   // Initialize pricing service and fetch BTC price
@@ -4169,7 +4287,7 @@ export default function SpacesScreen() {
   useEffect(() => {
     const timeoutId = setTimeout(() => {
       void checkAvailability();
-    }, 500); // Wait 500ms after user stops typing
+    }, 2000); // Wait 2s after user stops typing (same as coupon validation)
 
     return () => clearTimeout(timeoutId);
   }, [checkAvailability]);
@@ -4305,6 +4423,8 @@ export default function SpacesScreen() {
       setCouponCode('');
       setDiscountPercent(null);
       setCompletelyFree(false);
+      setCouponAffiliatePaymentAddress(null);
+      setCouponAffiliateRevenuePercent(null);
       setCouponStatus('idle');
     }
   }, [isConfirmationMode]);
@@ -4316,6 +4436,8 @@ export default function SpacesScreen() {
     if (!couponCode.trim()) {
       setDiscountPercent(null);
       setCompletelyFree(false);
+      setCouponAffiliatePaymentAddress(null);
+      setCouponAffiliateRevenuePercent(null);
       setCouponStatus('idle');
       return;
     }
@@ -4335,18 +4457,32 @@ export default function SpacesScreen() {
         if (data.success && data.valid) {
           setDiscountPercent(data.discount_percent);
           setCompletelyFree(!!data.completely_free);
+          setCouponAffiliatePaymentAddress(
+            typeof data.affiliate_payment_address === 'string'
+              ? data.affiliate_payment_address
+              : null
+          );
+          setCouponAffiliateRevenuePercent(
+            typeof data.affiliate_revenue_percent === 'number'
+              ? data.affiliate_revenue_percent
+              : null
+          );
           setCouponStatus('valid');
           toast.success(data.message || `Coupon applied: ${data.discount_percent}% off`);
           Keyboard.dismiss();
         } else {
           setDiscountPercent(null);
           setCompletelyFree(false);
+          setCouponAffiliatePaymentAddress(null);
+          setCouponAffiliateRevenuePercent(null);
           setCouponStatus('invalid');
           toast.error(data.message || 'Invalid coupon code');
         }
       } catch {
         setDiscountPercent(null);
         setCompletelyFree(false);
+        setCouponAffiliatePaymentAddress(null);
+        setCouponAffiliateRevenuePercent(null);
         setCouponStatus('invalid');
         toast.error('Could not validate coupon');
       }
@@ -4433,9 +4569,9 @@ export default function SpacesScreen() {
         minimumFractionDigits: 2,
         maximumFractionDigits: 2,
       });
-      setButtonLabel(`Send ${formattedSats} sats = $${formattedUSD} for ${purchaseData.handle}`);
+      setButtonLabel(formatSendButtonLabel(formattedSats, purchaseData.handle, formattedUSD));
     } else {
-      setButtonLabel(`Send ${formattedSats} sats for ${purchaseData.handle}`);
+      setButtonLabel(formatSendButtonLabel(formattedSats, purchaseData.handle));
     }
   }, [completelyFree, discountPercent, couponStatus, isConfirmationMode, purchaseData, buttonState, btcPriceUSD, priceSats, selectedDuration, blockFee1, blockFee6, blockFee48, takeOnchain, sptrPrice, sptrFee1, sptrFee6, sptrFee48]);
 
@@ -5383,6 +5519,8 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '600',
     color: colors.black,
+    textAlign: 'center',
+    alignSelf: 'stretch',
   },
   purchaseButtonTextDisabled: {
     color: colors.textSecondary,
