@@ -9,9 +9,9 @@ import { networkConfigs } from '@/config/networks';
 import formatAmount from '@/utils/format-amount';
 import {
   useBalancesForWallet,
-  useWallet,
   useWalletManager,
 } from '@spacesops/wdk-react-native-core';
+import { useAppWallet } from '@/hooks/use-app-wallet';
 import { useLocalSearchParams } from 'expo-router';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
@@ -31,9 +31,7 @@ export default function SelectNetworkScreen() {
   const params = useLocalSearchParams();
   const { wallets, activeWalletId } = useWalletManager();
   const currentWalletId = resolveCurrentWalletId(activeWalletId, wallets);
-  const { isInitialized } = useWallet(
-    currentWalletId ? { walletId: currentWalletId } : undefined
-  );
+  const { isInitialized } = useAppWallet(currentWalletId);
   const tokenConfigs = useMemo(() => getTokenConfigs(), []);
   const { addressesSettled } = useEnsureWalletAddresses(
     DISPLAY_WALLET_NETWORKS,

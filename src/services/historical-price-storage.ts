@@ -3,6 +3,8 @@ import { AssetTicker } from '@/config/assets';
 
 const STORAGE_KEY_EARLIEST_DATES = 'wdk_earliest_token_dates';
 const STORAGE_KEY_HISTORICAL_PRICES = 'wdk_historical_prices';
+/** Set after a successful one-shot reload when EXPO_PUBLIC_CLEAR_PRICES=true. */
+const STORAGE_KEY_ONE_SHOT_CLEAR_DONE = 'wdk_historical_prices_one_shot_clear_done';
 const MAX_POINTS_PER_TOKEN = 200;
 const DAY_MS = 24 * 60 * 60 * 1000;
 /** Price history window: 100 days from today at midnight. */
@@ -149,14 +151,80 @@ export async function saveHistoricalPrices(
 
 /**
  * Clear all historical price data from AsyncStorage (prices and earliest dates).
- * When EXPO_PUBLIC_CLEAR_PRICES is true, call this before sync so data is
- * reloaded from the API (100 days from today at midnight).
+ * Prefer {@link runOneShotHistoricalPriceReloadIfRequested} for dev reloads so a
+ * failed API call does not wipe the chart.
  */
 export async function clearAllHistoricalPriceData(): Promise<void> {
   await AsyncStorage.multiRemove([
     STORAGE_KEY_HISTORICAL_PRICES,
     STORAGE_KEY_EARLIEST_DATES,
   ]);
+}
+
+/**
+ * When EXPO_PUBLIC_CLEAR_PRICES=true, fetch a fresh 100-day series from the API,
+ * replace storage only after each token succeeds, then record a one-shot sentinel
+ * so later launches skip even if the env flag is still true. Set the flag back to
+ * false in .env after a successful reload.
+ */
+export async function runOneShotHistoricalPriceReloadIfRequested(
+  pricingService: PricingServiceLike
+): Promise<void> {
+  if (process.env.EXPO_PUBLIC_CLEAR_PRICES !== 'true') {
+    return;
+  }
+
+  const alreadyDone = await AsyncStorage.getItem(STORAGE_KEY_ONE_SHOT_CLEAR_DONE);
+  if (alreadyDone === '1') {
+    return;
+  }
+
+  const nowMs = Date.now();
+  const todayMidnightMs = dayMidnightMs(nowMs);
+  const chartStartMs = nowMs - CHART_DAYS_MS;
+  const chartEndMs = todayMidnightMs + DAY_MS - 1;
+
+  const outcomes = await Promise.all(
+    HISTORICAL_PRICE_TOKENS.map(async (ticker) => {
+      const tokenKey = ticker.toLowerCase();
+      try {
+        const newPoints = await pricingService.getHistoricalPrice({
+          from: ticker,
+          to: 'USD',
+          start: chartStartMs,
+          end: chartEndMs,
+        });
+        if (newPoints.length === 0) {
+          return { tokenKey, ok: false as const };
+        }
+        const series = mergePriceSeries([], newPoints);
+        await enqueuePriceWrite(async () => {
+          const current = await loadHistoricalPrices();
+          current[tokenKey] = { lastUpdated: nowMs, data: series };
+          await saveHistoricalPrices(current);
+          notifyHistoricalPricesUpdated();
+        });
+        return { tokenKey, ok: true as const };
+      } catch (err) {
+        console.warn(`[HistoricalPrice] One-shot reload failed for ${ticker}:`, err);
+        return { tokenKey, ok: false as const };
+      }
+    })
+  );
+
+  const allOk = outcomes.every((o) => o.ok);
+  if (!allOk) {
+    console.warn(
+      '[HistoricalPrice] One-shot reload incomplete; keeping prior data for failed tokens. Clear sentinel or fix API before retrying.'
+    );
+    return;
+  }
+
+  await AsyncStorage.removeItem(STORAGE_KEY_EARLIEST_DATES);
+  await AsyncStorage.setItem(STORAGE_KEY_ONE_SHOT_CLEAR_DONE, '1');
+  console.log(
+    '[HistoricalPrice] One-shot price reload complete. Set EXPO_PUBLIC_CLEAR_PRICES=false in .env.'
+  );
 }
 
 /**
@@ -217,74 +285,128 @@ export interface PricingServiceLike {
 }
 
 /**
- * Sync earliest token dates from activity and historical price data.
- * - Computes earliest date per token from transactions, merges with stored dates, saves.
- * - For each token: only requests day ranges missing from stored data (from start through today at midnight), merges, saves.
+ * Merge earliest activity timestamps into stored dates.
+ * Price history does not wait on this; callers can run it when transactions arrive.
  */
-export async function syncHistoricalPrices(
-  transactions: TransactionLike[],
+export async function mergeEarliestTokenDates(
+  transactions: TransactionLike[]
+): Promise<void> {
+  const fromActivity = getEarliestDatesFromTransactions(transactions);
+  if (Object.keys(fromActivity).length === 0) return;
+
+  const storedDates = await loadEarliestDates();
+  const mergedDates: EarliestDatesMap = { ...storedDates };
+  let changed = false;
+  for (const [token, ms] of Object.entries(fromActivity)) {
+    const existing = mergedDates[token];
+    if (existing === undefined || ms < existing) {
+      mergedDates[token] = ms;
+      changed = true;
+    }
+  }
+  if (changed) {
+    await saveEarliestDates(mergedDates);
+  }
+}
+
+/** Serializes read-modify-write of the price map so parallel token fetches cannot drop each other. */
+let priceWriteQueue: Promise<void> = Promise.resolve();
+
+function enqueuePriceWrite(task: () => Promise<void>): Promise<void> {
+  const run = priceWriteQueue.then(task, task);
+  priceWriteQueue = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
+
+let chartFillInFlight: Promise<void> | null = null;
+
+/**
+ * Fetch BTC and XAU₮ ranges missing from the 100-day chart window.
+ * Tokens run together. Each token is saved and listeners are notified as soon as it arrives.
+ * Overlapping calls share one in-flight request.
+ */
+export async function fillMissingChartPrices(
+  pricingService: PricingServiceLike
+): Promise<void> {
+  if (chartFillInFlight) return chartFillInFlight;
+
+  const run = fetchMissingChartPrices(pricingService).finally(() => {
+    if (chartFillInFlight === run) chartFillInFlight = null;
+  });
+  chartFillInFlight = run;
+  return run;
+}
+
+async function fetchMissingChartPrices(
   pricingService: PricingServiceLike
 ): Promise<void> {
   const nowMs = Date.now();
   const todayMidnightMs = dayMidnightMs(nowMs);
   const chartStartMs = nowMs - CHART_DAYS_MS;
-
-  const fromActivity = getEarliestDatesFromTransactions(transactions);
-  const storedDates = await loadEarliestDates();
-  const mergedDates: EarliestDatesMap = { ...storedDates };
-  for (const [token, ms] of Object.entries(fromActivity)) {
-    const existing = mergedDates[token];
-    if (existing === undefined || ms < existing) {
-      mergedDates[token] = ms;
-    }
-  }
-  await saveEarliestDates(mergedDates);
+  if (chartStartMs >= todayMidnightMs + DAY_MS) return;
 
   const storedPrices = await loadHistoricalPrices();
-  const updatedPrices: HistoricalPricesMap = { ...storedPrices };
 
-  for (const ticker of HISTORICAL_PRICE_TOKENS) {
-    const tokenKey = ticker.toLowerCase();
-    // Chart USD bands need the full window of market prices, independent of activity.
-    const startMs = chartStartMs;
-    const existing = storedPrices[tokenKey]?.data ?? [];
+  await Promise.all(
+    HISTORICAL_PRICE_TOKENS.map(async (ticker) => {
+      const tokenKey = ticker.toLowerCase();
+      const existing = storedPrices[tokenKey]?.data ?? [];
+      const ranges = missingDayRanges(existing, chartStartMs, todayMidnightMs);
+      if (ranges.length === 0) return;
 
-    if (startMs >= todayMidnightMs + DAY_MS) continue;
-
-    const ranges = missingDayRanges(existing, startMs, todayMidnightMs);
-    if (ranges.length === 0) {
-      continue;
-    }
-
-    let merged = existing;
-    for (const range of ranges) {
-      try {
-        console.log('[HistoricalPrice] fetching missing range', {
-          ticker,
-          start: range.startMs,
-          end: range.endMs,
-          startDate: new Date(range.startMs).toISOString(),
-          endDate: new Date(range.endMs).toISOString(),
-        });
-        const newPoints = await pricingService.getHistoricalPrice({
-          from: ticker,
-          to: 'USD',
-          start: range.startMs,
-          end: range.endMs,
-        });
-        merged = mergePriceSeries(merged, newPoints);
-      } catch (err) {
-        console.warn(`[HistoricalPrice] Failed to fetch ${ticker} range ${range.startMs}-${range.endMs}:`, err);
+      let merged = existing;
+      let changed = false;
+      for (const range of ranges) {
+        try {
+          console.log('[HistoricalPrice] fetching missing range', {
+            ticker,
+            start: range.startMs,
+            end: range.endMs,
+            startDate: new Date(range.startMs).toISOString(),
+            endDate: new Date(range.endMs).toISOString(),
+          });
+          const newPoints = await pricingService.getHistoricalPrice({
+            from: ticker,
+            to: 'USD',
+            start: range.startMs,
+            end: range.endMs,
+          });
+          if (newPoints.length > 0) {
+            merged = mergePriceSeries(merged, newPoints);
+            changed = true;
+          }
+        } catch (err) {
+          console.warn(
+            `[HistoricalPrice] Failed to fetch ${ticker} range ${range.startMs}-${range.endMs}:`,
+            err
+          );
+        }
       }
-    }
-    updatedPrices[tokenKey] = {
-      lastUpdated: nowMs,
-      data: merged,
-    };
-  }
+      if (!changed) return;
 
-  await saveHistoricalPrices(updatedPrices);
-  notifyHistoricalPricesUpdated();
+      await enqueuePriceWrite(async () => {
+        const current = await loadHistoricalPrices();
+        current[tokenKey] = { lastUpdated: nowMs, data: merged };
+        await saveHistoricalPrices(current);
+        notifyHistoricalPricesUpdated();
+      });
+    })
+  );
+}
+
+/**
+ * Sync earliest token dates from activity and historical price data.
+ * Chart USD bands use the full market window and do not wait on activity.
+ */
+export async function syncHistoricalPrices(
+  transactions: TransactionLike[],
+  pricingService: PricingServiceLike
+): Promise<void> {
+  await mergeEarliestTokenDates(transactions);
+  await fillMissingChartPrices(pricingService);
 }
 
 /**
@@ -293,47 +415,11 @@ export async function syncHistoricalPrices(
  * even when activity does not date acquisitions.
  */
 export async function ensureChartUsdPrices(
-  stored: HistoricalPricesMap,
+  _stored: HistoricalPricesMap,
   pricingService: PricingServiceLike
 ): Promise<HistoricalPricesMap> {
-  const nowMs = Date.now();
-  const todayMidnightMs = dayMidnightMs(nowMs);
-  const chartStartMs = nowMs - CHART_DAYS_MS;
-  const updated: HistoricalPricesMap = { ...stored };
-  let changed = false;
-
-  for (const ticker of HISTORICAL_PRICE_TOKENS) {
-    const tokenKey = ticker.toLowerCase();
-    const existing = stored[tokenKey]?.data ?? [];
-    const ranges = missingDayRanges(existing, chartStartMs, todayMidnightMs);
-    if (ranges.length === 0) continue;
-
-    let merged = existing;
-    for (const range of ranges) {
-      try {
-        const newPoints = await pricingService.getHistoricalPrice({
-          from: ticker,
-          to: 'USD',
-          start: range.startMs,
-          end: range.endMs,
-        });
-        merged = mergePriceSeries(merged, newPoints);
-        changed = true;
-      } catch (err) {
-        console.warn(
-          `[HistoricalPrice] ensureChartUsdPrices failed ${ticker} ${range.startMs}-${range.endMs}:`,
-          err
-        );
-      }
-    }
-    updated[tokenKey] = { lastUpdated: nowMs, data: merged };
-  }
-
-  if (changed) {
-    await saveHistoricalPrices(updated);
-    notifyHistoricalPricesUpdated();
-  }
-  return updated;
+  await fillMissingChartPrices(pricingService);
+  return loadHistoricalPrices();
 }
 
 

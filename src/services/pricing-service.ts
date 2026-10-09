@@ -1,4 +1,5 @@
 import { AssetTicker } from '@/config/assets';
+import { loadHistoricalPrices } from '@/services/historical-price-storage';
 import DecimalJS from 'decimal.js';
 
 /** Inlined at build time from EXPO_PUBLIC_SPACES_API_BASE_URL (must use direct process.env access). */
@@ -119,10 +120,25 @@ async function fetchPricesFromApi(
   return normalizePriceSeries(arr);
 }
 
+function latestStoredPrice(
+  points: Array<{ price: number; ts: number }> | undefined
+): number | null {
+  if (!points?.length) return null;
+  let best: { price: number; ts: number } | null = null;
+  for (const point of points) {
+    if (!Number.isFinite(point.price) || point.price <= 0) continue;
+    if (best == null || point.ts >= best.ts) best = point;
+  }
+  return best?.price ?? null;
+}
+
 class PricingService {
   private static instance: PricingService;
   private fiatExchangeRateCache: Record<FiatCurrency, Record<AssetTicker, number>> | undefined;
   private isInitialized: boolean = false;
+  private initPromise: Promise<void> | null = null;
+  private refreshInFlight: Promise<void> | null = null;
+  private rateListeners = new Set<() => void>();
 
   private constructor() {}
 
@@ -131,6 +147,27 @@ class PricingService {
       PricingService.instance = new PricingService();
     }
     return PricingService.instance;
+  }
+
+  private applyRates(btc: number, xaut: number): void {
+    this.fiatExchangeRateCache = {
+      [FiatCurrency.USD]: {
+        [AssetTicker.BTC]: btc,
+        [AssetTicker.USDT]: 1,
+        [AssetTicker.XAUT]: xaut,
+        [AssetTicker.USAT]: 1,
+      },
+    };
+    this.isInitialized = true;
+    this.rateListeners.forEach((listener) => listener());
+  }
+
+  /** Fires after spot rates are seeded from cache or replaced by a network refresh. */
+  subscribeToExchangeRates(listener: () => void): () => void {
+    this.rateListeners.add(listener);
+    return () => {
+      this.rateListeners.delete(listener);
+    };
   }
 
   private async fetchLastPriceForSlug(slug: string): Promise<number> {
@@ -149,29 +186,67 @@ class PricingService {
     return last.price;
   }
 
+  private async fetchSpotRates(): Promise<{ btc: number; xaut: number }> {
+    const btcSlug = assetTickerToSlug(AssetTicker.BTC);
+    const xautSlug = assetTickerToSlug(AssetTicker.XAUT);
+    const [btcResult, xautResult] = await Promise.allSettled([
+      btcSlug != null ? this.fetchLastPriceForSlug(btcSlug) : Promise.resolve(0),
+      xautSlug != null ? this.fetchLastPriceForSlug(xautSlug) : Promise.resolve(0),
+    ]);
+
+    if (btcResult.status === 'rejected') {
+      console.error('Failed to fetch BTC price:', btcResult.reason);
+    }
+    if (xautResult.status === 'rejected') {
+      console.error('Failed to fetch XAU₮ price:', xautResult.reason);
+    }
+    if (btcResult.status === 'rejected' && xautResult.status === 'rejected') {
+      throw btcResult.reason;
+    }
+
+    return {
+      btc:
+        btcResult.status === 'fulfilled'
+          ? btcResult.value
+          : (this.getExchangeRate(AssetTicker.BTC, FiatCurrency.USD) ?? 0),
+      xaut:
+        xautResult.status === 'fulfilled'
+          ? xautResult.value
+          : (this.getExchangeRate(AssetTicker.XAUT, FiatCurrency.USD) ?? 0),
+    };
+  }
+
+  /** Use the newest stored chart point so USD values can render before a network round trip. */
+  private async seedFromStoredHistory(): Promise<boolean> {
+    const stored = await loadHistoricalPrices();
+    const btc = latestStoredPrice(stored.btc?.data);
+    const xaut = latestStoredPrice(stored.xaut?.data);
+    if (btc == null && xaut == null) return false;
+    this.applyRates(btc ?? 0, xaut ?? 0);
+    return true;
+  }
+
+  private async doInitialize(): Promise<void> {
+    const seeded = await this.seedFromStoredHistory();
+    if (seeded) {
+      void this.refreshExchangeRates().catch(() => {});
+      return;
+    }
+
+    const { btc, xaut } = await this.fetchSpotRates();
+    this.applyRates(btc, xaut);
+  }
+
   async initialize(): Promise<void> {
     if (this.isInitialized) return;
-
-    try {
-      const btcSlug = assetTickerToSlug(AssetTicker.BTC);
-      const xautSlug = assetTickerToSlug(AssetTicker.XAUT);
-
-      this.fiatExchangeRateCache = {
-        [FiatCurrency.USD]: {
-          [AssetTicker.BTC]:
-            btcSlug != null ? await this.fetchLastPriceForSlug(btcSlug) : 0,
-          [AssetTicker.USDT]: 1,
-          [AssetTicker.XAUT]:
-            xautSlug != null ? await this.fetchLastPriceForSlug(xautSlug) : 0,
-          [AssetTicker.USAT]: 1,
-        },
-      };
-
-      this.isInitialized = true;
-    } catch (error) {
-      console.error('Failed to initialize pricing service:', error);
-      throw error;
+    if (!this.initPromise) {
+      this.initPromise = this.doInitialize().catch((error) => {
+        this.initPromise = null;
+        console.error('Failed to initialize pricing service:', error);
+        throw error;
+      });
     }
+    return this.initPromise;
   }
 
   async getFiatValue(value: number, asset: AssetTicker, currency: FiatCurrency): Promise<number> {
@@ -187,27 +262,16 @@ class PricingService {
     if (!this.isInitialized) {
       throw new Error('Pricing service not initialized');
     }
+    if (this.refreshInFlight) return this.refreshInFlight;
 
-    try {
-      const btcSlug = assetTickerToSlug(AssetTicker.BTC);
-      const xautSlug = assetTickerToSlug(AssetTicker.XAUT);
-
-      this.fiatExchangeRateCache = {
-        [FiatCurrency.USD]: {
-          [AssetTicker.BTC]:
-            btcSlug != null ? await this.fetchLastPriceForSlug(btcSlug) : 0,
-          [AssetTicker.USDT]: 1,
-          [AssetTicker.XAUT]:
-            xautSlug != null ? await this.fetchLastPriceForSlug(xautSlug) : 0,
-          [AssetTicker.USAT]: 1,
-        },
-      };
-
-      this.isInitialized = true;
-    } catch (error) {
-      console.error('Failed to refresh exchange rates:', error);
-      throw error;
-    }
+    this.refreshInFlight = this.fetchSpotRates()
+      .then(({ btc, xaut }) => {
+        this.applyRates(btc, xaut);
+      })
+      .finally(() => {
+        this.refreshInFlight = null;
+      });
+    return this.refreshInFlight;
   }
 
   getExchangeRate(asset: AssetTicker, currency: FiatCurrency): number | undefined {
@@ -226,10 +290,6 @@ class PricingService {
     /** Override slug sent to API (e.g. from env or custom mapping). */
     apiFromSymbol?: string;
   }): Promise<{ price: number; ts: number }[]> {
-    if (!this.isInitialized) {
-      throw new Error('Pricing service not initialized');
-    }
-
     const slug =
       opts.apiFromSymbol ?? assetTickerToSlug(opts.from) ?? opts.from.toLowerCase();
     const nowMs = Date.now();

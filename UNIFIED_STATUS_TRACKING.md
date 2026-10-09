@@ -202,6 +202,16 @@ When implementing proof/certificate/SPTR workflows, call the status update endpo
 5. **SPTR Creation**: `PUT /api/purchases/:purchaseId/status/sptr_created`
 6. **SPTR Delivery**: `PUT /api/purchases/:purchaseId/status/sptr_delivered`
 
+## Client polling (Spaces Wallet)
+
+The app polls `GET /api/purchases/:spaceName/:subspace/status` (plus SUBS handle, listnums, and pipeline when relevant) until a terminal unified status or on-chain detection. Intervals are **phase-based** — see `src/utils/purchase-status-polling.ts` and `JOB_STATUS_POLLING.md`:
+
+- **Free coupon** (`requesting` / `isFreeCouponPurchase`): **3 min** until SUBS `staged`
+- **Paid purchase** (pre-staged): **30 min**
+- **Staged / commitment pipeline**: **60 min**
+
+Users can tap the My Spaces **Status** header for an immediate manual refresh without waiting for the next scheduled poll.
+
 ## Testing
 
 To test the unified status system:

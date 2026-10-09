@@ -28,11 +28,8 @@ import {
 } from '@/hooks/use-ensure-wallet-addresses';
 import { NetworkType } from '@/config/networks';
 import { WDKService } from '@/services/wdk-service';
-import {
-  useBalancesForWallet,
-  useWallet,
-  useWalletManager,
-} from '@spacesops/wdk-react-native-core';
+import { useBalancesForWallet, useWalletManager } from '@spacesops/wdk-react-native-core';
+import { useAppWallet } from '@/hooks/use-app-wallet';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import getChainsConfig from '@/config/get-chains-config';
 import { createLegacyBalances } from '@/utils/legacy-balances';
@@ -50,6 +47,15 @@ import {
   formatMySpacesThirdColumnLabel,
   pipelineSnapshotFieldsFromUpdate,
 } from '@/utils/space-pipeline';
+import {
+  getPollingErrorRetryMs,
+  getPollingIntervalMs,
+  getPollingIntervalMsForContext,
+  MAX_POLL_ATTEMPTS,
+  resolvePurchasePollingPhase,
+  SLOW_UI_TICK_THRESHOLD_MS,
+  type PurchasePollingPhase,
+} from '@/utils/purchase-status-polling';
 import {
   resolveNextAvailableTaprootPath,
   type NextAvailableTaprootPath,
@@ -77,13 +83,23 @@ import {
 import type { BtcPaymentOutput } from '@/services/wdk-service';
 import * as Clipboard from 'expo-clipboard';
 import { toast } from 'sonner-native';
+import {
+  fetchSpaceNameOptionsWithRetry,
+  isSpacesListCacheStale,
+  readCachedSpaceNamesEntry,
+  type SpacesLoadStatus,
+} from '@/utils/load-spaces-list';
 
-const SPACE_NAME_OPTIONS = ['spacesops_services', 'are_currently_unavailable', 'try_again_later'];
 const DURATION_OPTIONS = ['~10 mins', '~1 hour', '~8 hours'];
 const SPACES_API_BASE_URL = process.env.EXPO_PUBLIC_SPACES_API_BASE_URL || 'http://192.168.1.111:7264';
 const SPACES_APP_NAME = 'spaces-wallet';
 const EMPTY_SUBSPACE_BUTTON_LABEL = 'Enter a subspace name';
 const NO_SPACE_NAME_BUTTON_LABEL = 'Select a Space name';
+
+/** Subspace handles use hyphens; map typed periods to hyphens while searching. */
+function normalizeSubspaceInput(value: string): string {
+  return value.replace(/\./g, '-');
+}
 
 function idlePurchaseButtonLabel(subspaceValue: string, spaceNameValue: string): string {
   if (subspaceValue.trim().length === 0) {
@@ -1081,16 +1097,6 @@ interface SpaceAvailabilityResponse {
   [key: string]: any;
 }
 
-interface SpaceItem {
-  space_name: string;
-  [key: string]: any;
-}
-
-interface GetSpacesResponse {
-  spaces: SpaceItem[];
-  [key: string]: any;
-}
-
 function parseSpacesApiErrorMessage(errorText: string): string | null {
   const trimmed = errorText.trim();
   if (!trimmed) return null;
@@ -1140,9 +1146,7 @@ export default function SpacesScreen() {
   const router = useDebouncedNavigation();
   const { wallets, activeWalletId } = useWalletManager();
   const currentWalletId = resolveCurrentWalletId(activeWalletId, wallets);
-  const { addresses, isInitialized } = useWallet(
-    currentWalletId ? { walletId: currentWalletId } : undefined
-  );
+  const { addresses, isInitialized } = useAppWallet(currentWalletId);
   const tokenConfigs = useMemo(() => getTokenConfigs(), []);
   const { addressesSettled } = useEnsureWalletAddresses(
     DISPLAY_WALLET_NETWORKS,
@@ -1196,7 +1200,17 @@ export default function SpacesScreen() {
   const [sptrFee6, setSptrFee6] = useState<number | null>(null);
   const [sptrFee48, setSptrFee48] = useState<number | null>(null);
   const [takeOnchain, setTakeOnchain] = useState(false);
-  const [spaceNameOptions, setSpaceNameOptions] = useState<string[]>(SPACE_NAME_OPTIONS);
+  const [spaceNameOptions, setSpaceNameOptions] = useState<string[]>([]);
+  const [spacesLoadStatus, setSpacesLoadStatus] = useState<SpacesLoadStatus>('loading');
+  const [spacesLoadError, setSpacesLoadError] = useState<string | null>(null);
+  const [spacesListFromCache, setSpacesListFromCache] = useState(false);
+  const [spacesListRefreshing, setSpacesListRefreshing] = useState(false);
+  const spacesListLoadInFlightRef = useRef(false);
+  const spacesListHasLoadedOnceRef = useRef(false);
+  const spacesListLastFetchAtRef = useRef<number | null>(null);
+  const spaceNameOptionsRef = useRef<string[]>([]);
+  spaceNameOptionsRef.current = spaceNameOptions;
+
   const filteredSpaceNameOptions = useMemo(() => {
     const query = spaceName.trim();
     if (!query) {
@@ -1207,7 +1221,93 @@ export default function SpacesScreen() {
   }, [spaceName, spaceNameOptions]);
 
   const showSpaceNameSuggestions =
-    spaceNameFocused && filteredSpaceNameOptions.length > 0;
+    spaceNameFocused && spacesLoadStatus === 'ready' && filteredSpaceNameOptions.length > 0;
+
+  const showSpacesListLoading =
+    spacesLoadStatus === 'loading' || (spacesListRefreshing && spacesListFromCache);
+
+  const spacesLoadStatusRef = useRef(spacesLoadStatus);
+  spacesLoadStatusRef.current = spacesLoadStatus;
+
+  const loadSpaceNameOptions = useCallback(async (mode: 'initial' | 'refresh' | 'retry') => {
+    if (spacesListLoadInFlightRef.current) {
+      return;
+    }
+    spacesListLoadInFlightRef.current = true;
+
+    let knownOptions: string[] = mode === 'initial' ? [] : [...spaceNameOptionsRef.current];
+
+    try {
+      if (mode === 'initial') {
+        const cached = await readCachedSpaceNamesEntry();
+        if (cached.spaceNames.length > 0) {
+          knownOptions = cached.spaceNames;
+          setSpaceNameOptions(cached.spaceNames);
+          setSpacesListFromCache(true);
+          setSpacesLoadStatus('ready');
+          if (cached.cachedAt != null) {
+            spacesListLastFetchAtRef.current = cached.cachedAt;
+          }
+          if (!isSpacesListCacheStale(cached.cachedAt)) {
+            return;
+          }
+          setSpacesListRefreshing(true);
+        } else {
+          setSpacesLoadStatus('loading');
+          setSpacesLoadError(null);
+        }
+      } else if (mode === 'retry') {
+        setSpacesLoadStatus('loading');
+        setSpacesLoadError(null);
+      } else {
+        setSpacesListRefreshing(true);
+      }
+
+      const result = await fetchSpaceNameOptionsWithRetry(SPACES_API_BASE_URL, SPACES_APP_NAME);
+
+      if (result.ok) {
+        spacesListLastFetchAtRef.current = Date.now();
+        setSpaceNameOptions(result.spaceNames);
+        setSpacesListFromCache(false);
+        setSpacesLoadStatus('ready');
+        setSpacesLoadError(null);
+      } else if (knownOptions.length > 0) {
+        setSpacesLoadStatus('ready');
+        setSpacesLoadError(result.errorMessage);
+        if (mode === 'retry') {
+          toast.error(result.errorMessage);
+        }
+      } else {
+        setSpacesLoadStatus('error');
+        setSpacesLoadError(result.errorMessage);
+        if (mode !== 'refresh') {
+          toast.error(result.errorMessage);
+        }
+      }
+    } finally {
+      spacesListLoadInFlightRef.current = false;
+      setSpacesListRefreshing(false);
+    }
+  }, []);
+
+  const loadSpaceNameOptionsRef = useRef(loadSpaceNameOptions);
+  loadSpaceNameOptionsRef.current = loadSpaceNameOptions;
+
+  useFocusEffect(
+    useCallback(() => {
+      if (!spacesListHasLoadedOnceRef.current) {
+        spacesListHasLoadedOnceRef.current = true;
+        void loadSpaceNameOptionsRef.current('initial');
+        return;
+      }
+
+      if (spacesLoadStatusRef.current === 'error') {
+        void loadSpaceNameOptionsRef.current('retry');
+      } else if (isSpacesListCacheStale(spacesListLastFetchAtRef.current)) {
+        void loadSpaceNameOptionsRef.current('refresh');
+      }
+    }, [])
+  );
 
   const [btcPriceUSD, setBtcPriceUSD] = useState<number | null>(null);
   const [quoteId, setQuoteId] = useState<number | null>(null);
@@ -1289,6 +1389,8 @@ export default function SpacesScreen() {
        * Set to `pointer` for Take on-chain / standalone pointer purchases.
        */
       unifiedStatusPurchaseType?: 'subname' | 'pointer';
+      /** Completely-free coupon purchase; slower simulated-tx polling until staged. */
+      isFreeCouponPurchase?: boolean;
       /** Raw status from GET /api/subsd/spaces/@{space}/handles/{subspace} (e.g. `staged`). */
       subsHandleStatus?: string | null;
       /** Latest commitment_root when subs status is `committed`. */
@@ -1313,6 +1415,7 @@ export default function SpacesScreen() {
         nextCheckTime: number;
         attempt: number;
         isPolling: boolean;
+        pollingPhase?: PurchasePollingPhase;
       }
     >
   >({});
@@ -1503,18 +1606,15 @@ export default function SpacesScreen() {
     return formatMySpaceHandleStatusLabel(space);
   };
 
-  const getTimeUntilNextCheck = (subspace: string, spaceName: string): number | null => {
+  const getTimeUntilNextCheckMs = (subspace: string, spaceName: string): number | null => {
     const space = mySpaces.find((s) => s.subspace === subspace && s.spaceName === spaceName);
     if (!space || !space.jobId) return null;
 
     const pollingState = jobPollingState[space.jobId];
     if (!pollingState || !pollingState.isPolling) return null;
 
-    const now = Date.now();
-    const timeRemaining = pollingState.nextCheckTime - now;
-    if (timeRemaining <= 0) return 0;
-    // Return minutes (rounded to 1 decimal place)
-    return Math.round((timeRemaining / 60000) * 10) / 10;
+    const timeRemaining = pollingState.nextCheckTime - Date.now();
+    return timeRemaining <= 0 ? 0 : timeRemaining;
   };
 
   const handleRefreshAllMySpacesStatuses = useCallback(async () => {
@@ -1901,19 +2001,12 @@ export default function SpacesScreen() {
     spaceName: string,
     subspace: string,
     options: {
-      initialDelay?: number;
-      maxDelay?: number;
       maxAttempts?: number;
       /** @default 'subname' — use `pointer` for Take on-chain / standalone pointer. */
       unifiedStatusPurchaseType?: 'subname' | 'pointer';
     } = {}
   ) => {
-    const {
-      initialDelay = 2000, // Start with 2 seconds
-      maxDelay = 300000, // Max 5 minutes
-      maxAttempts = 100,
-      unifiedStatusPurchaseType = 'subname',
-    } = options;
+    const { maxAttempts = MAX_POLL_ATTEMPTS, unifiedStatusPurchaseType = 'subname' } = options;
 
     const spaceNameLower = spaceName.toLowerCase();
     const existingSpace = mySpaces.find(
@@ -1948,12 +2041,39 @@ export default function SpacesScreen() {
       'sptr_delivered',
     ]);
 
-    let delay = initialDelay;
+    const trackedRow = () =>
+      mySpacesRef.current.find(
+        (s) => s.subspace === subspace && s.spaceName === spaceNameLower
+      );
+
+    const buildPollingContext = (
+      unifiedStatus: string | null,
+      subsHandleStatus: string | null | undefined
+    ) => {
+      const row = trackedRow();
+      return {
+        unifiedStatus,
+        subsHandleStatus: subsHandleStatus ?? row?.subsHandleStatus ?? null,
+        isFreeCouponPurchase:
+          row?.isFreeCouponPurchase === true || row?.status === 'requesting',
+      };
+    };
+
+    let delay = getPollingIntervalMsForContext(
+      buildPollingContext(trackedRow()?.status ?? null, trackedRow()?.subsHandleStatus)
+    );
     let attempt = 0;
+    let pollingPhase: PurchasePollingPhase = resolvePurchasePollingPhase(
+      buildPollingContext(trackedRow()?.status ?? null, trackedRow()?.subsHandleStatus)
+    );
 
     const url = `${SPACES_API_BASE_URL}/api/jobs/${jobId}?space=${encodeURIComponent(spaceName)}`;
 
-    const updatePollingState = (nextCheckTime: number, isPolling: boolean) => {
+    const updatePollingState = (
+      nextCheckTime: number,
+      isPolling: boolean,
+      phase?: PurchasePollingPhase
+    ) => {
       setJobPollingState((prev) => ({
         ...prev,
         [jobId]: {
@@ -1961,6 +2081,7 @@ export default function SpacesScreen() {
           nextCheckTime,
           attempt,
           isPolling,
+          pollingPhase: phase ?? pollingPhase,
         },
       }));
     };
@@ -2040,13 +2161,12 @@ export default function SpacesScreen() {
             return null;
           }
 
-          // Set next check time (for first attempt, this is immediate, then uses delay)
           const nextCheckTime = attempt === 0 ? Date.now() : Date.now() + delay;
-          updatePollingState(nextCheckTime, true);
+          updatePollingState(nextCheckTime, true, pollingPhase);
           console.log(
-            `[Spaces] Polling job ${jobId} (purchase_type=${purchaseTypeQuery}) - attempt ${
+            `[Spaces] Polling job ${jobId} (purchase_type=${purchaseTypeQuery}, phase=${pollingPhase}) - attempt ${
               attempt + 1
-            }${attempt > 0 ? `, next check in ${delay}ms` : ' (immediate)'}`
+            }${attempt > 0 ? `, waited ${delay}ms` : ' (immediate)'}`
           );
 
           // Try unified status endpoint first, fallback to job status endpoint
@@ -2097,11 +2217,12 @@ export default function SpacesScreen() {
             spaceName,
             subspace
           );
-          const spaceRow = mySpaces.find(
-            (s) => s.subspace === subspace && s.spaceName === spaceNameLower
-          );
+          const spaceRow = trackedRow();
+          const subsStagedOrCommitted =
+            subsSnapshot?.subsStatus === 'staged' ||
+            subsSnapshot?.subsStatus === 'committed';
           const tenantQuote =
-            spaceRow?.chainPresence !== 'on-chain'
+            spaceRow?.chainPresence !== 'on-chain' && !subsStagedOrCommitted
               ? await fetchTenantQuoteRecord(SPACES_API_BASE_URL, spaceName, subspace)
               : null;
           let pipelineSnapshot: Awaited<ReturnType<typeof fetchSpacePipelineSnapshot>> | null =
@@ -2221,7 +2342,7 @@ export default function SpacesScreen() {
             unifiedStatus || (data.purchase?.unified_status as UnifiedStatus) || 'pending_payment';
 
           if (terminalStates.includes(currentStatus)) {
-            updatePollingState(nextCheckTime, false);
+            updatePollingState(nextCheckTime, false, pollingPhase);
             console.log(`[Spaces] Job ${jobId} completed with status: ${currentStatus}`);
             if (currentStatus === 'certificate_delivered' || currentStatus === 'sptr_delivered') {
               toast.success(`Purchase complete for ${subspace}@${spaceName}`);
@@ -2252,29 +2373,32 @@ export default function SpacesScreen() {
             console.log(`[Spaces] Unified status: ${unifiedStatus} (attempt ${attempt + 1})`);
           }
 
-          // Exponential backoff: double delay, up to maxDelay
-          delay = Math.min(delay * 2, maxDelay);
+          const pollingCtx = buildPollingContext(
+            currentStatus,
+            subsSnapshot?.subsStatus
+          );
+          pollingPhase = resolvePurchasePollingPhase(pollingCtx);
+          delay = getPollingIntervalMs(pollingPhase);
           attempt++;
 
-          // Set next check time for the next poll (after exponential backoff)
           const nextCheckTimeAfterDelay = Date.now() + delay;
-          updatePollingState(nextCheckTimeAfterDelay, true);
+          updatePollingState(nextCheckTimeAfterDelay, true, pollingPhase);
 
-          // Wait before next poll
           await new Promise((resolve) => setTimeout(resolve, delay));
         } catch (error) {
           console.error(`[Spaces] Polling error (attempt ${attempt + 1}):`, error);
+          const row = trackedRow();
+          const errorCtx = buildPollingContext(row?.status ?? null, row?.subsHandleStatus);
+          delay = getPollingErrorRetryMs(errorCtx);
+          pollingPhase = resolvePurchasePollingPhase(errorCtx);
           const nextCheckTime = Date.now() + delay;
-          updatePollingState(nextCheckTime, true);
+          updatePollingState(nextCheckTime, true, pollingPhase);
 
-          // On error, wait before retrying (with exponential backoff)
           await new Promise((resolve) => setTimeout(resolve, delay));
-          delay = Math.min(delay * 2, maxDelay);
           attempt++;
 
-          // If max attempts reached, stop polling
           if (attempt >= maxAttempts) {
-            updatePollingState(nextCheckTime, false);
+            updatePollingState(nextCheckTime, false, pollingPhase);
             toast.error(`Max polling attempts reached for ${subspace}@${spaceName}`);
             return null;
           }
@@ -2567,6 +2691,7 @@ export default function SpacesScreen() {
             spaceName: currentSpaceName,
             handle: purchaseData.handle,
             status: 'requesting' as const,
+            isFreeCouponPurchase: true,
           };
           setMySpaces((prev) => {
             const existingIndex = prev.findIndex(
@@ -3991,64 +4116,6 @@ export default function SpacesScreen() {
     return () => clearInterval(interval);
   }, []);
 
-  // Load space names from API when component mounts
-  useEffect(() => {
-    const loadSpaces = async () => {
-      const url = `${SPACES_API_BASE_URL}/getspaces?app=${SPACES_APP_NAME}`;
-      const startTime = Date.now();
-      console.log(`[Spaces API] GET ${url}`);
-
-      try {
-        const response = await fetch(url, {
-          method: 'GET',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-        });
-
-        const endTime = Date.now();
-        const duration = endTime - startTime;
-
-        if (!response.ok) {
-          console.error(
-            `[Spaces API] GET ${url} - HTTP error! status: ${response.status} (${duration}ms)`
-          );
-          if (response.status >= 500) {
-            toast.error('Spaces server is temporarily unavailable. Please try again later.');
-          }
-          return;
-        }
-
-        const data: GetSpacesResponse = await response.json();
-        console.log(`[Spaces API] GET ${url} - Success (${duration}ms)`);
-
-        if (data.spaces && Array.isArray(data.spaces)) {
-          // Extract space_name from each object
-          const spaceNames = data.spaces
-            .map((item) => item.space_name)
-            .filter((name): name is string => typeof name === 'string' && name.length > 0);
-          setSpaceNameOptions(spaceNames);
-        }
-      } catch (error) {
-        const endTime = Date.now();
-        const duration = endTime - startTime;
-
-        if (error instanceof TypeError && error.message.includes('Network request failed')) {
-          console.error(
-            `[Spaces API] GET ${url} - Network failure (${duration}ms):`,
-            error.message
-          );
-        } else {
-          console.error(`[Spaces API] GET ${url} - Failed (${duration}ms):`, error);
-        }
-        toast.error('Unable to reach Spaces server. Please try again later.');
-        // Keep default options on error
-      }
-    };
-
-    loadSpaces();
-  }, []);
-
   // If the user types a subspace before choosing space_name, warn once (until they pick a space or clear subspace)
   useEffect(() => {
     const hasSub = subspace.trim().length > 0;
@@ -4401,18 +4468,17 @@ export default function SpacesScreen() {
     }, [loadMySpaces])
   );
 
-  // Update countdown timers every second for active polling jobs
+  // Update countdown timers for active polling jobs (slow tick for long intervals)
   useEffect(() => {
-    const activeJobs = Object.keys(jobPollingState).filter(
-      (jobId) => jobPollingState[Number(jobId)]?.isPolling
-    );
+    const activeStates = Object.values(jobPollingState).filter((s) => s?.isPolling);
+    if (activeStates.length === 0) return;
 
-    if (activeJobs.length === 0) return;
+    const minDelay = Math.min(...activeStates.map((s) => s.delay));
+    const tickMs = minDelay >= SLOW_UI_TICK_THRESHOLD_MS ? 60_000 : 1_000;
 
     const interval = setInterval(() => {
-      // Force re-render to update countdown timers
       setJobPollingState((prev) => ({ ...prev }));
-    }, 1000);
+    }, tickMs);
 
     return () => clearInterval(interval);
   }, [jobPollingState]);
@@ -4609,7 +4675,7 @@ export default function SpacesScreen() {
                 placeholder="subspace"
                 placeholderTextColor={colors.textSecondary}
                 value={subspace}
-                onChangeText={setSubspace}
+                onChangeText={(text) => setSubspace(normalizeSubspaceInput(text))}
                 autoCapitalize="none"
                 autoCorrect={false}
               />
@@ -4634,6 +4700,34 @@ export default function SpacesScreen() {
                 />
               </View>
             </View>
+
+            {showSpacesListLoading ? (
+              <View style={styles.spacesListStatusRow}>
+                <ActivityIndicator size="small" color={colors.primary} />
+                <Text style={styles.spacesListStatusText}>Loading spaces…</Text>
+              </View>
+            ) : null}
+
+            {spacesLoadStatus === 'error' ? (
+              <View style={styles.spacesListErrorRow}>
+                <Text style={styles.spacesListErrorText}>
+                  {spacesLoadError ?? 'Unable to load spaces list.'}
+                </Text>
+                <TouchableOpacity
+                  style={styles.spacesListRetryButton}
+                  onPress={() => loadSpaceNameOptions('retry')}
+                  activeOpacity={0.7}
+                >
+                  <Text style={styles.spacesListRetryButtonText}>Retry</Text>
+                </TouchableOpacity>
+              </View>
+            ) : null}
+
+            {spacesLoadStatus === 'ready' && spacesLoadError ? (
+              <Text style={styles.spacesListStaleHint}>
+                Could not refresh the spaces list. Showing saved spaces.
+              </Text>
+            ) : null}
 
             {showSpaceNameSuggestions ? (
               <View style={styles.spaceNameSuggestions}>
@@ -4923,8 +5017,7 @@ export default function SpacesScreen() {
             <View style={styles.infoCard}>
               <Text style={styles.emptyText}>No spaces yet</Text>
               <Text style={styles.emptySubtext}>
-                Search for and purchase a space above, or scan for existing spaces by pressing the
-                Find Spaces button.
+                Search for and purchase a space above.
               </Text>
             </View>
           ) : (
@@ -4957,11 +5050,14 @@ export default function SpacesScreen() {
               </View>
               {/* Table Rows */}
               {mySpaces.map((space, index) => {
-                const timeUntilNextCheck = getTimeUntilNextCheck(space.subspace, space.spaceName);
+                const timeUntilNextCheckMs = getTimeUntilNextCheckMs(
+                  space.subspace,
+                  space.spaceName
+                );
                 const statusText = getSpaceStatus(space.subspace, space.spaceName);
                 const thirdColumnLabel = formatMySpacesThirdColumnLabel(
                   space,
-                  timeUntilNextCheck
+                  timeUntilNextCheckMs
                 );
 
                 return (
@@ -4993,13 +5089,6 @@ export default function SpacesScreen() {
               })}
             </View>
           )}
-          <TouchableOpacity
-            style={styles.findSpacesButton}
-            onPress={handleFindSpaces}
-            activeOpacity={0.7}
-          >
-            <Text style={styles.findSpacesButtonText}>Find Spaces</Text>
-          </TouchableOpacity>
             </>
           )}
         </View>
@@ -5467,6 +5556,42 @@ const styles = StyleSheet.create({
     color: colors.text,
     borderWidth: 1,
     borderColor: colors.borderDark,
+  },
+  spacesListStatusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 12,
+  },
+  spacesListStatusText: {
+    fontSize: 14,
+    color: colors.textSecondary,
+  },
+  spacesListErrorRow: {
+    marginTop: 12,
+    gap: 8,
+  },
+  spacesListErrorText: {
+    fontSize: 14,
+    color: colors.textSecondary,
+  },
+  spacesListRetryButton: {
+    alignSelf: 'flex-start',
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: colors.primary,
+  },
+  spacesListRetryButtonText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: colors.primary,
+  },
+  spacesListStaleHint: {
+    marginTop: 12,
+    fontSize: 13,
+    color: colors.textSecondary,
   },
   spaceNameSuggestions: {
     backgroundColor: colors.background,

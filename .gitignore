@@ -56,3 +56,8 @@ wdk-react-native-provider/
 credentials.json
 addons-lock.json
 
+# Local build artifacts
+*.apk
+*.aab
+*.ipa
+

@@ -173,110 +173,106 @@ These headers indicate that responses should not be cached and clients should al
 
 ## Polling Strategy
 
-### Exponential Backoff
+### Phase-based intervals (Spaces Wallet)
 
-Clients should implement exponential backoff to avoid excessive polling. Here's a recommended strategy:
+Purchase status changes on much longer timelines than early clients assumed. **Spaces Wallet** (`src/utils/purchase-status-polling.ts`, `pollJobStatus` in `src/app/spaces.tsx`) uses **fixed phase-based intervals** instead of exponential backoff:
 
-1. **Initial Polling**: Start with short intervals (1-5 seconds) for immediate feedback
-2. **Exponential Increase**: Double the delay after each poll until reaching a maximum
-3. **Maximum Delay**: Cap at 5 minutes (300 seconds) for long-running jobs
-4. **Stop Conditions**: Stop polling when status is terminal (`confirmed`, `expired`, `cancelled`)
+| Phase | When | Interval | Rationale |
+|-------|------|----------|-----------|
+| `free_coupon_early` | Completely-free coupon (`isFreeCouponPurchase` or `requesting`) before SUBS `staged` | **3 min** | Simulated transaction; server updates after several minutes |
+| `pre_staged` | Paid purchase before SUBS `staged` | **30 min** | Real tx confirmation + staging typically takes ≥30 minutes |
+| `staged_plus` | SUBS `staged`/`committed`, or unified `proof_created`+ | **60 min** | Batch commitments are ~150 blocks (>1 day); hourly checks suffice |
+
+**Other rules:**
+
+1. **One immediate poll** on start (catch already-complete purchases), then wait the phase interval.
+2. **Error retries:** `min(phaseInterval, 5 min)` — no exponential doubling.
+3. **maxAttempts:** 168 (~7 days at 1 hr for long commitment pipelines).
+4. **Manual refresh:** My Spaces Status header triggers an immediate full refresh (`handleRefreshAllMySpacesStatuses`).
+5. **Stop conditions:** Terminal unified states (`certificate_delivered`, `sptr_delivered`, `expired`, `cancelled`) or on-chain via listnums.
 
 ### Example Client Implementation
 
 #### JavaScript/TypeScript
 
 ```javascript
+const FREE_COUPON_POLL_MS = 3 * 60 * 1000;
+const PRE_STAGED_POLL_MS = 30 * 60 * 1000;
+const STAGED_PLUS_POLL_MS = 60 * 60 * 1000;
+const ERROR_RETRY_CAP_MS = 5 * 60 * 1000;
+const MAX_POLL_ATTEMPTS = 168;
+
+function resolvePollingPhase({ unifiedStatus, subsHandleStatus, isFreeCouponPurchase }) {
+  const subs = subsHandleStatus?.toLowerCase();
+  if (subs === 'staged' || subs === 'committed') return 'staged_plus';
+  const proofOrLater = ['proof_created', 'proof_batched', 'proof_committed',
+    'certificate_pending', 'certificate_delivered', 'sptr_creating', 'sptr_created', 'sptr_delivered'];
+  if (proofOrLater.includes(unifiedStatus)) return 'staged_plus';
+  if (isFreeCouponPurchase || unifiedStatus === 'requesting') return 'free_coupon_early';
+  return 'pre_staged';
+}
+
+function intervalForPhase(phase) {
+  if (phase === 'free_coupon_early') return FREE_COUPON_POLL_MS;
+  if (phase === 'staged_plus') return STAGED_PLUS_POLL_MS;
+  return PRE_STAGED_POLL_MS;
+}
+
 /**
- * Poll job status with exponential backoff
- * @param {number} jobId - Job ID to poll
- * @param {string} spaceName - Space name (optional but recommended)
- * @param {Object} options - Polling options
- * @returns {Promise<Object>} Final job status
+ * Poll unified purchase status with phase-based fixed intervals.
  */
-async function pollJobStatus(jobId, spaceName = null, options = {}) {
-  const {
-    initialDelay = 2000,      // Start with 2 seconds
-    maxDelay = 300000,         // Max 5 minutes
-    maxAttempts = 100,         // Maximum polling attempts
-    baseUrl = 'http://localhost:3000'
-  } = options;
-  
-  let delay = initialDelay;
+async function pollPurchaseStatus(spaceName, subspace, options = {}) {
+  const { maxAttempts = MAX_POLL_ATTEMPTS, baseUrl = 'http://localhost:3000' } = options;
   let attempt = 0;
-  
-  const url = spaceName 
-    ? `${baseUrl}/api/jobs/${jobId}?space=${encodeURIComponent(spaceName)}`
-    : `${baseUrl}/api/jobs/${jobId}`;
-  
+  let delay = PRE_STAGED_POLL_MS;
+
+  const statusUrl = `${baseUrl}/api/purchases/${encodeURIComponent(spaceName)}/${encodeURIComponent(subspace)}/status`;
+
   while (attempt < maxAttempts) {
     try {
-      const response = await fetch(url);
+      const response = await fetch(statusUrl);
       const data = await response.json();
-      
-      if (!data.success) {
-        throw new Error(data.message || 'Failed to fetch job status');
-      }
-      
-      const job = data.job;
-      const purchase = data.purchase;
-      
-      // Check for terminal states
-      const terminalStates = ['confirmed', 'expired', 'cancelled'];
-      if (terminalStates.includes(job.status)) {
-        return data; // Job finished
-      }
-      
-      // Check expiration
-      if (job.is_expired) {
-        return { ...data, expired: true };
-      }
-      
-      // Log progress
-      console.log(`Job ${jobId}: ${job.status} (attempt ${attempt + 1})`);
-      if (job.blocks_until_expiration !== null) {
-        console.log(`  Blocks until expiration: ${job.blocks_until_expiration}`);
-      }
-      
-      // Wait before next poll
-      await new Promise(resolve => setTimeout(resolve, delay));
-      
-      // Exponential backoff: double delay, up to maxDelay
-      delay = Math.min(delay * 2, maxDelay);
+      if (!data.success) throw new Error(data.message || 'Failed to fetch status');
+
+      const unifiedStatus = data.unified_status;
+      const subsHandleStatus = data.subs_handle_status ?? null; // fetch SUBS separately in production
+
+      const terminal = ['certificate_delivered', 'sptr_delivered', 'expired', 'cancelled'];
+      if (terminal.includes(unifiedStatus)) return data;
+
+      const phase = resolvePollingPhase({
+        unifiedStatus,
+        subsHandleStatus,
+        isFreeCouponPurchase: unifiedStatus === 'requesting',
+      });
+      delay = intervalForPhase(phase);
       attempt++;
-      
+
+      await new Promise((resolve) => setTimeout(resolve, delay));
     } catch (error) {
       console.error(`Polling error (attempt ${attempt + 1}):`, error.message);
-      
-      // On error, wait before retrying (with exponential backoff)
-      await new Promise(resolve => setTimeout(resolve, delay));
-      delay = Math.min(delay * 2, maxDelay);
+      const retryMs = Math.min(delay, ERROR_RETRY_CAP_MS);
+      await new Promise((resolve) => setTimeout(resolve, retryMs));
       attempt++;
-      
-      // If max attempts reached, throw error
       if (attempt >= maxAttempts) {
         throw new Error(`Max polling attempts (${maxAttempts}) reached: ${error.message}`);
       }
     }
   }
-  
+
   throw new Error(`Max polling attempts (${maxAttempts}) reached without completion`);
 }
 
 // Usage example
-async function monitorPurchase(jobId, spaceName) {
+async function monitorPurchase(spaceName, subspace) {
   try {
-    const result = await pollJobStatus(jobId, spaceName, {
-      initialDelay: 2000,    // 2 seconds
-      maxDelay: 300000,      // 5 minutes
-      maxAttempts: 100
-    });
-    
-    if (result.job.status === 'confirmed') {
-      console.log('Purchase confirmed!', result.purchase);
-    } else if (result.job.status === 'expired' || result.expired) {
+    const result = await pollPurchaseStatus(spaceName, subspace, { maxAttempts: MAX_POLL_ATTEMPTS });
+
+    if (result.unified_status === 'certificate_delivered' || result.unified_status === 'sptr_delivered') {
+      console.log('Purchase complete!', result);
+    } else if (result.unified_status === 'expired') {
       console.log('Purchase expired');
-    } else if (result.job.status === 'cancelled') {
+    } else if (result.unified_status === 'cancelled') {
       console.log('Purchase cancelled');
     }
     
@@ -473,12 +469,9 @@ GET /api/jobs/123?space=tabconf
 GET /api/jobs/123
 ```
 
-### 2. Implement Exponential Backoff
+### 2. Match polling frequency to operational timelines
 
-Never poll with fixed intervals. Always use exponential backoff to:
-- Reduce server load
-- Respect rate limits
-- Handle long-running jobs efficiently
+Do not poll every few seconds for purchases that take 30+ minutes to stage or days to commit. Use phase-based fixed intervals (see above) or exponential backoff capped at intervals appropriate to the current lifecycle stage.
 
 ### 3. Handle Network Errors
 
@@ -510,20 +503,28 @@ When rate limiting is implemented:
 
 ## Typical Polling Timeline
 
-For a purchase with `conf_target=6` (6-block confirmation):
+### Paid purchase (real transaction)
 
-| Time | Delay | Status | Action |
-|------|-------|--------|--------|
-| 0s | - | `pending_payment` | Initial poll |
-| 2s | 2s | `pending_payment` | Continue polling |
-| 6s | 4s | `processing` | Payment detected, continue |
-| 14s | 8s | `processing` | Waiting for confirmations |
-| 30s | 16s | `processing` | Still waiting... |
-| 62s | 32s | `processing` | ... |
-| 126s | 64s | `processing` | ... |
-| 254s | 128s | `confirmed` | **Done!** Stop polling |
+| Time | Interval | Status | Action |
+|------|----------|--------|--------|
+| 0s | immediate | `pending_payment` / `processing` | First status check |
+| +30 min | 30 min | `processing` / `confirmed` | Poll until SUBS `staged` |
+| +30 min | 30 min | SUBS `staged` | Phase switches to `staged_plus` |
+| +60 min | 60 min | `proof_*` / commitment pipeline | Hourly checks |
+| … | 60 min | `certificate_delivered` | **Done** — stop polling |
 
-**Total time:** ~4 minutes (varies based on block time and confirmation target)
+Staging after payment typically takes **≥30 minutes**. Batch commitments are **~150 blocks (>1 day)**.
+
+### Completely-free coupon (simulated transaction)
+
+| Time | Interval | Status | Action |
+|------|----------|--------|--------|
+| 0s | immediate | `requesting` | First status check |
+| +3 min | 3 min | `requesting` / `processing` | Poll until SUBS `staged` |
+| +3 min | 3 min | SUBS `staged` | Phase switches to hourly |
+| … | 60 min | `certificate_delivered` | **Done** |
+
+Simulated payment registration completes on the server after **several minutes**, not seconds.
 
 ## Integration with Purchase Flow
 
@@ -592,16 +593,12 @@ await fetch('/api/payments/callback?tenant=tabconf', {
   })
 });
 
-// 5. Poll for status
-const result = await pollJobStatus(jobId, 'tabconf', {
-  initialDelay: 2000,
-  maxDelay: 300000,
-  maxAttempts: 100
-});
+// 5. Poll for unified status (phase-based intervals in Spaces Wallet)
+const result = await pollPurchaseStatus('tabconf', 'unknown', { maxAttempts: 168 });
 
-// 4. Handle result
-if (result.job.status === 'confirmed') {
-  console.log('Purchase confirmed!', result.purchase);
+// 6. Handle result
+if (result.unified_status === 'certificate_delivered') {
+  console.log('Purchase complete!', result);
   // Proceed with next steps
 } else if (result.job.status === 'expired') {
   console.log('Purchase expired');

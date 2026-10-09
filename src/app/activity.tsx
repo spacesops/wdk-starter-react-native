@@ -1,5 +1,4 @@
 import {
-  useWallet,
   useWalletManager,
   useWalletTransactions,
   useBalancesForWallet,
@@ -20,6 +19,7 @@ import { FiatCurrency, pricingService } from '@/services/pricing-service';
 import formatTokenAmount from '@/utils/format-token-amount';
 import { isSentByWalletUI } from '@/services/historical-price-storage';
 import { flattenWalletAddresses } from '@/utils/wallet-addresses';
+import { useAppWallet } from '@/hooks/use-app-wallet';
 import { resolveCurrentWalletId } from '@/utils/resolve-current-wallet-id';
 import { filterTokenConfigsByNonZeroBalance } from '@/utils/filter-token-configs-by-balance';
 import { AssetTicker } from '@/config/assets';
@@ -67,9 +67,7 @@ export default function ActivityScreen() {
   const { wallets, activeWalletId } = useWalletManager();
   const currentWalletId = resolveCurrentWalletId(activeWalletId, wallets);
   const tokenConfigs = useMemo(() => getTokenConfigs(), []);
-  const { isInitialized, addresses: nestedAddresses } = useWallet(
-    currentWalletId ? { walletId: currentWalletId } : undefined
-  );
+  const { isInitialized, addresses: nestedAddresses } = useAppWallet(currentWalletId);
   const { addressesSettled } = useEnsureWalletAddresses(
     DISPLAY_WALLET_NETWORKS,
     currentWalletId

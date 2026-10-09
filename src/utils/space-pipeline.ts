@@ -1,3 +1,5 @@
+import { formatPollCountdownLabel } from './purchase-status-polling';
+
 export type SpacePipelineSteps = {
   broadcast?: string;
   confirmed?: string;
@@ -162,13 +164,13 @@ export function pipelineSnapshotFieldsFromUpdate(
 /** My Spaces third column: finalized ETA or poll countdown. */
 export function formatMySpacesThirdColumnLabel(
   space: { pipelineFinalizedHoursRemaining?: number | null },
-  timeUntilNextCheckMinutes: number | null
+  timeUntilNextCheckMs: number | null
 ): string {
   if (space.pipelineFinalizedHoursRemaining != null) {
     return `~ ${space.pipelineFinalizedHoursRemaining} hrs`;
   }
-  if (timeUntilNextCheckMinutes !== null) {
-    return `${timeUntilNextCheckMinutes} min`;
+  if (timeUntilNextCheckMs !== null) {
+    return formatPollCountdownLabel(timeUntilNextCheckMs);
   }
   return '-';
 }

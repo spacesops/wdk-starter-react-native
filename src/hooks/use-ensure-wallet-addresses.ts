@@ -1,4 +1,4 @@
-import { useWallet } from '@spacesops/wdk-react-native-core';
+import { useAppWallet } from '@/hooks/use-app-wallet';
 import { useEffect, useMemo, useSyncExternalStore } from 'react';
 import { flattenWalletAddresses } from '@/utils/wallet-addresses';
 
@@ -103,9 +103,7 @@ export function useEnsureWalletAddresses(
   networks: readonly string[],
   walletId?: string
 ) {
-  const { addresses: nestedAddresses, getAddress, isInitialized } = useWallet(
-    walletId ? { walletId } : undefined
-  );
+  const { addresses: nestedAddresses, getAddress, isInitialized } = useAppWallet(walletId);
   const addresses = useMemo(
     () => flattenWalletAddresses(nestedAddresses),
     [nestedAddresses]

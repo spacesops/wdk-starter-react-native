@@ -13,9 +13,9 @@ import { colors } from '@/constants/colors';
 
 import {
   useBalancesForWallet,
-  useWallet,
   useWalletManager,
 } from '@spacesops/wdk-react-native-core';
+import { useAppWallet } from '@/hooks/use-app-wallet';
 import { AssetSelector, type Token } from '@tetherto/wdk-uikit-react-native';
 import { FiatCurrency, pricingService } from '@/services/pricing-service';
 import formatAmount from '@/utils/format-amount';
@@ -32,9 +32,7 @@ export default function SelectTokenScreen() {
   const params = useLocalSearchParams();
   const { wallets, activeWalletId } = useWalletManager();
   const currentWalletId = resolveCurrentWalletId(activeWalletId, wallets);
-  const { isInitialized } = useWallet(
-    currentWalletId ? { walletId: currentWalletId } : undefined
-  );
+  const { isInitialized } = useAppWallet(currentWalletId);
   const tokenConfigs = useMemo(() => getTokenConfigs(), []);
   const { addressesSettled } = useEnsureWalletAddresses(
     DISPLAY_WALLET_NETWORKS,

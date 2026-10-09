@@ -1,0 +1,71 @@
+# EAS Build upload exclusions. Starts from .gitignore, then drops anything not
+# needed to install deps, run prebuild, and compile the app on EAS servers.
+# See https://docs.expo.dev/build-reference/easignore/
+
+# --- from .gitignore ---
+node_modules/
+.cache/
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+.kotlin/
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+.metro-health-check*
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+.DS_Store
+*.pem
+.env*.local
+google-service-account.json
+keys/
+*.tsbuildinfo
+.vscode
+app-example
+/ios
+/android
+.env
+wdk-wallet-btc/
+spacesops/
+wdk-react-native-provider/
+credentials.json
+addons-lock.json
+
+# --- build artifacts (local; EAS produces its own) ---
+*.apk
+*.aab
+*.ipa
+*.app
+spaceswallet.apk
+
+# --- docs, agent skills, IDE (not used by EAS Build) ---
+*.md
+!README.md
+docs/
+.agents/
+.cursor/
+.github/
+*.code-workspace
+
+# --- dev / legal / store collateral not bundled into the app ---
+assets/docs/
+CFTC_STAFF_LETTER_OPINION.md
+cftc_staff_letter.txt
+credentials/
+ticker.json
+simpler.js
+mock_xaut_tx.json
+update-onchain-example.txt
+
+# --- unit tests (not run during EAS compile) ---
+**/*.test.ts
+**/*.test.tsx
+
+# --- git metadata ---
+.git/

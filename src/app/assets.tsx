@@ -7,9 +7,9 @@ import {
 } from '@/hooks/use-ensure-wallet-addresses';
 import {
   useBalancesForWallet,
-  useWallet,
   useWalletManager,
 } from '@spacesops/wdk-react-native-core';
+import { useAppWallet } from '@/hooks/use-app-wallet';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
 import React, { useEffect, useMemo, useState } from 'react';
 import { Image, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
@@ -28,9 +28,7 @@ export default function AssetsScreen() {
   const router = useDebouncedNavigation();
   const { wallets, activeWalletId } = useWalletManager();
   const currentWalletId = resolveCurrentWalletId(activeWalletId, wallets);
-  const { isInitialized } = useWallet(
-    currentWalletId ? { walletId: currentWalletId } : undefined
-  );
+  const { isInitialized } = useAppWallet(currentWalletId);
   const tokenConfigs = useMemo(() => getTokenConfigs(), []);
   const { addressesSettled } = useEnsureWalletAddresses(
     DISPLAY_WALLET_NETWORKS,

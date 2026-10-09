@@ -1,8 +1,8 @@
 import { BalanceLoader } from '@/components/BalanceLoader';
+import { useAppWallet } from '@/hooks/use-app-wallet';
 import {
   useBalancesForWallet,
   useRefreshBalance,
-  useWallet,
   useWalletManager,
   useWalletTransactions,
 } from '@spacesops/wdk-react-native-core';
@@ -41,9 +41,9 @@ import {
   buildPortfolioValueChartData,
   DEFAULT_CHART_QUOTE_UNIT,
   DEFAULT_CHART_STACK_ORDER,
-  ensureChartUsdPrices,
   isSentByWalletUI,
   loadHistoricalPrices,
+  mergeEarliestTokenDates,
   moveTokenToChartStackBottom,
   onHistoricalPricesUpdated,
   TOKEN_CHART_COLORS,
@@ -146,9 +146,7 @@ export default function WalletScreen() {
   const router = useDebouncedNavigation();
   const { wallets, activeWalletId } = useWalletManager();
   const currentWalletId = resolveCurrentWalletId(activeWalletId, wallets);
-  const { isInitialized, addresses: nestedAddresses } = useWallet(
-    currentWalletId ? { walletId: currentWalletId } : undefined
-  );
+  const { isInitialized, addresses: nestedAddresses } = useAppWallet(currentWalletId);
   const { addressesSettled } = useEnsureWalletAddresses(DISPLAY_WALLET_NETWORKS, currentWalletId);
   const { mutate: refreshBalance } = useRefreshBalance();
   const tokenConfigs = useMemo(() => getTokenConfigs(), []);
@@ -427,6 +425,15 @@ export default function WalletScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [balances]);
 
+  // Spot rates can arrive after the first paint (cache seed, then network refresh).
+  useEffect(() => {
+    return pricingService.subscribeToExchangeRates(() => {
+      getAggregatedBalances().then(setAggregatedBalances);
+      getTransactions().then(setTransactions);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [balances, walletTransactions?.list, addresses]);
+
   // Refetch activity when the non-zero-balance token set changes (npm core may omit tokensKey).
   useEffect(() => {
     if (!balancesReady || Object.keys(activityTokenConfigs).length === 0) return;
@@ -452,6 +459,9 @@ export default function WalletScreen() {
     }));
     const table = buildBtcDailyBalanceTable(txList, walletAddresses);
     saveBtcDailyBalanceTable(table).catch(() => {});
+    mergeEarliestTokenDates(
+      rawList.map((tx) => ({ token: tx.token, timestamp: tx.timestamp }))
+    ).catch(() => {});
   }, [walletTransactions?.list, addresses]);
 
   const currentHoldings = useMemo((): CurrentHoldings => {
@@ -464,15 +474,13 @@ export default function WalletScreen() {
     return holdings;
   }, [balances?.list]);
 
+  const chartLoadGeneration = useRef(0);
+
   const loadChartData = useCallback(async () => {
+    const generation = ++chartLoadGeneration.current;
     try {
-      if (!pricingService.isReady()) {
-        await pricingService.initialize().catch(() => {});
-      }
-      let stored = await loadHistoricalPrices();
-      if (pricingService.isReady()) {
-        stored = await ensureChartUsdPrices(stored, pricingService);
-      }
+      const stored = await loadHistoricalPrices();
+      if (generation !== chartLoadGeneration.current) return;
       const rawList = walletTransactions?.list ?? [];
       const txList = rawList.map((tx) => ({
         timestamp: tx.timestamp,
@@ -484,6 +492,7 @@ export default function WalletScreen() {
       const walletAddresses = addresses
         ? Object.values(addresses).map((a) => a?.toLowerCase())
         : [];
+      if (generation !== chartLoadGeneration.current) return;
       setPortfolioChartInputs({
         stored,
         txList,
@@ -491,7 +500,9 @@ export default function WalletScreen() {
         currentHoldings,
       });
     } catch {
-      setPortfolioChartInputs(null);
+      if (generation === chartLoadGeneration.current) {
+        setPortfolioChartInputs(null);
+      }
     }
   }, [walletTransactions?.list, addresses, currentHoldings]);
 
@@ -499,16 +510,10 @@ export default function WalletScreen() {
     loadChartData();
   }, [loadChartData]);
 
-  // Reload chart when historical price sync completes (so we don't stay on "No price history yet")
+  // Reload chart when a token series is saved. The screen only reads storage.
   useEffect(() => {
     const unsubscribe = onHistoricalPricesUpdated(loadChartData);
     return unsubscribe;
-  }, [loadChartData]);
-
-  // Delayed reload so we pick up chart data if sync completes shortly after mount
-  useEffect(() => {
-    const t = setTimeout(loadChartData, 1500);
-    return () => clearTimeout(t);
   }, [loadChartData]);
 
   useFocusEffect(
