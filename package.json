@@ -1,7 +1,7 @@
 {
   "name": "@tetherto/wdk-starter-react-native",
   "main": "expo-router/entry",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "scripts": {
     "start": "expo start --dev-client",
     "start:android": "expo start --dev-client --localhost",

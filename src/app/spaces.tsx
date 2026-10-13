@@ -6,7 +6,6 @@ import { useFocusEffect } from '@react-navigation/native';
 import {
   ActivityIndicator,
   Alert,
-  InteractionManager,
   Keyboard,
   Modal,
   ScrollView,
@@ -96,8 +95,6 @@ const SPACES_APP_NAME = 'spaces-wallet';
 const SPACES_LIST_BACKGROUND_TIMEOUT_MS = 10_000;
 /** When true, show the cached getspaces list from AsyncStorage before the network refresh. */
 const LOAD_SPACES_ASYNC = false;
-/** Upper bound on waiting for the push animation before starting the list refresh. */
-const SPACES_LIST_START_MAX_DEFER_MS = 600;
 
 function sameSpaceNames(a: string[], b: string[]): boolean {
   return a.length === b.length && a.every((name, i) => name === b[i]);
@@ -1372,21 +1369,12 @@ export default function SpacesScreen() {
           : 'refresh';
       spacesListHasLoadedOnceRef.current = true;
 
-      let started = false;
-      const start = () => {
-        if (started) return;
-        started = true;
-        console.log(`[Spaces] Screen focused — reloading spaces list (${mode})`);
-        spacesListAbortRef.current?.abort();
-        spacesListLoadPromiseRef.current = null;
-        void loadSpaceNameOptionsRef.current(mode);
-      };
-      const interaction = InteractionManager.runAfterInteractions(start);
-      const fallback = setTimeout(start, SPACES_LIST_START_MAX_DEFER_MS);
+      console.log(`[Spaces] Screen focused — reloading spaces list (${mode})`);
+      spacesListAbortRef.current?.abort();
+      spacesListLoadPromiseRef.current = null;
+      void loadSpaceNameOptionsRef.current(mode);
 
       return () => {
-        interaction.cancel();
-        clearTimeout(fallback);
         // Hide the banner when leaving; in-flight fetch may still finish and update cache.
         setSpacesListRefreshing(false);
       };
