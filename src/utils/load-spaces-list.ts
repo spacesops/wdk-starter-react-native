@@ -19,10 +19,7 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export function isSpacesListCacheStale(
-  cachedAt: number | null,
-  now = Date.now()
-): boolean {
+export function isSpacesListCacheStale(cachedAt: number | null, now = Date.now()): boolean {
   if (cachedAt == null || !Number.isFinite(cachedAt)) {
     return true;
   }
@@ -86,20 +83,33 @@ type FetchGetSpacesOnceResult =
 
 async function fetchGetSpacesOnce(
   baseUrl: string,
-  appName: string
+  appName: string,
+  externalSignal?: AbortSignal,
+  timeoutMs = FETCH_TIMEOUT_MS
 ): Promise<FetchGetSpacesOnceResult> {
   const url = `${baseUrl.replace(/\/$/, '')}/getspaces?app=${encodeURIComponent(appName)}`;
   const startTime = Date.now();
 
+  if (externalSignal?.aborted) {
+    return { ok: false, retryable: false, status: 0, errorMessage: 'Aborted' };
+  }
+
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  const onExternalAbort = () => controller.abort();
+  externalSignal?.addEventListener('abort', onExternalAbort);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let outcome = 'threw';
 
   try {
+    console.log(`[Spaces API] GET getspaces - start ${url}`);
     const response = await fetch(url, {
       method: 'GET',
+      cache: 'no-store',
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/json',
+        'Cache-Control': 'no-cache',
+        Pragma: 'no-cache',
       },
       signal: controller.signal,
     });
@@ -113,6 +123,7 @@ async function fetchGetSpacesOnce(
       );
       const retryable =
         response.status >= 500 || response.status === 408 || response.status === 429;
+      outcome = `HTTP ${response.status}`;
       return {
         ok: false,
         retryable,
@@ -125,6 +136,7 @@ async function fetchGetSpacesOnce(
     try {
       data = text ? (JSON.parse(text) as { spaces?: { space_name?: string }[] }) : {};
     } catch {
+      outcome = 'invalid JSON';
       return {
         ok: false,
         retryable: false,
@@ -134,6 +146,7 @@ async function fetchGetSpacesOnce(
     }
 
     if (!data.spaces || !Array.isArray(data.spaces)) {
+      outcome = 'missing spaces field';
       return {
         ok: false,
         retryable: false,
@@ -146,18 +159,26 @@ async function fetchGetSpacesOnce(
       .map((item) => item.space_name)
       .filter((name): name is string => typeof name === 'string' && name.length > 0);
 
-    if (__DEV__) {
-      console.log(
-        `[Spaces API] GET getspaces - Success (${duration}ms), count=${spaceNames.length}`
-      );
-    }
+    outcome = `success, count=${spaceNames.length}`;
     return { ok: true, spaceNames };
   } catch (error) {
     const duration = Date.now() - startTime;
+    const isUserAbort = externalSignal?.aborted === true;
     const isTimeout =
+      !isUserAbort &&
       error instanceof Error &&
       (error.name === 'TimeoutError' || error.name === 'AbortError');
-    const isNetwork = error instanceof TypeError;
+    const isNetwork = !isUserAbort && error instanceof TypeError;
+
+    if (isUserAbort) {
+      outcome = 'aborted by caller';
+      return { ok: false, retryable: false, status: 0, errorMessage: 'Aborted' };
+    }
+    outcome = isTimeout
+      ? `timed out after ${timeoutMs}ms`
+      : isNetwork
+        ? 'network failure'
+        : 'failed';
 
     if (isNetwork) {
       console.error(
@@ -180,26 +201,36 @@ async function fetchGetSpacesOnce(
     };
   } finally {
     clearTimeout(timer);
+    externalSignal?.removeEventListener('abort', onExternalAbort);
+    console.log(`[Spaces API] GET getspaces - complete: ${outcome} (${Date.now() - startTime}ms)`);
   }
 }
 
 export async function fetchSpaceNameOptionsWithRetry(
   baseUrl: string,
   appName: string,
-  options?: { maxAttempts?: number }
+  options?: { maxAttempts?: number; signal?: AbortSignal; timeoutMs?: number }
 ): Promise<{ ok: true; spaceNames: string[] } | { ok: false; errorMessage: string }> {
   const maxAttempts = options?.maxAttempts ?? GETSPACES_MAX_ATTEMPTS;
+  const signal = options?.signal;
+  const timeoutMs = options?.timeoutMs ?? FETCH_TIMEOUT_MS;
   let lastError = 'Unable to load spaces list.';
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const result = await fetchGetSpacesOnce(baseUrl, appName);
+    if (signal?.aborted) {
+      return { ok: false, errorMessage: 'Aborted' };
+    }
+
+    const result = await fetchGetSpacesOnce(baseUrl, appName, signal, timeoutMs);
     if (result.ok) {
-      await writeCachedSpaceNames(result.spaceNames);
+      writeCachedSpaceNames(result.spaceNames).catch((error) => {
+        console.warn('[Spaces API] Failed to cache getspaces list:', error);
+      });
       return { ok: true, spaceNames: result.spaceNames };
     }
 
     lastError = result.errorMessage;
-    if (!result.retryable || attempt >= maxAttempts) {
+    if (lastError === 'Aborted' || !result.retryable || attempt >= maxAttempts) {
       return { ok: false, errorMessage: lastError };
     }
 

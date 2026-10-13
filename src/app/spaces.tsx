@@ -1,11 +1,12 @@
 import Header from '@/components/header';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
 import { AtSign, Check, ChevronDown, ChevronRight, ChevronUp, Circle, Copy, Info, Search } from 'lucide-react-native';
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useFocusEffect } from '@react-navigation/native';
 import {
   ActivityIndicator,
   Alert,
+  InteractionManager,
   Keyboard,
   Modal,
   ScrollView,
@@ -85,7 +86,6 @@ import * as Clipboard from 'expo-clipboard';
 import { toast } from 'sonner-native';
 import {
   fetchSpaceNameOptionsWithRetry,
-  isSpacesListCacheStale,
   readCachedSpaceNamesEntry,
   type SpacesLoadStatus,
 } from '@/utils/load-spaces-list';
@@ -93,6 +93,15 @@ import {
 const DURATION_OPTIONS = ['~10 mins', '~1 hour', '~8 hours'];
 const SPACES_API_BASE_URL = process.env.EXPO_PUBLIC_SPACES_API_BASE_URL || 'http://192.168.1.111:7264';
 const SPACES_APP_NAME = 'spaces-wallet';
+const SPACES_LIST_BACKGROUND_TIMEOUT_MS = 10_000;
+/** When true, show the cached getspaces list from AsyncStorage before the network refresh. */
+const LOAD_SPACES_ASYNC = false;
+/** Upper bound on waiting for the push animation before starting the list refresh. */
+const SPACES_LIST_START_MAX_DEFER_MS = 600;
+
+function sameSpaceNames(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((name, i) => name === b[i]);
+}
 const EMPTY_SUBSPACE_BUTTON_LABEL = 'Enter a subspace name';
 const NO_SPACE_NAME_BUTTON_LABEL = 'Select a Space name';
 
@@ -1205,7 +1214,8 @@ export default function SpacesScreen() {
   const [spacesLoadError, setSpacesLoadError] = useState<string | null>(null);
   const [spacesListFromCache, setSpacesListFromCache] = useState(false);
   const [spacesListRefreshing, setSpacesListRefreshing] = useState(false);
-  const spacesListLoadInFlightRef = useRef(false);
+  const spacesListLoadPromiseRef = useRef<Promise<void> | null>(null);
+  const spacesListAbortRef = useRef<AbortController | null>(null);
   const spacesListHasLoadedOnceRef = useRef(false);
   const spacesListLastFetchAtRef = useRef<number | null>(null);
   const spaceNameOptionsRef = useRef<string[]>([]);
@@ -1223,70 +1233,130 @@ export default function SpacesScreen() {
   const showSpaceNameSuggestions =
     spaceNameFocused && spacesLoadStatus === 'ready' && filteredSpaceNameOptions.length > 0;
 
+  /** Block the picker only when there is nothing to show; keep cached names usable while refreshing. */
   const showSpacesListLoading =
-    spacesLoadStatus === 'loading' || (spacesListRefreshing && spacesListFromCache);
+    spaceNameOptions.length === 0 &&
+    (spacesLoadStatus === 'loading' || spacesListRefreshing);
 
   const spacesLoadStatusRef = useRef(spacesLoadStatus);
   spacesLoadStatusRef.current = spacesLoadStatus;
 
   const loadSpaceNameOptions = useCallback(async (mode: 'initial' | 'refresh' | 'retry') => {
-    if (spacesListLoadInFlightRef.current) {
-      return;
+    if (spacesListLoadPromiseRef.current) {
+      return spacesListLoadPromiseRef.current;
     }
-    spacesListLoadInFlightRef.current = true;
 
-    let knownOptions: string[] = mode === 'initial' ? [] : [...spaceNameOptionsRef.current];
+    const loadTask = (async () => {
+      spacesListAbortRef.current?.abort();
+      const controller = new AbortController();
+      spacesListAbortRef.current = controller;
 
-    try {
-      if (mode === 'initial') {
-        const cached = await readCachedSpaceNamesEntry();
-        if (cached.spaceNames.length > 0) {
-          knownOptions = cached.spaceNames;
-          setSpaceNameOptions(cached.spaceNames);
-          setSpacesListFromCache(true);
-          setSpacesLoadStatus('ready');
-          if (cached.cachedAt != null) {
-            spacesListLastFetchAtRef.current = cached.cachedAt;
-          }
-          if (!isSpacesListCacheStale(cached.cachedAt)) {
+      let knownOptions: string[] = mode === 'initial' ? [] : [...spaceNameOptionsRef.current];
+
+      try {
+        if (mode === 'initial') {
+          const cached = LOAD_SPACES_ASYNC
+            ? await readCachedSpaceNamesEntry()
+            : { spaceNames: [], cachedAt: null };
+          if (controller.signal.aborted) {
             return;
           }
-          setSpacesListRefreshing(true);
-        } else {
+          if (cached.spaceNames.length > 0) {
+            knownOptions = cached.spaceNames;
+            setSpaceNameOptions(cached.spaceNames);
+            setSpacesListFromCache(true);
+            setSpacesLoadStatus('ready');
+            if (cached.cachedAt != null) {
+              spacesListLastFetchAtRef.current = cached.cachedAt;
+            }
+            setSpacesListRefreshing(true);
+          } else {
+            setSpacesLoadStatus('loading');
+            setSpacesLoadError(null);
+          }
+        } else if (mode === 'retry') {
           setSpacesLoadStatus('loading');
           setSpacesLoadError(null);
+        } else {
+          setSpacesListRefreshing(true);
         }
-      } else if (mode === 'retry') {
-        setSpacesLoadStatus('loading');
-        setSpacesLoadError(null);
-      } else {
-        setSpacesListRefreshing(true);
-      }
 
-      const result = await fetchSpaceNameOptionsWithRetry(SPACES_API_BASE_URL, SPACES_APP_NAME);
+        const hasCachedNames = knownOptions.length > 0;
+        const fetchPromise = fetchSpaceNameOptionsWithRetry(SPACES_API_BASE_URL, SPACES_APP_NAME, {
+          signal: controller.signal,
+          maxAttempts: hasCachedNames ? 1 : undefined,
+          timeoutMs: hasCachedNames ? SPACES_LIST_BACKGROUND_TIMEOUT_MS : undefined,
+        });
+        let watchdog: ReturnType<typeof setTimeout> | undefined;
+        const watchdogPromise = new Promise<{ ok: false; errorMessage: string }>((resolve) => {
+          watchdog = setTimeout(() => {
+            console.warn('[Spaces API] GET getspaces - watchdog fired; request never settled');
+            controller.abort();
+            resolve({ ok: false, errorMessage: 'Loading spaces timed out. Please try again.' });
+          }, (hasCachedNames ? SPACES_LIST_BACKGROUND_TIMEOUT_MS : 60_000) + 2_000);
+        });
+        const result = await Promise.race([fetchPromise, watchdogPromise]);
+        clearTimeout(watchdog);
 
-      if (result.ok) {
-        spacesListLastFetchAtRef.current = Date.now();
-        setSpaceNameOptions(result.spaceNames);
-        setSpacesListFromCache(false);
-        setSpacesLoadStatus('ready');
-        setSpacesLoadError(null);
-      } else if (knownOptions.length > 0) {
-        setSpacesLoadStatus('ready');
-        setSpacesLoadError(result.errorMessage);
-        if (mode === 'retry') {
-          toast.error(result.errorMessage);
+        if (!result.ok && result.errorMessage === 'Aborted') {
+          return;
         }
-      } else {
-        setSpacesLoadStatus('error');
-        setSpacesLoadError(result.errorMessage);
-        if (mode !== 'refresh') {
-          toast.error(result.errorMessage);
+
+        if (result.ok) {
+          spacesListLastFetchAtRef.current = Date.now();
+          const unchanged = sameSpaceNames(result.spaceNames, spaceNameOptionsRef.current);
+          startTransition(() => {
+            if (!unchanged) {
+              setSpaceNameOptions(result.spaceNames);
+            }
+            setSpacesListFromCache(false);
+            setSpacesLoadStatus('ready');
+            setSpacesLoadError(null);
+          });
+        } else if (knownOptions.length > 0) {
+          setSpacesLoadStatus('ready');
+          setSpacesLoadError(result.errorMessage);
+          if (mode === 'retry') {
+            toast.error(result.errorMessage);
+          }
+        } else {
+          setSpacesLoadStatus('error');
+          setSpacesLoadError(result.errorMessage);
+          if (mode !== 'refresh') {
+            toast.error(result.errorMessage);
+          }
         }
+      } catch (error) {
+        if (controller.signal.aborted) {
+          return;
+        }
+        const message =
+          error instanceof Error ? error.message : 'Unable to load spaces list.';
+        if (knownOptions.length > 0) {
+          setSpacesLoadStatus('ready');
+          setSpacesLoadError(message);
+        } else {
+          setSpacesLoadStatus('error');
+          setSpacesLoadError(message);
+          if (mode !== 'refresh') {
+            toast.error(message);
+          }
+        }
+      } finally {
+        if (spacesListAbortRef.current === controller) {
+          spacesListAbortRef.current = null;
+        }
+        setSpacesListRefreshing(false);
       }
+    })();
+
+    spacesListLoadPromiseRef.current = loadTask;
+    try {
+      await loadTask;
     } finally {
-      spacesListLoadInFlightRef.current = false;
-      setSpacesListRefreshing(false);
+      if (spacesListLoadPromiseRef.current === loadTask) {
+        spacesListLoadPromiseRef.current = null;
+      }
     }
   }, []);
 
@@ -1295,17 +1365,31 @@ export default function SpacesScreen() {
 
   useFocusEffect(
     useCallback(() => {
-      if (!spacesListHasLoadedOnceRef.current) {
-        spacesListHasLoadedOnceRef.current = true;
-        void loadSpaceNameOptionsRef.current('initial');
-        return;
-      }
+      const mode = !spacesListHasLoadedOnceRef.current
+        ? 'initial'
+        : spacesLoadStatusRef.current === 'error'
+          ? 'retry'
+          : 'refresh';
+      spacesListHasLoadedOnceRef.current = true;
 
-      if (spacesLoadStatusRef.current === 'error') {
-        void loadSpaceNameOptionsRef.current('retry');
-      } else if (isSpacesListCacheStale(spacesListLastFetchAtRef.current)) {
-        void loadSpaceNameOptionsRef.current('refresh');
-      }
+      let started = false;
+      const start = () => {
+        if (started) return;
+        started = true;
+        console.log(`[Spaces] Screen focused — reloading spaces list (${mode})`);
+        spacesListAbortRef.current?.abort();
+        spacesListLoadPromiseRef.current = null;
+        void loadSpaceNameOptionsRef.current(mode);
+      };
+      const interaction = InteractionManager.runAfterInteractions(start);
+      const fallback = setTimeout(start, SPACES_LIST_START_MAX_DEFER_MS);
+
+      return () => {
+        interaction.cancel();
+        clearTimeout(fallback);
+        // Hide the banner when leaving; in-flight fetch may still finish and update cache.
+        setSpacesListRefreshing(false);
+      };
     }, [])
   );
 
@@ -4705,6 +4789,13 @@ export default function SpacesScreen() {
               <View style={styles.spacesListStatusRow}>
                 <ActivityIndicator size="small" color={colors.primary} />
                 <Text style={styles.spacesListStatusText}>Loading spaces…</Text>
+              </View>
+            ) : null}
+
+            {spacesListRefreshing && spaceNameOptions.length > 0 ? (
+              <View style={styles.spacesListStatusRow}>
+                <ActivityIndicator size="small" color={colors.textSecondary} />
+                <Text style={styles.spacesListStaleHint}>Updating spaces list…</Text>
               </View>
             ) : null}
 
