@@ -1,7 +1,7 @@
 import Header from '@/components/header';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
 import { AtSign, Check, ChevronDown, ChevronRight, ChevronUp, Circle, Copy, Info, Search } from 'lucide-react-native';
-import React, { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useFocusEffect } from '@react-navigation/native';
 import {
   ActivityIndicator,
@@ -86,6 +86,8 @@ import { toast } from 'sonner-native';
 import {
   fetchSpaceNameOptionsWithRetry,
   readCachedSpaceNamesEntry,
+  readSpacesApiGet,
+  readSpacesApiRequest,
   type SpacesLoadStatus,
 } from '@/utils/load-spaces-list';
 
@@ -93,8 +95,19 @@ const DURATION_OPTIONS = ['~10 mins', '~1 hour', '~8 hours'];
 const SPACES_API_BASE_URL = process.env.EXPO_PUBLIC_SPACES_API_BASE_URL || 'http://192.168.1.111:7264';
 const SPACES_APP_NAME = 'spaces-wallet';
 const SPACES_LIST_BACKGROUND_TIMEOUT_MS = 10_000;
+/** Empty list: one attempt, then show Retry. Watchdog matches this so a hung request cannot wait longer. */
+const SPACES_LIST_RETRY_AFTER_MS = 15_000;
 /** When true, show the cached getspaces list from AsyncStorage before the network refresh. */
 const LOAD_SPACES_ASYNC = false;
+/** Let /getspaces use the network before resumed job polls start. */
+const POLL_RESUME_INITIAL_DELAY_MS = 1_000;
+/** Gap between resumed job polls so they are not sent together. */
+const POLL_RESUME_STAGGER_MS = 750;
+/** Debounce before GET quote/availability after subspace or space_name edits. */
+const SUBNAME_AVAILABILITY_DEBOUNCE_MS = 2_000;
+const AVAILABILITY_GET_TIMEOUT_MS = 15_000;
+const PURCHASE_API_TIMEOUT_MS = 60_000;
+const COUPON_DEBOUNCE_MS = 2_000;
 
 function sameSpaceNames(a: string[], b: string[]): boolean {
   return a.length === b.length && a.every((name, i) => name === b[i]);
@@ -608,18 +621,17 @@ async function postJobsWatchPayment(
   const body = buildPaymentWatchRequestBody(spec.body, transactionId, { scriptPubKeyHex });
   const start = Date.now();
   try {
-    const res = await fetch(url, {
+    const { status, text } = await readSpacesApiRequest(url, {
       method,
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify(body),
+      timeoutMs: PURCHASE_API_TIMEOUT_MS,
     });
     const ms = Date.now() - start;
-    if (!res.ok) {
-      const t = await res.text();
-      console.error(`[Spaces API] ${method} ${url} - watch-payment (${ms}ms) [${logLabel}]`, t);
+    if (status < 200 || status >= 300) {
+      console.error(`[Spaces API] ${method} ${url} - watch-payment (${ms}ms) [${logLabel}]`, text);
       return { ok: false };
     }
-    const text = await res.text();
     const purchaseId = purchaseIdFromResponseBodyText(text);
     console.log(
       `[Spaces API] ${method} ${url} - watch-payment OK (${ms}ms) [${logLabel}]`,
@@ -645,21 +657,20 @@ async function postWatchPaymentFallback(
   const start = Date.now();
   const body = buildPaymentWatchRequestBody(undefined, transactionId, { scriptPubKeyHex });
   try {
-    const res = await fetch(url, {
+    const { status, text } = await readSpacesApiRequest(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify(body),
+      timeoutMs: PURCHASE_API_TIMEOUT_MS,
     });
     const ms = Date.now() - start;
-    if (!res.ok) {
-      const t = await res.text();
+    if (status < 200 || status >= 300) {
       console.error(
         `[Spaces API] POST ${url} - watch-payment fallback (${ms}ms) [${logLabel}]`,
-        t
+        text
       );
       return { ok: false };
     }
-    const text = await res.text();
     const purchaseId = purchaseIdFromResponseBodyText(text);
     console.log(
       `[Spaces API] POST ${url} - watch-payment OK (${ms}ms) [${logLabel}]`,
@@ -909,25 +920,24 @@ async function registerPurchasePaymentOnServer(params: {
   if (purchaseIdForCallback != null) {
     const cbStart = Date.now();
     try {
-      const res = await fetch(callbackUrl, {
+      const { status, text: bodyText } = await readSpacesApiRequest(callbackUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
         body: JSON.stringify({
           transaction_id: transactionId,
           label,
           purchase_id: purchaseIdForCallback,
           ...(scriptPubKeyHex?.trim() ? { script_pubkey: scriptPubKeyHex.trim() } : {}),
         }),
+        timeoutMs: PURCHASE_API_TIMEOUT_MS,
       });
       const ms = Date.now() - cbStart;
-      if (!res.ok) {
-        const errText = await res.text();
+      if (status < 200 || status >= 300) {
         console.error(
-          `[Spaces API] POST ${callbackUrl} - HTTP ${res.status} (${ms}ms) [${logLabel}]`,
-          errText
+          `[Spaces API] POST ${callbackUrl} - HTTP ${status} (${ms}ms) [${logLabel}]`,
+          bodyText
         );
       } else {
-        const bodyText = await res.text();
         console.log(
           `[Spaces API] POST ${callbackUrl} - Success (${ms}ms) [${logLabel}]`,
           bodyText || '(empty body)'
@@ -1176,6 +1186,21 @@ export default function SpacesScreen() {
   const pricingUnavailableToastAtRef = useRef(0);
   /** Latest availability/quote refresh (for stale-quote recovery after POST/PUT failures). */
   const refreshSpaceQuoteRef = useRef<(() => Promise<void>) | undefined>(undefined);
+  const tryRunDebouncedAvailabilityCheckRef = useRef<(source: string) => void>(() => {});
+  const availabilityTypingRef = useRef<{
+    editedAt: number;
+    subspace: string;
+    spaceName: string;
+  } | null>(null);
+  const availabilityCheckedKeyRef = useRef<string | null>(null);
+  const availabilityCheckInFlightRef = useRef(false);
+  const availabilityWakeFrameRef = useRef<number | null>(null);
+  const couponPendingRef = useRef<{ editedAt: number; code: string } | null>(null);
+  const couponValidateInFlightRef = useRef(false);
+  const couponValidateGenerationRef = useRef(0);
+  const couponWakeFrameRef = useRef<number | null>(null);
+  const tryRunCouponValidationRef = useRef<(source: string) => void>(() => {});
+  const isConfirmationModeRef = useRef(false);
   const handleSpacesPurchaseApiErrorRef = useRef<
     (error: unknown, logContext: string) => void
   >(() => {});
@@ -1206,7 +1231,20 @@ export default function SpacesScreen() {
   const [sptrFee6, setSptrFee6] = useState<number | null>(null);
   const [sptrFee48, setSptrFee48] = useState<number | null>(null);
   const [takeOnchain, setTakeOnchain] = useState(false);
-  const [spaceNameOptions, setSpaceNameOptions] = useState<string[]>([]);
+  const [spaceNameOptions, setSpaceNameOptionsState] = useState<string[]>([]);
+  const spaceNameOptionsRef = useRef<string[]>([]);
+  spaceNameOptionsRef.current = spaceNameOptions;
+  const setSpaceNameOptions = useCallback((spaceNames: string[], source: string) => {
+    const preview =
+      spaceNames.length === 0
+        ? '(empty)'
+        : spaceNames.length <= 6
+          ? spaceNames.join(', ')
+          : `${spaceNames.slice(0, 4).join(', ')}… (+${spaceNames.length - 4} more)`;
+    console.log(`[Spaces] setSpaceNameOptions (${source}): ${spaceNames.length} — ${preview}`);
+    spaceNameOptionsRef.current = spaceNames;
+    setSpaceNameOptionsState(spaceNames);
+  }, []);
   const [spacesLoadStatus, setSpacesLoadStatus] = useState<SpacesLoadStatus>('loading');
   const [spacesLoadError, setSpacesLoadError] = useState<string | null>(null);
   const [spacesListFromCache, setSpacesListFromCache] = useState(false);
@@ -1215,8 +1253,6 @@ export default function SpacesScreen() {
   const spacesListAbortRef = useRef<AbortController | null>(null);
   const spacesListHasLoadedOnceRef = useRef(false);
   const spacesListLastFetchAtRef = useRef<number | null>(null);
-  const spaceNameOptionsRef = useRef<string[]>([]);
-  spaceNameOptionsRef.current = spaceNameOptions;
 
   const filteredSpaceNameOptions = useMemo(() => {
     const query = spaceName.trim();
@@ -1240,10 +1276,13 @@ export default function SpacesScreen() {
 
   const loadSpaceNameOptions = useCallback(async (mode: 'initial' | 'refresh' | 'retry') => {
     if (spacesListLoadPromiseRef.current) {
+      console.log(`[Spaces] loadSpaceNameOptions(${mode}) — reusing in-flight load`);
       return spacesListLoadPromiseRef.current;
     }
 
     const loadTask = (async () => {
+      const loadStartedAt = Date.now();
+      console.log(`[Spaces] loadSpaceNameOptions(${mode}) — start`);
       spacesListAbortRef.current?.abort();
       const controller = new AbortController();
       spacesListAbortRef.current = controller;
@@ -1256,11 +1295,17 @@ export default function SpacesScreen() {
             ? await readCachedSpaceNamesEntry()
             : { spaceNames: [], cachedAt: null };
           if (controller.signal.aborted) {
+            console.log(
+              `[Spaces] loadSpaceNameOptions(${mode}) — aborted after cache read (${Date.now() - loadStartedAt}ms)`
+            );
             return;
           }
           if (cached.spaceNames.length > 0) {
             knownOptions = cached.spaceNames;
-            setSpaceNameOptions(cached.spaceNames);
+            console.log(
+              `[Spaces] loadSpaceNameOptions(${mode}) — cache hit: ${cached.spaceNames.length} space names`
+            );
+            setSpaceNameOptions(cached.spaceNames, 'cache');
             setSpacesListFromCache(true);
             setSpacesLoadStatus('ready');
             if (cached.cachedAt != null) {
@@ -1268,55 +1313,114 @@ export default function SpacesScreen() {
             }
             setSpacesListRefreshing(true);
           } else {
+            console.log(`[Spaces] loadSpaceNameOptions(${mode}) — no cache; status loading`);
             setSpacesLoadStatus('loading');
             setSpacesLoadError(null);
           }
         } else if (mode === 'retry') {
-          setSpacesLoadStatus('loading');
+          const hasNames = spaceNameOptionsRef.current.length > 0;
+          console.log(
+            `[Spaces] loadSpaceNameOptions(${mode}) — retry; hasNames=${hasNames}`
+          );
+          if (!hasNames) {
+            setSpacesLoadStatus('loading');
+          } else {
+            setSpacesListRefreshing(true);
+          }
           setSpacesLoadError(null);
         } else {
+          console.log(
+            `[Spaces] loadSpaceNameOptions(${mode}) — refresh; knownOptions=${knownOptions.length}`
+          );
           setSpacesListRefreshing(true);
         }
 
         const hasCachedNames = knownOptions.length > 0;
+        const fetchTimeoutMs = hasCachedNames
+          ? SPACES_LIST_BACKGROUND_TIMEOUT_MS
+          : SPACES_LIST_RETRY_AFTER_MS;
+        console.log(
+          `[Spaces] loadSpaceNameOptions(${mode}) — fetching getspaces (timeoutMs=${fetchTimeoutMs}, hasCachedNames=${hasCachedNames})`
+        );
         const fetchPromise = fetchSpaceNameOptionsWithRetry(SPACES_API_BASE_URL, SPACES_APP_NAME, {
           signal: controller.signal,
-          maxAttempts: hasCachedNames ? 1 : undefined,
-          timeoutMs: hasCachedNames ? SPACES_LIST_BACKGROUND_TIMEOUT_MS : undefined,
+          maxAttempts: 1,
+          timeoutMs: fetchTimeoutMs,
         });
+        const retryAfterMs = hasCachedNames
+          ? SPACES_LIST_BACKGROUND_TIMEOUT_MS + 2_000
+          : SPACES_LIST_RETRY_AFTER_MS;
         let watchdog: ReturnType<typeof setTimeout> | undefined;
         const watchdogPromise = new Promise<{ ok: false; errorMessage: string }>((resolve) => {
           watchdog = setTimeout(() => {
             console.warn('[Spaces API] GET getspaces - watchdog fired; request never settled');
+            // Update the screen here. The fetch promise can stay pending on iOS after
+            // abort, and an "Aborted" race result used to leave status on "loading".
+            if (spacesListAbortRef.current === controller) {
+              if (knownOptions.length > 0) {
+                setSpacesLoadStatus('ready');
+                setSpacesLoadError('Loading spaces timed out. Please try again.');
+              } else {
+                setSpacesLoadStatus('error');
+                setSpacesLoadError('Loading spaces timed out. Please try again.');
+              }
+              setSpacesListRefreshing(false);
+            }
             controller.abort();
             resolve({ ok: false, errorMessage: 'Loading spaces timed out. Please try again.' });
-          }, (hasCachedNames ? SPACES_LIST_BACKGROUND_TIMEOUT_MS : 60_000) + 2_000);
+          }, retryAfterMs);
         });
         const result = await Promise.race([fetchPromise, watchdogPromise]);
         clearTimeout(watchdog);
 
         if (!result.ok && result.errorMessage === 'Aborted') {
+          if (spacesListAbortRef.current !== controller) {
+            console.log(
+              `[Spaces] loadSpaceNameOptions(${mode}) — aborted (superseded) (${Date.now() - loadStartedAt}ms)`
+            );
+            return;
+          }
+          console.warn(
+            `[Spaces] loadSpaceNameOptions(${mode}) — aborted; setting error (${Date.now() - loadStartedAt}ms)`
+          );
+          setSpacesLoadStatus('error');
+          setSpacesLoadError('Loading spaces timed out. Please try again.');
           return;
         }
 
         if (result.ok) {
+          if (spacesListAbortRef.current !== controller) {
+            console.log(
+              `[Spaces] loadSpaceNameOptions(${mode}) — success ignored (superseded) (${Date.now() - loadStartedAt}ms)`
+            );
+            return;
+          }
           spacesListLastFetchAtRef.current = Date.now();
           const unchanged = sameSpaceNames(result.spaceNames, spaceNameOptionsRef.current);
-          startTransition(() => {
-            if (!unchanged) {
-              setSpaceNameOptions(result.spaceNames);
-            }
-            setSpacesListFromCache(false);
-            setSpacesLoadStatus('ready');
-            setSpacesLoadError(null);
-          });
+          console.log(
+            `[Spaces] loadSpaceNameOptions(${mode}) — success: ${result.spaceNames.length} space names, unchanged=${unchanged} (${Date.now() - loadStartedAt}ms)`
+          );
+          if (!unchanged) {
+            setSpaceNameOptions(result.spaceNames, 'getspaces');
+          } else {
+            console.log('[Spaces] setSpaceNameOptions skipped (getspaces list unchanged)');
+          }
+          setSpacesListFromCache(false);
+          setSpacesLoadStatus('ready');
+          setSpacesLoadError(null);
         } else if (knownOptions.length > 0) {
+          console.warn(
+            `[Spaces] loadSpaceNameOptions(${mode}) — fetch failed, keeping ${knownOptions.length} known: ${result.errorMessage} (${Date.now() - loadStartedAt}ms)`
+          );
           setSpacesLoadStatus('ready');
           setSpacesLoadError(result.errorMessage);
           if (mode === 'retry') {
             toast.error(result.errorMessage);
           }
         } else {
+          console.warn(
+            `[Spaces] loadSpaceNameOptions(${mode}) — fetch failed: ${result.errorMessage} (${Date.now() - loadStartedAt}ms)`
+          );
           setSpacesLoadStatus('error');
           setSpacesLoadError(result.errorMessage);
           if (mode !== 'refresh') {
@@ -1325,10 +1429,16 @@ export default function SpacesScreen() {
         }
       } catch (error) {
         if (controller.signal.aborted) {
+          console.log(
+            `[Spaces] loadSpaceNameOptions(${mode}) — catch aborted (${Date.now() - loadStartedAt}ms)`
+          );
           return;
         }
         const message =
           error instanceof Error ? error.message : 'Unable to load spaces list.';
+        console.warn(
+          `[Spaces] loadSpaceNameOptions(${mode}) — threw: ${message} (${Date.now() - loadStartedAt}ms)`
+        );
         if (knownOptions.length > 0) {
           setSpacesLoadStatus('ready');
           setSpacesLoadError(message);
@@ -1344,6 +1454,7 @@ export default function SpacesScreen() {
           spacesListAbortRef.current = null;
         }
         setSpacesListRefreshing(false);
+        console.log(`[Spaces] loadSpaceNameOptions(${mode}) — done (${Date.now() - loadStartedAt}ms)`);
       }
     })();
 
@@ -1359,6 +1470,12 @@ export default function SpacesScreen() {
 
   const loadSpaceNameOptionsRef = useRef(loadSpaceNameOptions);
   loadSpaceNameOptionsRef.current = loadSpaceNameOptions;
+
+  const retrySpacesListLoad = useCallback(() => {
+    spacesListAbortRef.current?.abort();
+    spacesListLoadPromiseRef.current = null;
+    void loadSpaceNameOptionsRef.current('retry');
+  }, []);
 
   useFocusEffect(
     useCallback(() => {
@@ -1385,6 +1502,7 @@ export default function SpacesScreen() {
   const [quoteId, setQuoteId] = useState<number | null>(null);
   const [handle, setHandle] = useState<string | null>(null);
   const [isConfirmationMode, setIsConfirmationMode] = useState(false);
+  isConfirmationModeRef.current = isConfirmationMode;
   const [couponCode, setCouponCode] = useState<string>('');
   const [discountPercent, setDiscountPercent] = useState<number | null>(null);
   const [completelyFree, setCompletelyFree] = useState(false);
@@ -2218,6 +2336,8 @@ export default function SpacesScreen() {
 
     try {
       while (attempt < maxAttempts) {
+        tryRunDebouncedAvailabilityCheckRef.current('poll-iteration');
+        tryRunCouponValidationRef.current('poll-iteration');
         try {
           const stillTracked = mySpacesRef.current.some(
             (s) =>
@@ -2242,20 +2362,22 @@ export default function SpacesScreen() {
           );
 
           // Try unified status endpoint first, fallback to job status endpoint
-          let response;
           let data;
           let unifiedStatus: UnifiedStatus | null = null;
 
           try {
-            response = await fetch(unifiedStatusUrl);
-            if (response.status === 404) {
+            const { status: unifiedHttp, text: unifiedText } = await readSpacesApiGet(
+              unifiedStatusUrl,
+              AVAILABILITY_GET_TIMEOUT_MS
+            );
+            if (unifiedHttp === 404) {
               console.warn(
                 `[Spaces] No purchase row for ${subspace}@${spaceName} — stopping poll for job ${jobId}`
               );
               updatePollingState(Date.now(), false);
               return null;
             }
-            data = await response.json();
+            data = unifiedText ? JSON.parse(unifiedText) : {};
             if (data.success && data.unified_status) {
               unifiedStatus = data.unified_status as UnifiedStatus;
               console.log(
@@ -2267,9 +2389,8 @@ export default function SpacesScreen() {
               `[Spaces] Unified status endpoint failed, falling back to job status:`,
               unifiedError
             );
-            // Fallback to job status endpoint
-            response = await fetch(url);
-            data = await response.json();
+            const { text: jobText } = await readSpacesApiGet(url, AVAILABILITY_GET_TIMEOUT_MS);
+            data = jobText ? JSON.parse(jobText) : {};
           }
 
           if (!data.success) {
@@ -2780,36 +2901,44 @@ export default function SpacesScreen() {
           const url = `${SPACES_API_BASE_URL}/spaces/${currentSpaceName}/${currentSubspace}?app=${SPACES_APP_NAME}&format=json`;
           console.log(`[Spaces API] PUT ${url} (free coupon)`);
 
-          const response = await fetch(url, {
+          const { status: putStatus, text: putText } = await readSpacesApiRequest(url, {
             method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
             body: JSON.stringify({ quote_id: quoteId, purchase_type: PURCHASE_TYPE_SUBNAME }),
+            timeoutMs: PURCHASE_API_TIMEOUT_MS,
           });
 
-          if (!response.ok) {
-            const errorText = await response.text();
-            console.error(`[Spaces API] PUT ${url} - HTTP error! status: ${response.status}`, errorText);
-            throwSpacesApiHttpError(response.status, errorText);
+          if (putStatus < 200 || putStatus >= 300) {
+            console.error(`[Spaces API] PUT ${url} - HTTP error! status: ${putStatus}`, putText);
+            throwSpacesApiHttpError(putStatus, putText);
           }
 
-          const data = await response.json();
+          let data: Record<string, unknown>;
+          try {
+            data = putText ? (JSON.parse(putText) as Record<string, unknown>) : {};
+          } catch {
+            throw new Error('Invalid response from Spaces server.');
+          }
           console.log(`[Spaces API] PUT ${url} - Success (free coupon)`, data);
 
-          if (data.job_id) {
-            const d = data as Record<string, unknown>;
+          const jobIdRaw = data.job_id;
+          if (jobIdRaw != null && jobIdRaw !== '') {
+            const d = data;
             const { pointerJobId, pointerPurchaseId } = pointerIdsFromPurchaseResponse(d);
             const resolvedPurchaseIdFree = purchaseIdFromRecord(d);
             const parsedPurchaseId = resolvedPurchaseIdFree ?? NaN;
             const parsedJobId =
-              typeof data.job_id === 'number'
-                ? data.job_id
-                : data.job_id != null
-                  ? Number(data.job_id)
+              typeof jobIdRaw === 'number'
+                ? jobIdRaw
+                : jobIdRaw != null
+                  ? Number(jobIdRaw)
                   : NaN;
+            const jobId = Number.isFinite(parsedJobId) ? parsedJobId : Number(jobIdRaw);
 
-            setCurrentJobId(data.job_id);
+            setCurrentJobId(jobId);
             setCurrentJobData({
-              handle: data.handle || purchaseData.handle,
+              handle:
+                (typeof data.handle === 'string' ? data.handle : null) || purchaseData.handle,
               subspace: currentSubspace,
               spaceName: currentSpaceName,
             });
@@ -2819,7 +2948,7 @@ export default function SpacesScreen() {
                 space.subspace === currentSubspace && space.spaceName === currentSpaceName
                   ? {
                       ...space,
-                      jobId: data.job_id,
+                      jobId,
                       purchaseId: resolvedPurchaseIdFree,
                       sptrJobId: pointerJobId,
                       sptrPurchaseId: pointerPurchaseId,
@@ -2839,143 +2968,153 @@ export default function SpacesScreen() {
               pendingPaymentCallbackRef.current = null;
             }
 
-            if (data.handle) {
-              const storageKey = `spaces_purchase_${data.job_id}`;
-              const storageData = {
-                job_id: data.job_id,
-                handle: data.handle,
-                quote_id: data.quote_id,
-                purchase_id: resolvedPurchaseIdFree ?? data.purchase_id,
-                sptr_job_id: pointerJobId,
-                sptr_purchase_id: pointerPurchaseId,
-                has_sptr: pointerJobId != null && pointerJobId > 0,
-                timestamp: Date.now(),
-              };
-              await AsyncStorage.setItem(storageKey, JSON.stringify(storageData));
-              console.log('[Spaces] Stored purchase data:', storageKey);
-            } else if (data.job_id != null && Number.isFinite(parsedPurchaseId)) {
-              const storageKey = `spaces_purchase_${data.job_id}`;
-              await AsyncStorage.setItem(
-                storageKey,
-                JSON.stringify({
-                  job_id: data.job_id,
-                  purchase_id: parsedPurchaseId,
-                  timestamp: Date.now(),
-                })
-              );
-            }
+            const purchaseDataHandle = purchaseData.handle;
+            const dataHandle =
+              typeof data.handle === 'string' ? data.handle : purchaseDataHandle;
+            const paymentWatchSnapshot = postPurchaseWatchRef.current;
+            const priorSpk = priorRowForPath?.scriptPubKeyHex?.trim();
 
-            let reservedPath: NextAvailableTaprootPath | null = null;
-            try {
-              let mnemonic: string | undefined;
+            void (async () => {
               try {
-                mnemonic = (await getMnemonicWithoutWorklet(currentWalletId ?? undefined)) ?? undefined;
-              } catch (mnemonicErr) {
-                console.error('[Spaces] Free-coupon getMnemonic failed:', mnemonicErr);
-              }
-              if (!mnemonic) {
-                console.error('[Spaces] Free-coupon: no mnemonic; refusing worklet getAccountByPath');
-              } else {
-                reservedPath = await reserveTaprootPathForPurchase({
-                  baseUrl: SPACES_API_BASE_URL,
-                  subspaceTrimmed: currentSubspace,
-                  spaceNameLower: currentSpaceName,
-                  jobId: data.job_id,
-                  mySpaces,
-                  mnemonic,
+                if (dataHandle) {
+                  const storageKey = `spaces_purchase_${jobId}`;
+                  const storageData = {
+                    job_id: jobId,
+                    handle: dataHandle,
+                    quote_id: data.quote_id,
+                    purchase_id: resolvedPurchaseIdFree ?? data.purchase_id,
+                    sptr_job_id: pointerJobId,
+                    sptr_purchase_id: pointerPurchaseId,
+                    has_sptr: pointerJobId != null && pointerJobId > 0,
+                    timestamp: Date.now(),
+                  };
+                  await AsyncStorage.setItem(storageKey, JSON.stringify(storageData));
+                  console.log('[Spaces] Stored purchase data:', storageKey);
+                } else if (Number.isFinite(parsedPurchaseId)) {
+                  const storageKey = `spaces_purchase_${jobId}`;
+                  await AsyncStorage.setItem(
+                    storageKey,
+                    JSON.stringify({
+                      job_id: jobId,
+                      purchase_id: parsedPurchaseId,
+                      timestamp: Date.now(),
+                    })
+                  );
+                }
+
+                let reservedPath: NextAvailableTaprootPath | null = null;
+                try {
+                  let mnemonic: string | undefined;
+                  try {
+                    mnemonic =
+                      (await getMnemonicWithoutWorklet(currentWalletId ?? undefined)) ?? undefined;
+                  } catch (mnemonicErr) {
+                    console.error('[Spaces] Free-coupon getMnemonic failed:', mnemonicErr);
+                  }
+                  if (!mnemonic) {
+                    console.error(
+                      '[Spaces] Free-coupon: no mnemonic; refusing worklet getAccountByPath'
+                    );
+                  } else {
+                    reservedPath = await reserveTaprootPathForPurchase({
+                      baseUrl: SPACES_API_BASE_URL,
+                      subspaceTrimmed: currentSubspace,
+                      spaceNameLower: currentSpaceName,
+                      jobId,
+                      mySpaces: mySpacesRef.current,
+                      mnemonic,
+                    });
+                  }
+                } catch (reserveErr) {
+                  console.error('[Spaces] Free-coupon Taproot reservation failed:', reserveErr);
+                }
+
+                if (needsTaprootPath && !reservedPath) {
+                  console.error('[Spaces] No available Taproot path for first-time free purchase');
+                  toast.error(
+                    'Could not reserve a wallet path for this handle. Use Find Spaces or try again.'
+                  );
+                  postPurchaseWatchRef.current = null;
+                  purchaseTaprootPathRef.current = null;
+                  pendingPaymentCallbackRef.current = null;
+                  return;
+                }
+
+                if (reservedPath) {
+                  purchaseTaprootPathRef.current = reservedPath;
+                  if (needsTaprootPath) {
+                    setMySpaces((prev) =>
+                      prev.map((space) =>
+                        space.subspace === currentSubspace && space.spaceName === currentSpaceName
+                          ? {
+                              ...space,
+                              scriptPubKeyHex: reservedPath.scriptPubKeyHex,
+                              taprootDerivationPath: reservedPath.fullPath,
+                              chainPresence: 'off-chain' as const,
+                            }
+                          : space
+                      )
+                    );
+                  }
+                }
+
+                const simulatedTxid = buildSimulatedTransactionId(jobId);
+                const pendingPurchaseId =
+                  Number.isFinite(parsedPurchaseId) ? parsedPurchaseId : undefined;
+                const scriptPubKeyHex =
+                  reservedPath?.scriptPubKeyHex?.trim() ?? priorSpk;
+
+                let watchOk = false;
+                let callbackOk = false;
+                if (scriptPubKeyHex) {
+                  try {
+                    const registration = await registerPurchasePaymentOnServer({
+                      baseUrl: SPACES_API_BASE_URL,
+                      transactionId: simulatedTxid,
+                      jobId,
+                      spaceNameLower: currentSpaceName,
+                      subspaceTrimmed: currentSubspace,
+                      handle: dataHandle || purchaseDataHandle,
+                      paymentWatch: paymentWatchSnapshot,
+                      pendingPurchaseId,
+                      scriptPubKeyHex,
+                      logLabel: 'free-coupon',
+                    });
+                    watchOk = registration.watchOk;
+                    callbackOk = registration.callbackOk;
+                    console.log('[Spaces] Free-coupon simulated payment registration:', {
+                      purchaseId: registration.purchaseId,
+                      watchOk,
+                      callbackOk,
+                      simulatedTxid,
+                    });
+                  } catch (regError) {
+                    console.error(
+                      '[Spaces] Free-coupon simulated payment registration failed:',
+                      regError
+                    );
+                  }
+                } else {
+                  console.warn('[Spaces] Skipping simulated payment: no script_pubkey reserved');
+                }
+
+                pollJobStatus(jobId, currentSpaceName, currentSubspace).catch((error) => {
+                  console.error('[Spaces] Polling failed:', error);
                 });
+
+                if (watchOk && callbackOk) {
+                  toast.success(`Requested ${purchaseDataHandle} for free!`);
+                  setSubspace('');
+                  subspaceBeforeSpaceNameWarnedRef.current = false;
+                } else if (watchOk || callbackOk) {
+                  toast.info('Free request partially registered — monitoring job status');
+                } else if (scriptPubKeyHex) {
+                  toast.error('Could not register simulated payment. Polling job status anyway.');
+                }
+              } catch (bgErr) {
+                console.error('[Spaces] Free-coupon post-PUT failed:', bgErr);
               }
-            } catch (reserveErr) {
-              console.error('[Spaces] Free-coupon Taproot reservation failed:', reserveErr);
-            }
-
-            if (needsTaprootPath && !reservedPath) {
-              console.error('[Spaces] No available Taproot path for first-time free purchase');
-              toast.error(
-                'Could not reserve a wallet path for this handle. Use Find Spaces or try again.'
-              );
-              postPurchaseWatchRef.current = null;
-              purchaseTaprootPathRef.current = null;
-              pendingPaymentCallbackRef.current = null;
-            }
-
-            if (reservedPath) {
-              purchaseTaprootPathRef.current = reservedPath;
-              if (needsTaprootPath) {
-                setMySpaces((prev) =>
-                  prev.map((space) =>
-                    space.subspace === currentSubspace && space.spaceName === currentSpaceName
-                      ? {
-                          ...space,
-                          scriptPubKeyHex: reservedPath.scriptPubKeyHex,
-                          taprootDerivationPath: reservedPath.fullPath,
-                          chainPresence: 'off-chain' as const,
-                        }
-                      : space
-                  )
-                );
-              }
-            }
-
-            const simulatedTxid = buildSimulatedTransactionId(
-              Number.isFinite(parsedJobId) ? parsedJobId : Number(data.job_id)
-            );
-            const pendingPurchaseId =
-              Number.isFinite(parsedPurchaseId) ? parsedPurchaseId : undefined;
-            const scriptPubKeyHex =
-              reservedPath?.scriptPubKeyHex?.trim() ?? priorRowForPath?.scriptPubKeyHex?.trim();
-
-            let watchOk = false;
-            let callbackOk = false;
-            if (scriptPubKeyHex) {
-              try {
-                const registration = await registerPurchasePaymentOnServer({
-                  baseUrl: SPACES_API_BASE_URL,
-                  transactionId: simulatedTxid,
-                  jobId: Number.isFinite(parsedJobId) ? parsedJobId : Number(data.job_id),
-                  spaceNameLower: currentSpaceName,
-                  subspaceTrimmed: currentSubspace,
-                  handle: data.handle || purchaseData.handle,
-                  paymentWatch: postPurchaseWatchRef.current,
-                  pendingPurchaseId,
-                  scriptPubKeyHex,
-                  logLabel: 'free-coupon',
-                });
-                watchOk = registration.watchOk;
-                callbackOk = registration.callbackOk;
-                console.log('[Spaces] Free-coupon simulated payment registration:', {
-                  purchaseId: registration.purchaseId,
-                  watchOk,
-                  callbackOk,
-                  simulatedTxid,
-                });
-              } catch (regError) {
-                console.error('[Spaces] Free-coupon simulated payment registration failed:', regError);
-              }
-            } else {
-              console.warn('[Spaces] Skipping simulated payment: no script_pubkey reserved');
-            }
-
-            pollJobStatus(data.job_id, currentSpaceName, currentSubspace).catch((error) => {
-              console.error('[Spaces] Polling failed:', error);
-            });
-
-            if (watchOk && callbackOk) {
-              toast.success(`Requested ${purchaseData.handle} for free!`);
-              setSubspace('');
-              subspaceBeforeSpaceNameWarnedRef.current = false;
-            } else if (watchOk || callbackOk) {
-              toast.info('Free request partially registered — monitoring job status');
-            } else if (scriptPubKeyHex) {
-              toast.error('Could not register simulated payment. Polling job status anyway.');
-            }
-          }
-
-          if (priceSats !== null) {
-            const blockFee = getBlockFee(selectedDuration, blockFee1, blockFee6, blockFee48);
-            if (blockFee !== null) {
-              setButtonLabel(calculateTotalPrice(priceSats, blockFee1, blockFee6, blockFee48, selectedDuration, btcPriceUSD, takeOnchain, sptrPrice, sptrFee1, sptrFee6, sptrFee48));
-            }
+            })();
           }
         } catch (error) {
           console.error('[Spaces] Free coupon request failed:', error);
@@ -2997,8 +3136,10 @@ export default function SpacesScreen() {
         } finally {
           setIsConfirmationMode(false);
           setPurchaseData(null);
+          postPurchaseWatchRef.current = null;
           setButtonState('available');
           setIsButtonEnabled(true);
+          setButtonLabel(EMPTY_SUBSPACE_BUTTON_LABEL);
         }
         return;
       }
@@ -3343,45 +3484,52 @@ export default function SpacesScreen() {
 
         console.log('[Spaces API] PUT request body:', JSON.stringify(requestBody, null, 2));
 
-        const response = await fetch(url, {
+        const { status: putStatus, text: putText } = await readSpacesApiRequest(url, {
           method: 'PUT',
-          headers: {
-            'Content-Type': 'application/json',
-          },
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
           body: JSON.stringify(requestBody),
+          timeoutMs: PURCHASE_API_TIMEOUT_MS,
         });
 
         const endTime = Date.now();
         const duration = endTime - startTime;
 
-        if (!response.ok) {
-          const errorText = await response.text();
+        if (putStatus < 200 || putStatus >= 300) {
           console.error(
-            `[Spaces API] PUT ${url} - HTTP error! status: ${response.status} (${duration}ms)`,
-            errorText
+            `[Spaces API] PUT ${url} - HTTP error! status: ${putStatus} (${duration}ms)`,
+            putText
           );
-          throwSpacesApiHttpError(response.status, errorText);
+          throwSpacesApiHttpError(putStatus, putText);
         }
 
-        const data = await response.json();
+        let data: Record<string, unknown>;
+        try {
+          data = putText ? (JSON.parse(putText) as Record<string, unknown>) : {};
+        } catch {
+          throw new Error('Invalid response from Spaces server.');
+        }
         console.log(`[Spaces API] PUT ${url} - Success (${duration}ms)`, data);
 
         const dataRec = data as Record<string, unknown>;
         const { pointerJobId, pointerPurchaseId } = pointerIdsFromPurchaseResponse(dataRec);
 
         // Store job_id and related data for polling
-        if (data.job_id) {
-          setCurrentJobId(data.job_id);
+        const putJobIdRaw = data.job_id;
+        if (putJobIdRaw != null && putJobIdRaw !== '') {
+          const putJobId =
+            typeof putJobIdRaw === 'number' ? putJobIdRaw : Number(putJobIdRaw);
+          setCurrentJobId(putJobId);
           setCurrentJobData({
-            handle: data.handle || purchaseData.handle,
+            handle:
+              (typeof data.handle === 'string' ? data.handle : '') || purchaseData.handle,
             subspace: subspace.trim(),
             spaceName: spaceName.toLowerCase(),
           });
           console.log(
             '[Spaces] Job ID received:',
-            data.job_id,
+            putJobId,
             'with handle:',
-            data.handle || purchaseData.handle
+            (typeof data.handle === 'string' ? data.handle : '') || purchaseData.handle
           );
         }
 
@@ -3448,12 +3596,22 @@ export default function SpacesScreen() {
           console.log('[Spaces] Stored minimal purchase id in AsyncStorage:', storageKey);
         }
 
+        let mnemonicForReserve: string | undefined;
+        try {
+          mnemonicForReserve =
+            (await getMnemonicWithoutWorklet(currentWalletId ?? undefined)) ?? undefined;
+        } catch (mnemonicErr) {
+          console.error('[Spaces] getMnemonic for Taproot reserve failed:', mnemonicErr);
+        }
+
+        const putJobIdForReserve = data.job_id;
         const reservedPath = await reserveTaprootPathForPurchase({
           baseUrl: SPACES_API_BASE_URL,
           subspaceTrimmed,
           spaceNameLower,
-          jobId: data.job_id,
-          mySpaces,
+          jobId: putJobIdForReserve,
+          mySpaces: mySpacesRef.current,
+          mnemonic: mnemonicForReserve,
         });
 
         if (needsTaprootPath && !reservedPath) {
@@ -3682,30 +3840,42 @@ export default function SpacesScreen() {
 
       console.log('[Spaces API] POST request body:', JSON.stringify(requestBody, null, 2));
 
-      const response = await fetch(url, {
+      const { status, text } = await readSpacesApiRequest(url, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
         body: JSON.stringify(requestBody),
+        timeoutMs: PURCHASE_API_TIMEOUT_MS,
       });
 
       const endTime = Date.now();
       const duration = endTime - startTime;
 
-      if (!response.ok) {
-        const errorText = await response.text();
+      if (status < 200 || status >= 300) {
         console.error(
-          `[Spaces API] POST ${url} - HTTP error! status: ${response.status} (${duration}ms)`,
-          errorText
+          `[Spaces API] POST ${url} - HTTP error! status: ${status} (${duration}ms)`,
+          text
         );
-        throwSpacesApiHttpError(response.status, errorText);
+        throwSpacesApiHttpError(status, text);
       }
 
-      const data = await response.json();
+      let data: Record<string, unknown>;
+      try {
+        data = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+      } catch {
+        throw new Error('Invalid response from Spaces server.');
+      }
       console.log(`[Spaces API] POST ${url} - Success (${duration}ms)`, data);
 
-      const dataRec = data as Record<string, unknown>;
+      if (
+        typeof data.taproot_address !== 'string' ||
+        typeof data.handle !== 'string' ||
+        typeof data.total_price !== 'number' ||
+        typeof data.expiring_blockheight !== 'number'
+      ) {
+        throw new Error('Purchase response missing required fields.');
+      }
+
+      const dataRec = data;
       const { pointerJobId: pointerJobIdFromPost } = pointerIdsFromPurchaseResponse(dataRec);
       const postJobRaw = dataRec.job_id;
       const primaryJobIdParsed =
@@ -3789,10 +3959,10 @@ export default function SpacesScreen() {
           maximumFractionDigits: 2,
         });
         // Update button label with USD
-        setButtonLabel(formatSendButtonLabel(formattedSats, data.handle, formattedUSD));
+        setButtonLabel(formatSendButtonLabel(formattedSats, data.handle as string, formattedUSD));
       } else {
         // Update button label without USD if price not available
-        setButtonLabel(formatSendButtonLabel(formattedSats, data.handle));
+        setButtonLabel(formatSendButtonLabel(formattedSats, data.handle as string));
       }
       setIsButtonEnabled(true);
       setButtonState('available');
@@ -3807,9 +3977,15 @@ export default function SpacesScreen() {
     }
   };
 
+  const flushAvailabilityCheckRef = useRef<(() => void) | null>(null);
+  const scheduleAvailabilityDebounceRef = useRef<
+    ((subspaceValue: string, spaceNameValue: string) => void) | null
+  >(null);
+
   const handleSelectSpaceName = (option: string) => {
     setSpaceName(option);
     setSpaceNameFocused(false);
+    scheduleAvailabilityDebounceRef.current?.(subspace, option);
   };
 
   // Helper function to shorten address for display
@@ -4204,8 +4380,15 @@ export default function SpacesScreen() {
 
   // Check space availability when subspace or spaceName changes
   const checkAvailability = useCallback(async () => {
+    const subspaceTrimmed = subspace.trim();
+    const spaceNameTrimmed = spaceName.trim();
+    console.log('[Spaces] checkAvailability invoked', {
+      subspace: subspaceTrimmed,
+      spaceName: spaceNameTrimmed,
+    });
+
     // Only make request if both fields have values
-    if (!subspace.trim() || !spaceName) {
+    if (!subspaceTrimmed || !spaceNameTrimmed) {
       setButtonState(null);
       setIsButtonEnabled(false);
       setButtonLabel(idlePurchaseButtonLabel(subspace, spaceName));
@@ -4224,41 +4407,36 @@ export default function SpacesScreen() {
     setIsButtonEnabled(false);
     setButtonLabel('Checking...');
 
-    const spaceNameLower = spaceName.toLowerCase();
-    const url = `${SPACES_API_BASE_URL}/spaces/${spaceNameLower}/${subspace.trim()}?app=${SPACES_APP_NAME}&format=json`;
+    const spaceNameLower = spaceNameTrimmed.toLowerCase();
+    const url = `${SPACES_API_BASE_URL}/spaces/${spaceNameLower}/${subspaceTrimmed}?app=${SPACES_APP_NAME}&format=json`;
     const startTime = Date.now();
     console.log(`[Spaces API] GET ${url}`);
 
     try {
-      const response = await fetch(url, {
-        method: 'GET',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      });
+      const { status, text } = await readSpacesApiGet(url, AVAILABILITY_GET_TIMEOUT_MS);
 
       const endTime = Date.now();
       const duration = endTime - startTime;
 
-      if (!response.ok) {
-        let bodyPreview = '';
-        try {
-          bodyPreview = (await response.text()).slice(0, 500);
-        } catch {
-          /* ignore */
-        }
+      if (status < 200 || status >= 300) {
+        const bodyPreview = text.slice(0, 500);
         const hint =
-          response.status === 503 || response.status === 502
+          status === 503 || status === 502
             ? ' (server/CGI unavailable or overloaded — retry later)'
             : '';
         console.error(
-          `[Spaces API] GET ${url} - HTTP ${response.status} ${response.statusText}${hint} (${duration}ms)`,
+          `[Spaces API] GET ${url} - HTTP ${status}${hint} (${duration}ms)`,
           bodyPreview ? `body: ${bodyPreview}` : 'empty body'
         );
-        throw new Error(`HTTP error! status: ${response.status}`);
+        throw new Error(`HTTP error! status: ${status}`);
       }
 
-      const data: SpaceAvailabilityResponse = await response.json();
+      let data: SpaceAvailabilityResponse;
+      try {
+        data = text ? (JSON.parse(text) as SpaceAvailabilityResponse) : {};
+      } catch {
+        throw new Error('Invalid response from Spaces server.');
+      }
       console.log(`[Spaces API] GET ${url} - Success (${duration}ms)`);
 
       if (data.state === 'available') {
@@ -4419,17 +4597,270 @@ export default function SpacesScreen() {
     }
   }, [subspace, spaceName]);
 
+  const checkAvailabilityRef = useRef(checkAvailability);
+  checkAvailabilityRef.current = checkAvailability;
+
+  const stopAvailabilityWakeLoop = () => {
+    if (availabilityWakeFrameRef.current != null) {
+      cancelAnimationFrame(availabilityWakeFrameRef.current);
+      availabilityWakeFrameRef.current = null;
+    }
+  };
+
+  const startAvailabilityWakeLoop = () => {
+    stopAvailabilityWakeLoop();
+    const tick = () => {
+      tryRunDebouncedAvailabilityCheckRef.current('wake-raf');
+      if (availabilityTypingRef.current) {
+        availabilityWakeFrameRef.current = requestAnimationFrame(tick);
+      } else {
+        stopAvailabilityWakeLoop();
+      }
+    };
+    availabilityWakeFrameRef.current = requestAnimationFrame(tick);
+  };
+
+  const markAvailabilityTyping = (subspaceValue: string, spaceNameValue: string) => {
+    const sub = subspaceValue.trim();
+    const space = spaceNameValue.trim();
+    availabilityTypingRef.current = {
+      editedAt: Date.now(),
+      subspace: sub,
+      spaceName: space,
+    };
+    availabilityCheckedKeyRef.current = null;
+    console.log('[Spaces] checkAvailability debounce scheduled', {
+      delayMs: SUBNAME_AVAILABILITY_DEBOUNCE_MS,
+      subspace: sub,
+      spaceName: space,
+    });
+    startAvailabilityWakeLoop();
+  };
+
+  const tryRunDebouncedAvailabilityCheck = (source: string) => {
+    const pending = availabilityTypingRef.current;
+    if (!pending) {
+      return;
+    }
+    if (!pending.subspace || !pending.spaceName) {
+      return;
+    }
+    const idleMs = Date.now() - pending.editedAt;
+    if (idleMs < SUBNAME_AVAILABILITY_DEBOUNCE_MS) {
+      return;
+    }
+    const key = `${pending.subspace}@${pending.spaceName.toLowerCase()}`;
+    if (availabilityCheckedKeyRef.current === key) {
+      return;
+    }
+    if (availabilityCheckInFlightRef.current) {
+      return;
+    }
+
+    availabilityCheckedKeyRef.current = key;
+    availabilityTypingRef.current = null;
+    console.log('[Spaces] checkAvailability debounce fired', { source, idleMs, key });
+    availabilityCheckInFlightRef.current = true;
+    void checkAvailabilityRef.current().finally(() => {
+      availabilityCheckInFlightRef.current = false;
+    });
+  };
+
+  tryRunDebouncedAvailabilityCheckRef.current = tryRunDebouncedAvailabilityCheck;
+
+  const scheduleAvailabilityDebounce = (subspaceValue: string, spaceNameValue: string) => {
+    markAvailabilityTyping(subspaceValue, spaceNameValue);
+  };
+
+  scheduleAvailabilityDebounceRef.current = scheduleAvailabilityDebounce;
+
+  const runCheckAvailabilityNow = () => {
+    availabilityTypingRef.current = null;
+    availabilityCheckedKeyRef.current = null;
+    stopAvailabilityWakeLoop();
+    void checkAvailabilityRef.current();
+  };
+
+  flushAvailabilityCheckRef.current = runCheckAvailabilityNow;
+
+  const stopCouponWakeLoop = () => {
+    if (couponWakeFrameRef.current != null) {
+      cancelAnimationFrame(couponWakeFrameRef.current);
+      couponWakeFrameRef.current = null;
+    }
+  };
+
+  const startCouponWakeLoop = () => {
+    stopCouponWakeLoop();
+    const tick = () => {
+      tryRunCouponValidationRef.current('wake-raf');
+      if (couponPendingRef.current) {
+        couponWakeFrameRef.current = requestAnimationFrame(tick);
+      } else {
+        stopCouponWakeLoop();
+      }
+    };
+    couponWakeFrameRef.current = requestAnimationFrame(tick);
+  };
+
+  const resetCouponValidationState = () => {
+    setDiscountPercent(null);
+    setCompletelyFree(false);
+    setCouponAffiliatePaymentAddress(null);
+    setCouponAffiliateRevenuePercent(null);
+    setCouponStatus('idle');
+  };
+
+  const runCouponValidation = async (code: string, generation: number) => {
+    const spaceNameLower = spaceName.trim().toLowerCase();
+    if (!spaceNameLower) {
+      if (generation === couponValidateGenerationRef.current) {
+        setCouponStatus('invalid');
+      }
+      return;
+    }
+
+    setCouponStatus('validating');
+    const url = `${SPACES_API_BASE_URL}/api/spaces/${spaceNameLower}/validate-coupon`;
+    console.log(`[Spaces API] POST ${url} (validate coupon)`);
+
+    try {
+      const { status, text } = await readSpacesApiRequest(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ code: code.toUpperCase() }),
+        timeoutMs: AVAILABILITY_GET_TIMEOUT_MS,
+      });
+
+      if (generation !== couponValidateGenerationRef.current) {
+        return;
+      }
+
+      let data: {
+        success?: boolean;
+        valid?: boolean;
+        discount_percent?: number;
+        completely_free?: boolean;
+        affiliate_payment_address?: string;
+        affiliate_revenue_percent?: number;
+        message?: string;
+      };
+      try {
+        data = text ? (JSON.parse(text) as typeof data) : {};
+      } catch {
+        setCouponStatus('invalid');
+        toast.error('Could not validate coupon');
+        return;
+      }
+
+      if (status < 200 || status >= 300) {
+        setCouponStatus('invalid');
+        toast.error('Could not validate coupon');
+        return;
+      }
+
+      if (data.success && data.valid) {
+        setDiscountPercent(data.discount_percent ?? null);
+        setCompletelyFree(!!data.completely_free);
+        setCouponAffiliatePaymentAddress(
+          typeof data.affiliate_payment_address === 'string'
+            ? data.affiliate_payment_address
+            : null
+        );
+        setCouponAffiliateRevenuePercent(
+          typeof data.affiliate_revenue_percent === 'number'
+            ? data.affiliate_revenue_percent
+            : null
+        );
+        setCouponStatus('valid');
+        toast.success(data.message || `Coupon applied: ${data.discount_percent}% off`);
+        Keyboard.dismiss();
+      } else {
+        resetCouponValidationState();
+        setCouponStatus('invalid');
+        toast.error(data.message || 'Invalid coupon code');
+      }
+    } catch (error) {
+      if (generation !== couponValidateGenerationRef.current) {
+        return;
+      }
+      console.warn('[Spaces API] validate-coupon failed:', error);
+      resetCouponValidationState();
+      setCouponStatus('invalid');
+      toast.error('Could not validate coupon');
+    } finally {
+      couponValidateInFlightRef.current = false;
+    }
+  };
+
+  const tryRunCouponValidation = (source: string) => {
+    if (!isConfirmationModeRef.current) {
+      couponPendingRef.current = null;
+      return;
+    }
+    const pending = couponPendingRef.current;
+    if (!pending) {
+      return;
+    }
+    const idleMs = Date.now() - pending.editedAt;
+    if (idleMs < COUPON_DEBOUNCE_MS) {
+      return;
+    }
+    if (couponValidateInFlightRef.current) {
+      return;
+    }
+
+    couponPendingRef.current = null;
+    stopCouponWakeLoop();
+    couponValidateInFlightRef.current = true;
+    const generation = couponValidateGenerationRef.current;
+    console.log('[Spaces] coupon debounce fired', { source, idleMs, code: pending.code });
+    void runCouponValidation(pending.code, generation);
+  };
+
+  tryRunCouponValidationRef.current = tryRunCouponValidation;
+
+  const scheduleCouponValidation = (rawCode: string) => {
+    if (!isConfirmationModeRef.current) {
+      return;
+    }
+    const code = rawCode.trim();
+    if (!code) {
+      couponPendingRef.current = null;
+      couponValidateGenerationRef.current += 1;
+      stopCouponWakeLoop();
+      resetCouponValidationState();
+      return;
+    }
+    couponValidateGenerationRef.current += 1;
+    couponPendingRef.current = { editedAt: Date.now(), code };
+    console.log('[Spaces] coupon debounce scheduled', { delayMs: COUPON_DEBOUNCE_MS, code });
+    startCouponWakeLoop();
+  };
+
   useEffect(() => {
     refreshSpaceQuoteRef.current = checkAvailability;
   }, [checkAvailability]);
 
+  // iOS often does not run JS timers while a TextInput is focused; drive debounce off
+  // re-renders (job poll UI ticks ~1s) instead of setTimeout/setInterval alone.
   useEffect(() => {
-    const timeoutId = setTimeout(() => {
-      void checkAvailability();
-    }, 2000); // Wait 2s after user stops typing (same as coupon validation)
+    tryRunDebouncedAvailabilityCheckRef.current('after-render');
+    tryRunCouponValidationRef.current('after-render');
+  });
 
-    return () => clearTimeout(timeoutId);
-  }, [checkAvailability]);
+  useEffect(() => {
+    tryRunDebouncedAvailabilityCheckRef.current('job-polling-state');
+    tryRunCouponValidationRef.current('job-polling-state');
+  }, [jobPollingState]);
+
+  useEffect(
+    () => () => {
+      stopAvailabilityWakeLoop();
+      stopCouponWakeLoop();
+    },
+    []
+  );
 
   const handleSpacesPurchaseApiError = useCallback((error: unknown, logContext: string) => {
     console.error(logContext, error);
@@ -4477,6 +4908,12 @@ export default function SpacesScreen() {
     }
   }, [mySpaces]);
 
+  const pollResumeTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+  const clearPollResumeTimers = useCallback(() => {
+    pollResumeTimersRef.current.forEach(clearTimeout);
+    pollResumeTimersRef.current = [];
+  }, []);
+
   // Load mySpaces from AsyncStorage
   const loadMySpaces = useCallback(async () => {
     try {
@@ -4501,24 +4938,36 @@ export default function SpacesScreen() {
         );
 
         if (activeSpaces.length > 0) {
-          console.log('[Spaces] Resuming polling for', activeSpaces.length, 'active jobs');
+          clearPollResumeTimers();
+          console.log(
+            '[Spaces] Resuming polling for',
+            activeSpaces.length,
+            `active jobs after ${POLL_RESUME_INITIAL_DELAY_MS}ms, every ${POLL_RESUME_STAGGER_MS}ms`
+          );
           activeSpaces.forEach(
-            (space: {
-              jobId: number;
-              subspace: string;
-              spaceName: string;
-              unifiedStatusPurchaseType?: 'subname' | 'pointer';
-            }) => {
-              pollJobStatus(space.jobId, space.spaceName, space.subspace, {
-                unifiedStatusPurchaseType: space.unifiedStatusPurchaseType ?? 'subname',
-              }).catch((error) => {
-                console.error(
-                  '[Spaces] Failed to resume polling for job',
-                  space.jobId,
-                  ':',
-                  error
-                );
-              });
+            (
+              space: {
+                jobId: number;
+                subspace: string;
+                spaceName: string;
+                unifiedStatusPurchaseType?: 'subname' | 'pointer';
+              },
+              index: number
+            ) => {
+              const delayMs = POLL_RESUME_INITIAL_DELAY_MS + index * POLL_RESUME_STAGGER_MS;
+              const timer = setTimeout(() => {
+                pollJobStatusRef.current(space.jobId, space.spaceName, space.subspace, {
+                  unifiedStatusPurchaseType: space.unifiedStatusPurchaseType ?? 'subname',
+                }).catch((error) => {
+                  console.error(
+                    '[Spaces] Failed to resume polling for job',
+                    space.jobId,
+                    ':',
+                    error
+                  );
+                });
+              }, delayMs);
+              pollResumeTimersRef.current.push(timer);
             }
           );
         }
@@ -4526,18 +4975,20 @@ export default function SpacesScreen() {
     } catch (error) {
       console.error('[Spaces] Failed to load mySpaces from AsyncStorage:', error);
     }
-  }, []);
+  }, [clearPollResumeTimers]);
 
   // Load mySpaces on component mount
   useEffect(() => {
     loadMySpaces();
-  }, [loadMySpaces]);
+    return clearPollResumeTimers;
+  }, [loadMySpaces, clearPollResumeTimers]);
 
   // Reload mySpaces when screen comes into focus (e.g., after deleting a space)
   useFocusEffect(
     useCallback(() => {
       loadMySpaces();
-    }, [loadMySpaces])
+      return clearPollResumeTimers;
+    }, [loadMySpaces, clearPollResumeTimers])
   );
 
   // Update countdown timers for active polling jobs (slow tick for long intervals)
@@ -4558,76 +5009,13 @@ export default function SpacesScreen() {
   // Reset coupon state when leaving confirmation mode
   useEffect(() => {
     if (!isConfirmationMode) {
+      couponPendingRef.current = null;
+      couponValidateGenerationRef.current += 1;
+      stopCouponWakeLoop();
       setCouponCode('');
-      setDiscountPercent(null);
-      setCompletelyFree(false);
-      setCouponAffiliatePaymentAddress(null);
-      setCouponAffiliateRevenuePercent(null);
-      setCouponStatus('idle');
+      resetCouponValidationState();
     }
   }, [isConfirmationMode]);
-
-  // Validate coupon code with 2-second debounce after user stops typing
-  useEffect(() => {
-    if (!isConfirmationMode) return;
-
-    if (!couponCode.trim()) {
-      setDiscountPercent(null);
-      setCompletelyFree(false);
-      setCouponAffiliatePaymentAddress(null);
-      setCouponAffiliateRevenuePercent(null);
-      setCouponStatus('idle');
-      return;
-    }
-
-    setCouponStatus('validating');
-
-    const timeoutId = setTimeout(async () => {
-      try {
-        const spaceNameLower = spaceName.toLowerCase();
-        const url = `${SPACES_API_BASE_URL}/api/spaces/${spaceNameLower}/validate-coupon`;
-        const response = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ code: couponCode.trim().toUpperCase() }),
-        });
-        const data = await response.json();
-        if (data.success && data.valid) {
-          setDiscountPercent(data.discount_percent);
-          setCompletelyFree(!!data.completely_free);
-          setCouponAffiliatePaymentAddress(
-            typeof data.affiliate_payment_address === 'string'
-              ? data.affiliate_payment_address
-              : null
-          );
-          setCouponAffiliateRevenuePercent(
-            typeof data.affiliate_revenue_percent === 'number'
-              ? data.affiliate_revenue_percent
-              : null
-          );
-          setCouponStatus('valid');
-          toast.success(data.message || `Coupon applied: ${data.discount_percent}% off`);
-          Keyboard.dismiss();
-        } else {
-          setDiscountPercent(null);
-          setCompletelyFree(false);
-          setCouponAffiliatePaymentAddress(null);
-          setCouponAffiliateRevenuePercent(null);
-          setCouponStatus('invalid');
-          toast.error(data.message || 'Invalid coupon code');
-        }
-      } catch {
-        setDiscountPercent(null);
-        setCompletelyFree(false);
-        setCouponAffiliatePaymentAddress(null);
-        setCouponAffiliateRevenuePercent(null);
-        setCouponStatus('invalid');
-        toast.error('Could not validate coupon');
-      }
-    }, 2000);
-
-    return () => clearTimeout(timeoutId);
-  }, [couponCode, isConfirmationMode, spaceName]);
 
   // Recalculate price when duration changes or BTC price updates
   useEffect(() => {
@@ -4747,7 +5135,27 @@ export default function SpacesScreen() {
                 placeholder="subspace"
                 placeholderTextColor={colors.textSecondary}
                 value={subspace}
-                onChangeText={(text) => setSubspace(normalizeSubspaceInput(text))}
+                onChangeText={(text) => {
+                  const normalized = normalizeSubspaceInput(text);
+                  setSubspace(normalized);
+                  scheduleAvailabilityDebounce(normalized, spaceName);
+                }}
+                onEndEditing={() => {
+                  if (subspace.trim() && spaceName.trim()) {
+                    runCheckAvailabilityNow();
+                  }
+                }}
+                onBlur={() => {
+                  if (subspace.trim() && spaceName.trim()) {
+                    runCheckAvailabilityNow();
+                  }
+                }}
+                returnKeyType="done"
+                onSubmitEditing={() => {
+                  if (subspace.trim() && spaceName.trim()) {
+                    runCheckAvailabilityNow();
+                  }
+                }}
                 autoCapitalize="none"
                 autoCorrect={false}
               />
@@ -4758,7 +5166,10 @@ export default function SpacesScreen() {
                   placeholder="space_name"
                   placeholderTextColor={colors.textSecondary}
                   value={spaceName}
-                  onChangeText={setSpaceName}
+                  onChangeText={(text) => {
+                    setSpaceName(text);
+                    scheduleAvailabilityDebounce(subspace, text);
+                  }}
                   onFocus={() => setSpaceNameFocused(true)}
                   onBlur={() => {
                     if (selectingSpaceNameRef.current) {
@@ -4766,6 +5177,9 @@ export default function SpacesScreen() {
                       return;
                     }
                     setSpaceNameFocused(false);
+                    if (subspace.trim() && spaceName.trim()) {
+                      runCheckAvailabilityNow();
+                    }
                   }}
                   autoCapitalize="none"
                   autoCorrect={false}
@@ -4777,6 +5191,13 @@ export default function SpacesScreen() {
               <View style={styles.spacesListStatusRow}>
                 <ActivityIndicator size="small" color={colors.primary} />
                 <Text style={styles.spacesListStatusText}>Loading spaces…</Text>
+                <TouchableOpacity
+                  style={styles.spacesListRetryButton}
+                  onPress={retrySpacesListLoad}
+                  activeOpacity={0.7}
+                >
+                  <Text style={styles.spacesListRetryButtonText}>Retry</Text>
+                </TouchableOpacity>
               </View>
             ) : null}
 
@@ -4794,7 +5215,7 @@ export default function SpacesScreen() {
                 </Text>
                 <TouchableOpacity
                   style={styles.spacesListRetryButton}
-                  onPress={() => loadSpaceNameOptions('retry')}
+                  onPress={retrySpacesListLoad}
                   activeOpacity={0.7}
                 >
                   <Text style={styles.spacesListRetryButtonText}>Retry</Text>
@@ -4897,6 +5318,18 @@ export default function SpacesScreen() {
                         if (couponStatus !== 'idle') setCouponStatus('idle');
                         if (discountPercent !== null) setDiscountPercent(null);
                         if (completelyFree) setCompletelyFree(false);
+                        scheduleCouponValidation(text);
+                      }}
+                      onEndEditing={() => {
+                        const code = couponCode.trim();
+                        if (!code) {
+                          return;
+                        }
+                        couponPendingRef.current = {
+                          editedAt: Date.now() - COUPON_DEBOUNCE_MS - 1,
+                          code,
+                        };
+                        tryRunCouponValidationRef.current('end-editing');
                       }}
                       autoCapitalize="characters"
                       autoCorrect={false}

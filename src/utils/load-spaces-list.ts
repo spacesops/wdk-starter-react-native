@@ -1,4 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { Platform } from 'react-native';
 
 export const GETSPACES_LIST_CACHE_KEY = 'spaces_wallet_getspaces_list_v1';
 const FETCH_TIMEOUT_MS = 15_000;
@@ -81,41 +82,196 @@ type FetchGetSpacesOnceResult =
   | { ok: true; spaceNames: string[] }
   | { ok: false; retryable: boolean; status: number; errorMessage: string };
 
+type RawGetResponse = { status: number; text: string };
+
+const GETSPACES_HEADERS: Record<string, string> = {
+  Accept: 'application/json',
+  'Cache-Control': 'no-cache',
+  Pragma: 'no-cache',
+};
+
+function abortError(): Error {
+  const error = new Error('Aborted');
+  error.name = 'AbortError';
+  return error;
+}
+
+function timeoutError(): Error {
+  const error = new Error('Timeout');
+  error.name = 'TimeoutError';
+  return error;
+}
+
+type SpacesHttpRequest = {
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string | null;
+};
+
+/**
+ * iOS RCTNetworking + fetch AbortSignal can leave the response body pending even after the
+ * server returns 200. XMLHttpRequest uses a separate path and reliably delivers responseText.
+ */
+function readSpacesViaXhr(
+  url: string,
+  timeoutMs: number,
+  externalSignal?: AbortSignal,
+  request: SpacesHttpRequest = {}
+): Promise<RawGetResponse> {
+  const method = request.method ?? 'GET';
+  const headers = request.headers ?? {};
+
+  return new Promise((resolve, reject) => {
+    if (externalSignal?.aborted) {
+      reject(abortError());
+      return;
+    }
+
+    const xhr = new XMLHttpRequest();
+    let settled = false;
+    const finish = (handler: () => void) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      externalSignal?.removeEventListener('abort', onExternalAbort);
+      handler();
+    };
+
+    const onExternalAbort = () => {
+      xhr.abort();
+    };
+
+    externalSignal?.addEventListener('abort', onExternalAbort);
+
+    xhr.open(method, url);
+    for (const [header, value] of Object.entries(headers)) {
+      xhr.setRequestHeader(header, value);
+    }
+    xhr.responseType = 'text';
+    xhr.timeout = timeoutMs;
+
+    xhr.onload = () => {
+      finish(() => resolve({ status: xhr.status, text: xhr.responseText ?? '' }));
+    };
+    xhr.onerror = () => {
+      finish(() => reject(new TypeError('Network request failed')));
+    };
+    xhr.ontimeout = () => {
+      finish(() => reject(timeoutError()));
+    };
+    xhr.onabort = () => {
+      finish(() => {
+        if (externalSignal?.aborted) {
+          reject(abortError());
+        } else {
+          reject(timeoutError());
+        }
+      });
+    };
+
+    xhr.send(request.body ?? null);
+  });
+}
+
+async function readSpacesViaFetch(
+  url: string,
+  timeoutMs: number,
+  externalSignal?: AbortSignal,
+  request: SpacesHttpRequest = {}
+): Promise<RawGetResponse> {
+  const method = request.method ?? 'GET';
+  const headers = request.headers ?? {};
+  const body = request.body;
+
+  const controller = new AbortController();
+  const onExternalAbort = () => controller.abort();
+  externalSignal?.addEventListener('abort', onExternalAbort);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      method,
+      headers,
+      body: body ?? undefined,
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    return { status: response.status, text };
+  } finally {
+    clearTimeout(timer);
+    externalSignal?.removeEventListener('abort', onExternalAbort);
+  }
+}
+
+/** Wait for the /getspaces body, then parse space_name. */
+async function readGetSpaces(
+  url: string,
+  timeoutMs: number,
+  externalSignal?: AbortSignal
+): Promise<RawGetResponse> {
+  const request: SpacesHttpRequest = { method: 'GET', headers: GETSPACES_HEADERS };
+  if (Platform.OS === 'ios') {
+    return readSpacesViaXhr(url, timeoutMs, externalSignal, request);
+  }
+  return readSpacesViaFetch(url, timeoutMs, externalSignal, request);
+}
+
+export type ReadSpacesApiRequestOptions = {
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+};
+
+/** Spaces API HTTP with iOS XHR transport for reliable response bodies. */
+export async function readSpacesApiRequest(
+  url: string,
+  options: ReadSpacesApiRequestOptions = {}
+): Promise<{ status: number; text: string }> {
+  const timeoutMs = options.timeoutMs ?? FETCH_TIMEOUT_MS;
+  const request: SpacesHttpRequest = {
+    method: options.method ?? 'GET',
+    headers: options.headers ?? (options.method && options.method !== 'GET' ? {} : GETSPACES_HEADERS),
+    body: options.body ?? null,
+  };
+  if (Platform.OS === 'ios') {
+    return readSpacesViaXhr(url, timeoutMs, options.signal, request);
+  }
+  return readSpacesViaFetch(url, timeoutMs, options.signal, request);
+}
+
+/** GET with iOS XHR transport; use for quote/availability JSON endpoints. */
+export async function readSpacesApiGet(
+  url: string,
+  timeoutMs = FETCH_TIMEOUT_MS,
+  externalSignal?: AbortSignal
+): Promise<{ status: number; text: string }> {
+  return readSpacesApiRequest(url, { timeoutMs, signal: externalSignal });
+}
+
 async function fetchGetSpacesOnce(
   baseUrl: string,
   appName: string,
   externalSignal?: AbortSignal,
   timeoutMs = FETCH_TIMEOUT_MS
 ): Promise<FetchGetSpacesOnceResult> {
-  const url = `${baseUrl.replace(/\/$/, '')}/getspaces?app=${encodeURIComponent(appName)}`;
+  const url = `${baseUrl.replace(/\/$/, '')}/getspaces?app=${encodeURIComponent(appName)}&_=${Date.now()}`;
   const startTime = Date.now();
 
   if (externalSignal?.aborted) {
     return { ok: false, retryable: false, status: 0, errorMessage: 'Aborted' };
   }
 
-  const controller = new AbortController();
-  const onExternalAbort = () => controller.abort();
-  externalSignal?.addEventListener('abort', onExternalAbort);
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
   let outcome = 'threw';
 
   try {
-    console.log(`[Spaces API] GET getspaces - start ${url}`);
-    const response = await fetch(url, {
-      method: 'GET',
-      cache: 'no-store',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        'Cache-Control': 'no-cache',
-        Pragma: 'no-cache',
-      },
-      signal: controller.signal,
-    });
+    const transport = Platform.OS === 'ios' ? 'xhr' : 'fetch';
+    console.log(`[Spaces API] GET getspaces - start (${transport}) ${url}`);
+    const { status, text } = await readGetSpaces(url, timeoutMs, externalSignal);
 
     const duration = Date.now() - startTime;
-    const text = await response.text();
+    const response = { ok: status >= 200 && status < 300, status, text };
 
     if (!response.ok) {
       console.error(
@@ -200,8 +356,6 @@ async function fetchGetSpacesOnce(
           : 'Unable to load spaces list.',
     };
   } finally {
-    clearTimeout(timer);
-    externalSignal?.removeEventListener('abort', onExternalAbort);
     console.log(`[Spaces API] GET getspaces - complete: ${outcome} (${Date.now() - startTime}ms)`);
   }
 }

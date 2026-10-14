@@ -3,7 +3,7 @@
     "name": "SpacesWallet",
     "slug": "spaces-wallet",
     "owner": "koine",
-    "version": "1.0.8",
+    "version": "1.0.10",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "wdkstarterreactnative",
@@ -11,7 +11,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.lcfx.spaceswallet",
-      "buildNumber": "21",
+      "buildNumber": "23",
       "infoPlist": {
         "UIStatusBarStyle": "UIStatusBarStyleLightContent",
         "UIViewControllerBasedStatusBarAppearance": false,
@@ -30,7 +30,7 @@
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
       "package": "com.lcfx.spaceswallet",
-      "versionCode": 21,
+      "versionCode": 23,
       "permissions": [
         "android.permission.CAMERA"
       ]

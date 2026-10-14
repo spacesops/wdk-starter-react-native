@@ -1,113 +1,70 @@
 import { useRouter } from 'expo-router';
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useRef } from 'react';
 
 /**
- * A debounced version of expo-router's useRouter hook to prevent
- * double navigation when users tap quickly on navigation buttons.
+ * Ignores a second navigation tap within `delay` ms.
+ * The window is checked against the clock on each press, so a missed timer
+ * cannot leave the main screen's buttons stuck after a later screen stalls.
  */
 export function useDebouncedNavigation(delay = 300) {
   const router = useRouter();
-  const isNavigatingRef = useRef(false);
-  const timeoutIdsRef = useRef<Set<number>>(new Set());
+  const lastNavigationAtRef = useRef(0);
 
-  useEffect(() => {
-    const refs = timeoutIdsRef.current;
-    return () => {
-      // Clear all pending timeouts on unmount
-      refs.forEach(clearTimeout);
-      refs.clear();
-    };
-  }, []);
+  const run = useCallback(
+    (action: () => void) => {
+      const now = Date.now();
+      if (now - lastNavigationAtRef.current < delay) {
+        return;
+      }
+      lastNavigationAtRef.current = now;
+      action();
+    },
+    [delay]
+  );
 
   const push = useCallback(
     (path: string | { pathname: string; params?: Record<string, any> }) => {
-      if (isNavigatingRef.current) {
-        return;
-      }
-
-      isNavigatingRef.current = true;
-      router.push(path as any);
-
-      const timeoutId = setTimeout(() => {
-        isNavigatingRef.current = false;
-        timeoutIdsRef.current.delete(timeoutId);
-      }, delay);
-      timeoutIdsRef.current.add(timeoutId);
+      run(() => {
+        router.push(path as any);
+      });
     },
-    [router, delay]
+    [router, run]
   );
 
   const replace = useCallback(
     (path: string | { pathname: string; params?: Record<string, any> }) => {
-      if (isNavigatingRef.current) {
-        return;
-      }
-
-      isNavigatingRef.current = true;
-      router.replace(path as any);
-
-      const timeoutId = setTimeout(() => {
-        isNavigatingRef.current = false;
-        timeoutIdsRef.current.delete(timeoutId);
-      }, delay);
-      timeoutIdsRef.current.add(timeoutId);
+      run(() => {
+        router.replace(path as any);
+      });
     },
-    [router, delay]
+    [router, run]
   );
 
   const back = useCallback(() => {
-    if (isNavigatingRef.current) {
-      return;
-    }
-
-    isNavigatingRef.current = true;
-    router.back();
-
-    const timeoutId = setTimeout(() => {
-      isNavigatingRef.current = false;
-      timeoutIdsRef.current.delete(timeoutId);
-    }, delay);
-    timeoutIdsRef.current.add(timeoutId);
-  }, [router, delay]);
+    run(() => {
+      router.back();
+    });
+  }, [router, run]);
 
   const dismissAll = useCallback(
     (navigateTo?: string | { pathname: string; params?: Record<string, any> }) => {
-      if (isNavigatingRef.current) {
-        return;
-      }
-
-      isNavigatingRef.current = true;
-      router.dismissAll();
-
-      if (navigateTo) {
-        router.replace(navigateTo as any);
-      }
-
-      const timeoutId = setTimeout(() => {
-        isNavigatingRef.current = false;
-        timeoutIdsRef.current.delete(timeoutId);
-      }, delay);
-      timeoutIdsRef.current.add(timeoutId);
+      run(() => {
+        router.dismissAll();
+        if (navigateTo) {
+          router.replace(navigateTo as any);
+        }
+      });
     },
-    [router, delay]
+    [router, run]
   );
 
   const dismissTo = useCallback(
     (path: string | { pathname: string; params?: Record<string, any> }) => {
-      if (isNavigatingRef.current) {
-        return;
-      }
-
-      isNavigatingRef.current = true;
-      router.dismissTo(path as any);
-
-      const timeoutId = setTimeout(() => {
-        isNavigatingRef.current = false;
-        timeoutIdsRef.current.delete(timeoutId);
-      }, delay);
-      timeoutIdsRef.current.add(timeoutId);
+      run(() => {
+        router.dismissTo(path as any);
+      });
     },
-    [router, delay]
+    [router, run]
   );
 
   return { push, replace, back, dismissAll, dismissTo };
