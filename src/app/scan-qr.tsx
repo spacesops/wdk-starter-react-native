@@ -17,6 +17,7 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { colors } from '@/constants/colors';
+import { isValidSpaceAddress } from '@/utils/taproot-address-to-spk';
 
 const { width: screenWidth } = Dimensions.get('window');
 const qrSize = screenWidth * 0.7;
@@ -26,37 +27,49 @@ export default function ScanQRScreen() {
   const router = useDebouncedNavigation();
   const { returnRoute, scanMode, ...params } = useLocalSearchParams();
   const isMnemonicMode = scanMode === 'mnemonic';
+  const isSpaceAddressMode = scanMode === 'spaceAddress';
   const [permission, requestPermission] = useCameraPermissions();
   const [scanned, setScanned] = useState(false);
   const [hasAsked, setHasAsked] = useState(false);
 
-  const copy = useMemo(
-    () =>
-      isMnemonicMode
-        ? {
-            permissionBody:
-              'Scanning a QR code of your recovery phrase needs the camera. You can turn it on in Settings, or go back and type your 12 words instead.',
-            title: 'Scan QR code with your recovery phrase.',
-            subtitle: 'Hold your phone up to the QR code. Only 12-word phrases are supported.',
-            scanLabel: 'Scan recovery phrase',
-            invalidTitle: 'Invalid QR Code',
-            invalidBody:
-              'The scanned QR code must contain exactly 12 lowercase words separated by spaces.',
-            invalidChecksumBody:
-              'This does not look like a valid 12-word recovery phrase. Check spelling and word order.',
-          }
-        : {
-            permissionBody:
-              'Scanning a QR code needs the camera. You can turn it on in Settings, or go back and paste the address instead.',
-            title: 'Scan QR code to make payment.',
-            subtitle: 'Hold your phone up to the QR code.',
-            scanLabel: 'Scan address',
-            invalidTitle: 'Invalid QR Code',
-            invalidBody: 'The scanned QR code does not contain a valid address.',
-            invalidChecksumBody: '',
-          },
-    [isMnemonicMode]
-  );
+  const copy = useMemo(() => {
+    if (isMnemonicMode) {
+      return {
+        permissionBody:
+          'Scanning a QR code of your recovery phrase needs the camera. You can turn it on in Settings, or go back and type your 12 words instead.',
+        title: 'Scan QR code with your recovery phrase.',
+        subtitle: 'Hold your phone up to the QR code. Only 12-word phrases are supported.',
+        scanLabel: 'Scan recovery phrase',
+        invalidTitle: 'Invalid QR Code',
+        invalidBody:
+          'The scanned QR code must contain exactly 12 lowercase words separated by spaces.',
+        invalidChecksumBody:
+          'This does not look like a valid 12-word recovery phrase. Check spelling and word order.',
+      };
+    }
+    if (isSpaceAddressMode) {
+      return {
+        permissionBody:
+          'Scanning a space address needs the camera. You can turn it on in Settings, or go back and paste the address instead.',
+        title: 'Scan recipient space address.',
+        subtitle: 'Hold your phone up to the QR code (bcs1… / tbs1…).',
+        scanLabel: 'Scan space address',
+        invalidTitle: 'Invalid QR Code',
+        invalidBody: 'The scanned code is not a valid space address (bcs1…, tbs1…, or bcrts1…).',
+        invalidChecksumBody: '',
+      };
+    }
+    return {
+      permissionBody:
+        'Scanning a QR code needs the camera. You can turn it on in Settings, or go back and paste the address instead.',
+      title: 'Scan QR code to make payment.',
+      subtitle: 'Hold your phone up to the QR code.',
+      scanLabel: 'Scan address',
+      invalidTitle: 'Invalid QR Code',
+      invalidBody: 'The scanned QR code does not contain a valid address.',
+      invalidChecksumBody: '',
+    };
+  }, [isMnemonicMode, isSpaceAddressMode]);
 
   const handleBarCodeScanned = useCallback(
     ({ data }: { type: string; data: string }) => {
@@ -97,7 +110,29 @@ export default function ScanQRScreen() {
         return;
       }
 
-      if (!data || data.length < 10) {
+      const trimmed = data?.trim() ?? '';
+      if (isSpaceAddressMode) {
+        if (!isValidSpaceAddress(trimmed)) {
+          Alert.alert(copy.invalidTitle, copy.invalidBody, [
+            {
+              text: 'Try Again',
+              onPress: () => setScanned(false),
+            },
+          ]);
+          return;
+        }
+        if (returnRoute) {
+          router.replace({
+            pathname: returnRoute as any,
+            params: { scannedSpaceAddress: trimmed, ...params },
+          });
+        } else {
+          router.back();
+        }
+        return;
+      }
+
+      if (!trimmed || trimmed.length < 10) {
         Alert.alert(copy.invalidTitle, copy.invalidBody, [
           {
             text: 'Try Again',
@@ -110,16 +145,16 @@ export default function ScanQRScreen() {
       if (returnRoute) {
         router.replace({
           pathname: returnRoute as any,
-          params: { scannedAddress: data, ...params },
+          params: { scannedAddress: trimmed, ...params },
         });
       } else {
         router.replace({
           pathname: '/send/select-token',
-          params: { scannedAddress: data, ...params },
+          params: { scannedAddress: trimmed, ...params },
         });
       }
     },
-    [scanned, router, returnRoute, params, isMnemonicMode, copy]
+    [scanned, router, returnRoute, params, isMnemonicMode, isSpaceAddressMode, copy]
   );
 
   const handleClose = useCallback(() => {

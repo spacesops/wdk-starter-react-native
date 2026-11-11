@@ -92,16 +92,52 @@ function deriveChild(node: HdNode, index: number): HdNode {
   return { key: childKey, chain: IR };
 }
 
-function derivePath(seed: Uint8Array, indices: number[]): Uint8Array {
-  let node = masterFromSeed(seed);
+function derivePath(node: HdNode, indices: number[]): HdNode {
+  let current = node;
   for (const index of indices) {
-    node = deriveChild(node, index);
+    current = deriveChild(current, index);
   }
-  return node.key;
+  return current;
+}
+
+export type Bip86ReceiveDeriver = (index: number) => DerivedBip86Taproot;
+
+/**
+ * Runs the expensive steps (PBKDF2 seed + hardened path to `m/86'/coin'/account'/0`) once,
+ * and returns a function that derives each receive index with a single child step.
+ */
+export function createBip86ReceiveDeriver(params: {
+  mnemonic: string;
+  account: number;
+  coinType?: number;
+  network?: string;
+}): Bip86ReceiveDeriver {
+  const coinType = params.coinType ?? 0;
+  const { account, network } = params;
+  if (!Number.isInteger(account) || account < 0) {
+    throw new Error('BIP-86 account must be a non-negative integer');
+  }
+
+  const seed = toBytes(mnemonicToSeedSync(params.mnemonic.trim()));
+  const receiveChain = derivePath(masterFromSeed(seed), [
+    HARDENED + 86,
+    HARDENED + coinType,
+    HARDENED + account,
+    0,
+  ]);
+
+  return (index: number) => {
+    if (!Number.isInteger(index) || index < 0) {
+      throw new Error('BIP-86 index must be a non-negative integer');
+    }
+    const privateKey = deriveChild(receiveChain, index).key;
+    return taprootFromPrivateKey({ privateKey, account, index, coinType, network });
+  };
 }
 
 /**
  * Derive a BIP-86 receive address and Taproot key material from a mnemonic.
+ * When deriving several indices, use `createBip86ReceiveDeriver` instead.
  */
 export function deriveBip86TaprootFromMnemonic(params: {
   mnemonic: string;
@@ -110,21 +146,17 @@ export function deriveBip86TaprootFromMnemonic(params: {
   coinType?: number;
   network?: string;
 }): DerivedBip86Taproot {
-  const coinType = params.coinType ?? 0;
-  const { account, index } = params;
-  if (!Number.isInteger(account) || account < 0 || !Number.isInteger(index) || index < 0) {
-    throw new Error('BIP-86 account and index must be non-negative integers');
-  }
+  return createBip86ReceiveDeriver(params)(params.index);
+}
 
-  const seed = toBytes(mnemonicToSeedSync(params.mnemonic.trim()));
-  const privateKey = derivePath(seed, [
-    HARDENED + 86,
-    HARDENED + coinType,
-    HARDENED + account,
-    0,
-    index,
-  ]);
-
+function taprootFromPrivateKey(params: {
+  privateKey: Uint8Array;
+  account: number;
+  index: number;
+  coinType: number;
+  network?: string;
+}): DerivedBip86Taproot {
+  const { privateKey, account, index, coinType } = params;
   const compressed = ecc.pointFromScalar(privateKey, true);
   if (!compressed || compressed.length !== 33) {
     throw new Error('Failed to derive secp256k1 public key');

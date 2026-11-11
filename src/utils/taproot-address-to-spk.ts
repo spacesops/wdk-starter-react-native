@@ -113,3 +113,63 @@ export function scriptPubKeyHexToTaprootAddress(
   const combined = data.concat(createChecksum(hrp, data));
   return `${hrp}1${combined.map((v) => CHARSET[v]).join('')}`;
 }
+
+/** Bech32m witness data for a P2TR address (`version` + 5-bit program words), or null. */
+function decodeTaprootBech32mWitness(address: string): { hrp: string; witnessData: number[] } | null {
+  const raw = address.trim();
+  const sep = raw.lastIndexOf('1');
+  if (sep < 1) return null;
+  const hrp = raw.slice(0, sep).toLowerCase();
+  const dataPart = raw.slice(sep + 1).toLowerCase();
+  const values: number[] = [];
+  for (const ch of dataPart) {
+    const idx = CHARSET.indexOf(ch);
+    if (idx < 0) return null;
+    values.push(idx);
+  }
+  if (values.length < 7) return null;
+  if (polymod(hrpExpand(hrp).concat(values)) !== BECH32M_CONST) return null;
+
+  const witnessData = values.slice(0, -6);
+  const version = witnessData[0];
+  const program = convertBits(witnessData.slice(1), 5, 8, false);
+  if (version !== 1 || !program || program.length !== 32) return null;
+
+  return { hrp, witnessData };
+}
+
+/**
+ * Bitcoin P2TR address → Space address (same witness program, HRP + `s`).
+ * Matches `spaces_wallet::address::SpaceAddress` display encoding in spaced-spacesops.
+ */
+export function taprootAddressToSpaceAddress(taprootAddress: string): string | null {
+  const decoded = decodeTaprootBech32mWitness(taprootAddress);
+  if (!decoded) return null;
+  const { hrp, witnessData } = decoded;
+  if (hrp !== 'bc' && hrp !== 'tb' && hrp !== 'bcrt') return null;
+  const spaceHrp = `${hrp}s`;
+  const combined = witnessData.concat(createChecksum(spaceHrp, witnessData));
+  return `${spaceHrp}1${combined.map((v) => CHARSET[v]).join('')}`;
+}
+
+/** Validates a Spaces network bech32m address (`bcs1…`, `tbs1…`, `bcrts1…`). */
+export function isValidSpaceAddress(address: string): boolean {
+  const raw = address.trim();
+  const sep = raw.lastIndexOf('1');
+  if (sep < 1) return false;
+  const hrp = raw.slice(0, sep).toLowerCase();
+  if (hrp !== 'bcs' && hrp !== 'tbs' && hrp !== 'bcrts') return false;
+  const dataPart = raw.slice(sep + 1).toLowerCase();
+  const values: number[] = [];
+  for (const ch of dataPart) {
+    const idx = CHARSET.indexOf(ch);
+    if (idx < 0) return false;
+    values.push(idx);
+  }
+  if (values.length < 7) return false;
+  if (polymod(hrpExpand(hrp).concat(values)) !== BECH32M_CONST) return false;
+  const witnessData = values.slice(0, -6);
+  const version = witnessData[0];
+  const program = convertBits(witnessData.slice(1), 5, 8, false);
+  return version === 1 && Boolean(program && program.length === 32);
+}

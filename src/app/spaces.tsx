@@ -1,6 +1,7 @@
 import Header from '@/components/header';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
-import { AtSign, Check, ChevronDown, ChevronRight, ChevronUp, Circle, Copy, Info, Search } from 'lucide-react-native';
+import { AtSign, Check, ChevronDown, ChevronRight, ChevronUp, Circle, Copy, Info, QrCode, Search } from 'lucide-react-native';
+import { QRCode } from '@tetherto/wdk-uikit-react-native';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useFocusEffect } from '@react-navigation/native';
 import {
@@ -40,6 +41,10 @@ import {
   fullPathToWalletRelativePath,
   getBitcoinTaprootPathPrefix,
 } from '@/utils/spaces-scan-paths';
+import {
+  scriptPubKeyHexToTaprootAddress,
+  taprootAddressToSpaceAddress,
+} from '@/utils/taproot-address-to-spk';
 import { buildPaymentWatchRequestBody } from '@/utils/build-payment-watch-body';
 import { formatMySpaceHandleStatusLabel } from '@/utils/format-my-space-status';
 import {
@@ -1524,6 +1529,10 @@ export default function SpacesScreen() {
     affiliate_revenue_percent?: number;
   } | null>(null);
   const [showTxHexModal, setShowTxHexModal] = useState(false);
+  const [showReceivePubKeyModal, setShowReceivePubKeyModal] = useState(false);
+  const [receiveSpaceAddress, setReceiveSpaceAddress] = useState('');
+  const [receiveTaprootPath, setReceiveTaprootPath] = useState('');
+  const [isResolvingReceiveKey, setIsResolvingReceiveKey] = useState(false);
   const [txHex, setTxHex] = useState<string>('');
   const [txHexData, setTxHexData] = useState<{
     scriptType: 'P2TR' | 'P2WPKH' | 'P2PKH';
@@ -2045,6 +2054,79 @@ export default function SpacesScreen() {
     setIsButtonEnabled(false);
     setButtonLabel(EMPTY_SUBSPACE_BUTTON_LABEL);
   }, []);
+
+  const dismissReceivePubKeyModal = useCallback(() => {
+    setShowReceivePubKeyModal(false);
+    setReceiveSpaceAddress('');
+    setReceiveTaprootPath('');
+  }, []);
+
+  const handleCopyReceiveSpaceAddress = useCallback(async () => {
+    if (!receiveSpaceAddress.trim()) {
+      return;
+    }
+    try {
+      await Clipboard.setStringAsync(receiveSpaceAddress);
+      toast.success('Space address copied to clipboard');
+    } catch (error) {
+      console.error('[Spaces] Failed to copy space address:', error);
+      toast.error('Failed to copy space address');
+    }
+  }, [receiveSpaceAddress]);
+
+  const handleReceiveQrPress = useCallback(async () => {
+    if (isResolvingReceiveKey) {
+      return;
+    }
+    setIsResolvingReceiveKey(true);
+    try {
+      const reservedPaths = mySpacesRef.current
+        .map((s) => s.taprootDerivationPath)
+        .filter((path): path is string => Boolean(path?.trim()));
+      const reservedSpks = mySpacesRef.current
+        .map((s) => s.scriptPubKeyHex)
+        .filter((spk): spk is string => Boolean(spk?.trim()));
+
+      let mnemonic: string | undefined;
+      try {
+        mnemonic = (await getMnemonicWithoutWorklet(currentWalletId ?? undefined)) ?? undefined;
+      } catch (mnemonicErr) {
+        console.error('[Spaces] Receive QR getMnemonic failed:', mnemonicErr);
+      }
+
+      const nextPath = await resolveNextAvailableTaprootPath({
+        baseUrl: SPACES_API_BASE_URL,
+        reservedDerivationPaths: reservedPaths,
+        reservedScriptPubKeys: reservedSpks,
+        mnemonic,
+      });
+
+      if (!nextPath) {
+        toast.error('No unused Taproot path is available for receive.');
+        return;
+      }
+
+      const bitcoinNetwork = (getChainsConfig().bitcoin as { network?: string } | undefined)?.network;
+      const taprootAddress =
+        nextPath.address?.trim() ||
+        scriptPubKeyHexToTaprootAddress(nextPath.scriptPubKeyHex, bitcoinNetwork) ||
+        '';
+      const spaceAddress = taprootAddress ? taprootAddressToSpaceAddress(taprootAddress) : null;
+      if (!spaceAddress) {
+        toast.error('Could not encode the next path as a space address.');
+        return;
+      }
+
+      setReceiveSpaceAddress(spaceAddress);
+      setReceiveTaprootPath(nextPath.fullPath);
+      setShowReceivePubKeyModal(true);
+    } catch (error) {
+      console.error('[Spaces] Receive QR path resolution failed:', error);
+      toast.error('Failed to resolve the next receive key. Try again.');
+    } finally {
+      setIsResolvingReceiveKey(false);
+    }
+  }, [currentWalletId, isResolvingReceiveKey]);
 
   const handleFindSpaces = async () => {
     const fullPaths = buildSpacesScanDerivationPaths();
@@ -4380,6 +4462,11 @@ export default function SpacesScreen() {
 
   // Check space availability when subspace or spaceName changes
   const checkAvailability = useCallback(async () => {
+    if (isConfirmationModeRef.current) {
+      console.log('[Spaces] checkAvailability skipped (purchase confirmation open)');
+      return;
+    }
+
     const subspaceTrimmed = subspace.trim();
     const spaceNameTrimmed = spaceName.trim();
     console.log('[Spaces] checkAvailability invoked', {
@@ -4438,6 +4525,11 @@ export default function SpacesScreen() {
         throw new Error('Invalid response from Spaces server.');
       }
       console.log(`[Spaces API] GET ${url} - Success (${duration}ms)`);
+
+      if (isConfirmationModeRef.current) {
+        console.log('[Spaces] checkAvailability: ignoring response (confirmation mode)');
+        return;
+      }
 
       if (data.state === 'available') {
         setButtonState('available');
@@ -4579,6 +4671,11 @@ export default function SpacesScreen() {
         console.error(`[Spaces API] GET ${url} - Failed (${duration}ms):`, error);
       }
 
+      if (isConfirmationModeRef.current) {
+        console.log('[Spaces] checkAvailability: ignoring error (confirmation mode)');
+        return;
+      }
+
       setButtonState(null);
       setIsButtonEnabled(false);
       setButtonLabel('Purchase');
@@ -4638,6 +4735,9 @@ export default function SpacesScreen() {
   };
 
   const tryRunDebouncedAvailabilityCheck = (source: string) => {
+    if (isConfirmationModeRef.current) {
+      return;
+    }
     const pending = availabilityTypingRef.current;
     if (!pending) {
       return;
@@ -4675,6 +4775,9 @@ export default function SpacesScreen() {
   scheduleAvailabilityDebounceRef.current = scheduleAvailabilityDebounce;
 
   const runCheckAvailabilityNow = () => {
+    if (isConfirmationModeRef.current) {
+      return;
+    }
     availabilityTypingRef.current = null;
     availabilityCheckedKeyRef.current = null;
     stopAvailabilityWakeLoop();
@@ -5014,6 +5117,10 @@ export default function SpacesScreen() {
       stopCouponWakeLoop();
       setCouponCode('');
       resetCouponValidationState();
+    } else {
+      availabilityTypingRef.current = null;
+      availabilityCheckedKeyRef.current = null;
+      stopAvailabilityWakeLoop();
     }
   }, [isConfirmationMode]);
 
@@ -5113,20 +5220,36 @@ export default function SpacesScreen() {
       >
         {/* Search Section */}
         <View style={styles.section}>
-          <TouchableOpacity
-            style={styles.collapsibleHeader}
-            onPress={() => setIsFindPurchaseExpanded(!isFindPurchaseExpanded)}
-            activeOpacity={0.7}
-          >
-            <View style={styles.collapsibleHeaderLeft}>
-              {isFindPurchaseExpanded ? (
-                <ChevronDown size={20} color={colors.textSecondary} />
+          <View style={styles.collapsibleHeaderRow}>
+            <TouchableOpacity
+              style={styles.collapsibleHeader}
+              onPress={() => setIsFindPurchaseExpanded(!isFindPurchaseExpanded)}
+              activeOpacity={0.7}
+            >
+              <View style={styles.collapsibleHeaderLeft}>
+                {isFindPurchaseExpanded ? (
+                  <ChevronDown size={20} color={colors.textSecondary} />
+                ) : (
+                  <ChevronRight size={20} color={colors.textSecondary} />
+                )}
+                <Text style={styles.collapsibleHeaderText}>Find & Purchase | Receive</Text>
+              </View>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.receiveQrHeaderButton}
+              onPress={() => void handleReceiveQrPress()}
+              disabled={isResolvingReceiveKey}
+              activeOpacity={0.7}
+              accessibilityRole="button"
+              accessibilityLabel="Show receive space address QR code"
+            >
+              {isResolvingReceiveKey ? (
+                <ActivityIndicator size="small" color={colors.primary} />
               ) : (
-                <ChevronRight size={20} color={colors.textSecondary} />
+                <QrCode size={20} color={colors.primary} />
               )}
-              <Text style={styles.collapsibleHeaderText}>Find & Purchase</Text>
-            </View>
-          </TouchableOpacity>
+            </TouchableOpacity>
+          </View>
           {isFindPurchaseExpanded && (
             <View style={styles.searchCard}>
               <View style={styles.searchRow}>
@@ -5141,18 +5264,18 @@ export default function SpacesScreen() {
                   scheduleAvailabilityDebounce(normalized, spaceName);
                 }}
                 onEndEditing={() => {
-                  if (subspace.trim() && spaceName.trim()) {
+                  if (!isConfirmationMode && subspace.trim() && spaceName.trim()) {
                     runCheckAvailabilityNow();
                   }
                 }}
                 onBlur={() => {
-                  if (subspace.trim() && spaceName.trim()) {
+                  if (!isConfirmationMode && subspace.trim() && spaceName.trim()) {
                     runCheckAvailabilityNow();
                   }
                 }}
                 returnKeyType="done"
                 onSubmitEditing={() => {
-                  if (subspace.trim() && spaceName.trim()) {
+                  if (!isConfirmationMode && subspace.trim() && spaceName.trim()) {
                     runCheckAvailabilityNow();
                   }
                 }}
@@ -5177,7 +5300,7 @@ export default function SpacesScreen() {
                       return;
                     }
                     setSpaceNameFocused(false);
-                    if (subspace.trim() && spaceName.trim()) {
+                    if (!isConfirmationMode && subspace.trim() && spaceName.trim()) {
                       runCheckAvailabilityNow();
                     }
                   }}
@@ -5499,6 +5622,59 @@ export default function SpacesScreen() {
                   activeOpacity={0.7}
                 >
                   <Text style={styles.modalBroadcastButtonText}>Proceed</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </Modal>
+
+        <Modal
+          visible={showReceivePubKeyModal}
+          transparent
+          animationType="fade"
+          onRequestClose={dismissReceivePubKeyModal}
+        >
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <Text style={styles.modalTitle}>Receive space address</Text>
+              {receiveTaprootPath ? (
+                <Text style={styles.receivePathHint} selectable>
+                  {receiveTaprootPath}
+                </Text>
+              ) : null}
+              {receiveSpaceAddress ? (
+                <>
+                  <QRCode
+                    value={receiveSpaceAddress}
+                    label="Scan space address"
+                    size={180}
+                    color={colors.primary}
+                    containerStyle={styles.receiveQrContainer}
+                  />
+                  <ScrollView style={styles.receivePubKeyScroll}>
+                    <Text style={styles.receivePubKeyText} selectable>
+                      {receiveSpaceAddress}
+                    </Text>
+                  </ScrollView>
+                </>
+              ) : null}
+              <View style={styles.modalButtonRow}>
+                <TouchableOpacity
+                  style={styles.modalCopyButton}
+                  onPress={() => void handleCopyReceiveSpaceAddress()}
+                  activeOpacity={0.7}
+                >
+                  <Copy size={18} color={colors.black} />
+                  <Text style={styles.modalCopyButtonText}>Copy</Text>
+                </TouchableOpacity>
+              </View>
+              <View style={[styles.modalButtonRow, styles.modalButtonRowSpacing]}>
+                <TouchableOpacity
+                  style={styles.modalDismissButton}
+                  onPress={dismissReceivePubKeyModal}
+                  activeOpacity={0.7}
+                >
+                  <Text style={styles.modalDismissButtonText}>Cancel</Text>
                 </TouchableOpacity>
               </View>
             </View>
@@ -5851,6 +6027,36 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '600',
     color: colors.text,
+  },
+  receiveQrHeaderButton: {
+    padding: 8,
+    marginBottom: 12,
+    marginLeft: 8,
+  },
+  receiveQrContainer: {
+    alignSelf: 'center',
+    marginBottom: 16,
+  },
+  receivePathHint: {
+    fontSize: 12,
+    color: colors.textSecondary,
+    textAlign: 'center',
+    marginBottom: 12,
+    fontFamily: 'monospace',
+  },
+  receivePubKeyScroll: {
+    backgroundColor: colors.background,
+    borderRadius: 8,
+    padding: 12,
+    maxHeight: 80,
+    marginBottom: 16,
+  },
+  receivePubKeyText: {
+    fontSize: 12,
+    fontFamily: 'monospace',
+    color: colors.text,
+    lineHeight: 18,
+    textAlign: 'center',
   },
   sectionHeader: {
     flexDirection: 'row',

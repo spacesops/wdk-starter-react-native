@@ -17,6 +17,9 @@
 		},
 		{
 			"path": "../wdk-wallet-btc"
+		},
+		{
+			"path": "../spaced-spacesops"
 		}
 	],
 	"settings": {

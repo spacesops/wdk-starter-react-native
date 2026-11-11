@@ -1,12 +1,17 @@
 import Header from '@/components/header';
+import {
+  SendSpaceModalProvider,
+  SendSpaceOpenButton,
+} from '@/components/send-space-modal-provider';
 import VerifiedZonesResults from '@/components/verified-zones-results';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
 import { useFocusEffect } from '@react-navigation/native';
-import { useLocalSearchParams } from 'expo-router';
+import { useLocalSearchParams, useRouter } from 'expo-router';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  InteractionManager,
   Modal,
   Platform,
   ScrollView,
@@ -244,6 +249,50 @@ function pointerPriceSatsFromSpacesQuote(data: Record<string, unknown>): number 
   return parseNumSats(
     data.sptr_price ?? data.sptr_price_sats ?? data.pointer_price ?? data.sptrPriceSats
   );
+}
+
+/**
+ * Standalone pointer purchases do not use a SUBS quote. For taken handles, GET /spaces
+ * returns `state: "taken"` and omits `sptr_price` — use tenant config (PURCHASE.md).
+ */
+async function fetchTenantSptrPriceSats(
+  baseUrl: string,
+  tenantName: string
+): Promise<number | null> {
+  const tenant = tenantName.trim().toLowerCase();
+  if (!tenant) return null;
+  const b = baseUrl.replace(/\/$/, '');
+  const url = `${b}/api/tenants/${encodeURIComponent(tenant)}/sptr-price`;
+  try {
+    const res = await fetch(url, { headers: { Accept: 'application/json' } });
+    const text = await res.text();
+    if (!res.ok) {
+      console.warn('[Subspace] GET /api/tenants/.../sptr-price', res.status, text.slice(0, 240));
+      return null;
+    }
+    const data = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+    const n = parseNumSats(data.sptr_price);
+    if (Number.isFinite(n) && n > 0) {
+      console.log('[Subspace] sptr_price from tenant config:', n);
+      return Math.trunc(n);
+    }
+    return null;
+  } catch (e) {
+    console.warn('[Subspace] GET sptr-price failed:', e);
+    return null;
+  }
+}
+
+async function resolvePointerPriceSatsForTakeOnchain(
+  baseUrl: string,
+  spaceLower: string,
+  spacesQuote: Record<string, unknown>
+): Promise<number | null> {
+  const fromQuote = pointerPriceSatsFromSpacesQuote(spacesQuote);
+  if (Number.isFinite(fromQuote) && fromQuote > 0) {
+    return Math.trunc(fromQuote);
+  }
+  return fetchTenantSptrPriceSats(baseUrl, spaceLower);
 }
 
 async function fetchSpacesQuoteJsonOnce(
@@ -682,6 +731,7 @@ function taprootXOnlyPubkeyHexFromScriptPubkeyHex(scriptPubkeyHex: string): stri
 export default function SubspaceScreen() {
   const insets = useSafeAreaInsets();
   const router = useDebouncedNavigation();
+  const expoRouter = useRouter();
   const { wallets, activeWalletId } = useWalletManager();
   const currentWalletId = resolveCurrentWalletId(activeWalletId, wallets);
   const {
@@ -689,11 +739,13 @@ export default function SubspaceScreen() {
     spaceName,
     scriptPubKeyHex: scriptPubKeyHexParam,
     statusLabel: statusLabelParam,
+    scannedSpaceAddress,
   } = useLocalSearchParams<{
     subspace: string;
     spaceName: string;
     scriptPubKeyHex?: string;
     statusLabel?: string;
+    scannedSpaceAddress?: string;
   }>();
 
   const [spaceData, setSpaceData] = useState<MySpaceRow | null>(null);
@@ -720,7 +772,6 @@ export default function SubspaceScreen() {
   >(null);
   const [detailsExpanded, setDetailsExpanded] = useState(false);
   const [editAttributesLoading, setEditAttributesLoading] = useState(false);
-
   const certificateStorageKey = useMemo(() => {
     if (!subspace?.trim() || !spaceName) {
       return null;
@@ -743,53 +794,134 @@ export default function SubspaceScreen() {
   const [keyDisplayMode, setKeyDisplayMode] = useState<KeyDisplayMode>('public');
   const [nostrDisplayMode, setNostrDisplayMode] = useState<NostrDisplayMode>('npub');
   const [taprootAddressLoading, setTaprootAddressLoading] = useState(false);
+  const [taprootKeyMaterialLoading, setTaprootKeyMaterialLoading] = useState(false);
+  /** Script pubkey whose key material is already in state (or being derived), so re-expanding Details does not re-derive. */
+  const keyMaterialSpkRef = useRef<string | null>(null);
+
+  const scriptPubKeyForKeys = spaceData?.scriptPubKeyHex?.trim() || '';
+  const storedTaprootDerivationPath = spaceData?.taprootDerivationPath?.trim() || '';
+
+  /** Saves a scanned derivation path so later visits hit the single-index fast path. */
+  const persistTaprootDerivationPath = useCallback(
+    async (derivationPath: string) => {
+      if (!subspace || !spaceName) return;
+      const spaceLower = spaceName.toLowerCase();
+      try {
+        const stored = await AsyncStorage.getItem('mySpaces');
+        if (stored) {
+          const loaded = JSON.parse(stored) as MySpaceRow[];
+          let changed = false;
+          const updated = loaded.map((s) => {
+            if (
+              s.subspace === subspace &&
+              s.spaceName === spaceLower &&
+              s.taprootDerivationPath !== derivationPath
+            ) {
+              changed = true;
+              return { ...s, taprootDerivationPath: derivationPath };
+            }
+            return s;
+          });
+          if (changed) {
+            await AsyncStorage.setItem('mySpaces', JSON.stringify(updated));
+          }
+        }
+      } catch (e) {
+        console.warn('[Subspace] could not persist taproot derivation path', e);
+      }
+      setSpaceData((prev) =>
+        prev && prev.taprootDerivationPath !== derivationPath
+          ? { ...prev, taprootDerivationPath: derivationPath }
+          : prev
+      );
+    },
+    [subspace, spaceName]
+  );
 
   useEffect(() => {
-    const spk = spaceData?.scriptPubKeyHex?.trim();
-    if (!spk) {
+    if (!scriptPubKeyForKeys) {
       setTaprootReceiveAddress(null);
       setTaprootDerivationPath(null);
       setTaprootKeyMaterial(null);
       setTaprootAddressLoading(false);
+      keyMaterialSpkRef.current = null;
       return;
     }
-
     const bitcoinNetwork = (getChainsConfig().bitcoin as { network?: string } | undefined)?.network;
-    const encoded = scriptPubKeyHexToTaprootAddress(spk, bitcoinNetwork);
-    setTaprootReceiveAddress(encoded);
-    setTaprootDerivationPath(spaceData?.taprootDerivationPath?.trim() || null);
+    setTaprootReceiveAddress(scriptPubKeyHexToTaprootAddress(scriptPubKeyForKeys, bitcoinNetwork));
     setTaprootAddressLoading(false);
+    if (keyMaterialSpkRef.current !== scriptPubKeyForKeys.toLowerCase()) {
+      keyMaterialSpkRef.current = null;
+      setTaprootKeyMaterial(null);
+    }
+  }, [scriptPubKeyForKeys]);
+
+  useEffect(() => {
+    if (storedTaprootDerivationPath) {
+      setTaprootDerivationPath(storedTaprootDerivationPath);
+    }
+  }, [storedTaprootDerivationPath]);
+
+  // Private / tweaked keys are only shown inside Details and need a mnemonic derivation on the
+  // JS thread, so derive them lazily (after the expand animation) instead of on screen mount.
+  useEffect(() => {
+    const spk = scriptPubKeyForKeys.toLowerCase();
+    if (!detailsExpanded || !spk || keyMaterialSpkRef.current === spk) {
+      return;
+    }
+    keyMaterialSpkRef.current = spk;
 
     let cancelled = false;
-    resolveTaprootForScriptPubKey(spk, {
-      derivationPath: spaceData?.taprootDerivationPath,
-      walletId: currentWalletId,
-    })
-      .then((r) => {
-        if (cancelled) return;
-        if (r?.address) {
-          setTaprootReceiveAddress(r.address);
-        }
-        if (r?.derivationPath?.trim()) {
-          setTaprootDerivationPath(r.derivationPath);
-        }
-        setTaprootKeyMaterial(
-          r
-            ? {
-                internalPubKeyHex: r.internalPubKeyHex,
-                privateKeyHex: r.privateKeyHex,
-                tweakedPrivateKeyHex: r.tweakedPrivateKeyHex,
-              }
-            : null
-        );
+    let done = false;
+    setTaprootKeyMaterialLoading(true);
+    const task = InteractionManager.runAfterInteractions(() => {
+      resolveTaprootForScriptPubKey(spk, {
+        derivationPath: storedTaprootDerivationPath || undefined,
+        walletId: currentWalletId,
       })
-      .catch(() => {
-        // Address/path already filled from script pubkey / stored row.
-      });
+        .then(async (r) => {
+          if (cancelled) return;
+          if (r?.address) {
+            setTaprootReceiveAddress(r.address);
+          }
+          const resolvedPath = r?.derivationPath?.trim();
+          if (resolvedPath) {
+            setTaprootDerivationPath(resolvedPath);
+            if (resolvedPath !== storedTaprootDerivationPath) {
+              await persistTaprootDerivationPath(resolvedPath);
+            }
+          }
+          setTaprootKeyMaterial(
+            r
+              ? {
+                  internalPubKeyHex: r.internalPubKeyHex,
+                  privateKeyHex: r.privateKeyHex,
+                  tweakedPrivateKeyHex: r.tweakedPrivateKeyHex,
+                }
+              : null
+          );
+          done = true;
+        })
+        .catch((e) => {
+          console.warn('[Subspace] Taproot key derivation failed:', e);
+        })
+        .finally(() => {
+          if (cancelled) return;
+          if (!done) keyMaterialSpkRef.current = null;
+          setTaprootKeyMaterialLoading(false);
+        });
+    });
     return () => {
       cancelled = true;
+      task.cancel();
+      if (!done && keyMaterialSpkRef.current === spk) {
+        keyMaterialSpkRef.current = null;
+      }
+      setTaprootKeyMaterialLoading(false);
     };
-  }, [spaceData?.scriptPubKeyHex, spaceData?.taprootDerivationPath, currentWalletId]);
+    // storedTaprootDerivationPath is read at start only; persisting a new path must not re-derive.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detailsExpanded, scriptPubKeyForKeys, currentWalletId, persistTaprootDerivationPath]);
 
   useEffect(() => {
     if (showUpdateOnchainModal) {
@@ -1280,7 +1412,58 @@ export default function SubspaceScreen() {
     }
   };
 
+  const showSendSpaceButton =
+    !chainResolutionLoading &&
+    (spaceData?.chainPresence === 'on-chain' || handleStatusLabel === 'On-chain');
+
+  const logSendSpaceRecipient = useCallback(
+    (spaceAddress: string) => {
+      const normalized = spaceAddress.trim();
+      console.log('[Subspace] Send Space — recipient space address:', normalized, {
+        subspace,
+        spaceName,
+        handle: handleForHexTool,
+      });
+    },
+    [subspace, spaceName, handleForHexTool]
+  );
+
+  const clearScannedSpaceAddressParam = useCallback(() => {
+    try {
+      expoRouter.setParams({ scannedSpaceAddress: '' });
+    } catch {
+      /* route may not support param updates */
+    }
+  }, [expoRouter]);
+
+  const handleSendSpaceScan = useCallback(() => {
+    router.push({
+      pathname: '/scan-qr',
+      params: {
+        scanMode: 'spaceAddress',
+        returnRoute: '/subspace',
+        subspace,
+        spaceName,
+        ...(scriptPubKeyHexParam ? { scriptPubKeyHex: scriptPubKeyHexParam } : {}),
+        ...(statusLabelParam ? { statusLabel: statusLabelParam } : {}),
+        ...(spaceData?.scriptPubKeyHex && !scriptPubKeyHexParam
+          ? { scriptPubKeyHex: spaceData.scriptPubKeyHex }
+          : {}),
+      },
+    });
+  }, [
+    router,
+    subspace,
+    spaceName,
+    scriptPubKeyHexParam,
+    statusLabelParam,
+    spaceData?.scriptPubKeyHex,
+  ]);
+
   const showTakeOnchainButton = spaceData?.chainPresence === 'off-chain';
+  const takeOnchainBusy =
+    showTakeOnchainDialog &&
+    (takeOnchainStep === 'loading' || takeOnchainStep === 'sending');
 
   const hasPendingOnchainUpdate = Boolean(
     spaceData?.newDataHex && spaceData.newDataHex.trim().length > 0
@@ -1401,10 +1584,14 @@ export default function SubspaceScreen() {
         return;
       }
 
-      const sptrPriceSats = pointerPriceSatsFromSpacesQuote(spacesData);
-      if (!Number.isFinite(sptrPriceSats) || sptrPriceSats <= 0) {
+      const sptrPriceSats = await resolvePointerPriceSatsForTakeOnchain(
+        SPACES_API_BASE_URL,
+        spaceLower,
+        spacesData
+      );
+      if (sptrPriceSats == null || sptrPriceSats <= 0) {
         toast.error(
-          'Pointer (SPTR) price is not available from the space quote. Open Find & Purchase or check the handle on the server.'
+          'Pointer (SPTR) price is not configured for this space. Ask the space operator or try again later.'
         );
         setTakeOnchainStep('intro');
         return;
@@ -1682,7 +1869,11 @@ export default function SubspaceScreen() {
     scriptPubkeyDisplay.length > 0
       ? (taprootXOnlyPubkeyHexFromScriptPubkeyHex(scriptPubkeyDisplay)?.toLowerCase() ?? '')
       : '';
+  const keyMaterialPending = taprootKeyMaterialLoading && !taprootKeyMaterial;
   const displayedKeyValue = useMemo(() => {
+    if (keyMaterialPending) {
+      return 'Deriving…';
+    }
     if (keyDisplayMode === 'public') {
       return (
         taprootKeyMaterial?.internalPubKeyHex?.toLowerCase() ||
@@ -1694,16 +1885,19 @@ export default function SubspaceScreen() {
       return taprootKeyMaterial?.privateKeyHex?.toLowerCase() ?? '—';
     }
     return taprootKeyMaterial?.tweakedPrivateKeyHex?.toLowerCase() ?? '—';
-  }, [keyDisplayMode, taprootKeyMaterial, publicKeyFromScript]);
+  }, [keyDisplayMode, taprootKeyMaterial, publicKeyFromScript, keyMaterialPending]);
 
   const nostrPubKeyHex =
     taprootKeyMaterial?.internalPubKeyHex?.toLowerCase() || publicKeyFromScript || '';
   const displayedNostrValue = useMemo(() => {
+    if (keyMaterialPending) {
+      return 'Deriving…';
+    }
     if (nostrDisplayMode === 'npub') {
       return encodeNpubFromPubKeyHex(nostrPubKeyHex) ?? '—';
     }
     return encodeNsecFromPrivKeyHex(taprootKeyMaterial?.privateKeyHex) ?? '—';
-  }, [nostrDisplayMode, nostrPubKeyHex, taprootKeyMaterial?.privateKeyHex]);
+  }, [nostrDisplayMode, nostrPubKeyHex, taprootKeyMaterial?.privateKeyHex, keyMaterialPending]);
 
   const handleCycleKeyDisplay = () => {
     setKeyDisplayMode((mode) => nextKeyDisplayMode(mode));
@@ -1713,8 +1907,19 @@ export default function SubspaceScreen() {
     setNostrDisplayMode((mode) => nextNostrDisplayMode(mode));
   };
 
-  return (
-    <View style={[styles.container, { paddingTop: insets.top }]}>
+  const containerStyle = useMemo(
+    () => [styles.container, { paddingTop: insets.top }],
+    [insets.top]
+  );
+
+  const scrollContentStyle = useMemo(
+    () => [styles.scrollContent, { paddingBottom: insets.bottom + 32 }],
+    [insets.bottom]
+  );
+
+  const subspaceMainView = useMemo(
+    () => (
+    <View style={containerStyle}>
       <Header
         title={displayName}
         subtitle={
@@ -1726,7 +1931,7 @@ export default function SubspaceScreen() {
 
       <ScrollView
         style={styles.scrollView}
-        contentContainerStyle={[styles.scrollContent, { paddingBottom: insets.bottom + 32 }]}
+        contentContainerStyle={scrollContentStyle}
         showsVerticalScrollIndicator={false}
         keyboardShouldPersistTaps="handled"
       >
@@ -1821,12 +2026,18 @@ export default function SubspaceScreen() {
 
           {showTakeOnchainButton ? (
             <TouchableOpacity
-              style={styles.takeOnchainButton}
+              style={[styles.takeOnchainButton, takeOnchainBusy && styles.takeOnchainButtonDisabled]}
               onPress={() => setShowTakeOnchainDialog(true)}
               activeOpacity={0.7}
+              disabled={takeOnchainBusy}
               accessibilityLabel="Take subspace on-chain"
+              accessibilityState={{ busy: takeOnchainBusy }}
             >
-              <Text style={styles.takeOnchainButtonText}>Take On-chain</Text>
+              {takeOnchainBusy ? (
+                <ActivityIndicator color={colors.primary} />
+              ) : (
+                <Text style={styles.takeOnchainButtonText}>Take On-chain</Text>
+              )}
             </TouchableOpacity>
           ) : null}
 
@@ -1935,6 +2146,12 @@ export default function SubspaceScreen() {
             )}
           </TouchableOpacity>
 
+          <SendSpaceOpenButton
+            visible={showSendSpaceButton}
+            style={styles.updateOnchainButton}
+            textStyle={styles.updateOnchainButtonText}
+          />
+
           <VerifiedZonesResults
             zones={certificateVerifiedZones}
             verifyError={certificateVerifyError}
@@ -1956,8 +2173,9 @@ export default function SubspaceScreen() {
       </ScrollView>
 
       {/* Delete Confirmation Dialog */}
+      {showDeleteConfirmation ? (
       <Modal
-        visible={showDeleteConfirmation}
+        visible
         transparent={true}
         animationType="fade"
         onRequestClose={handleCancelDelete}
@@ -1987,9 +2205,11 @@ export default function SubspaceScreen() {
           </View>
         </View>
       </Modal>
+      ) : null}
 
+      {showTakeOnchainDialog ? (
       <Modal
-        visible={showTakeOnchainDialog}
+        visible
         transparent
         animationType="fade"
         onRequestClose={() => {
@@ -2027,7 +2247,10 @@ export default function SubspaceScreen() {
                     accessibilityLabel="Proceed with take on-chain"
                   >
                     {takeOnchainStep === 'loading' ? (
-                      <ActivityIndicator color={colors.black} />
+                      <View style={styles.modalPurchaseButtonContent}>
+                        <ActivityIndicator color={colors.black} size="small" />
+                        <Text style={styles.modalPurchaseButtonText}>Loading…</Text>
+                      </View>
                     ) : (
                       <Text style={styles.modalPurchaseButtonText}>Proceed</Text>
                     )}
@@ -2088,7 +2311,10 @@ export default function SubspaceScreen() {
                     disabled={takeOnchainStep === 'sending' || !sptrQuote}
                   >
                     {takeOnchainStep === 'sending' ? (
-                      <ActivityIndicator color={colors.black} />
+                      <View style={styles.modalPurchaseButtonContent}>
+                        <ActivityIndicator color={colors.black} size="small" />
+                        <Text style={styles.modalPurchaseButtonText}>Sending…</Text>
+                      </View>
                     ) : (
                       <Text style={styles.modalPurchaseButtonText}>Purchase</Text>
                     )}
@@ -2099,9 +2325,11 @@ export default function SubspaceScreen() {
           </View>
         </View>
       </Modal>
+      ) : null}
 
+      {showUpdateOnchainModal ? (
       <Modal
-        visible={showUpdateOnchainModal}
+        visible
         transparent
         animationType="fade"
         onRequestClose={() => {
@@ -2200,7 +2428,74 @@ export default function SubspaceScreen() {
           </View>
         </View>
       </Modal>
+      ) : null}
+
     </View>
+    ),
+    [
+      containerStyle,
+      scrollContentStyle,
+      displayName,
+      taprootAddressLoading,
+      taprootDerivationPath,
+      chainResolutionLoading,
+      spaceData,
+      handleStatusLabel,
+      scriptPubkeyDisplay,
+      detailsExpanded,
+      keyDisplayMode,
+      nostrDisplayMode,
+      displayedKeyValue,
+      displayedNostrValue,
+      taprootReceiveAddress,
+      showSendSpaceButton,
+      certificateValidateLoading,
+      receiveCertificateLoading,
+      hasStoredCertificate,
+      certificateVerifiedZones,
+      certificateVerifyError,
+      certificateVerifyInfo,
+      certificateRequestedHandleFound,
+      showDeleteConfirmation,
+      showTakeOnchainDialog,
+      takeOnchainStep,
+      sptrQuote,
+      takeOnchainBusy,
+      showTakeOnchainButton,
+      showUpdateOnchainModal,
+      updateOnchainStep,
+      quotedFeeSats,
+      quotedUsdLabel,
+      broadcastParams,
+      isEditAttributesEnabled,
+      isEditFallbackEnabled,
+      editAttributesLoading,
+      hasPendingOnchainUpdate,
+      handleDeletePress,
+      handleCancelDelete,
+      handleConfirmDelete,
+      handleTakeOnchainProceed,
+      handleTakeOnchainPurchase,
+      handleValidateCertificate,
+      handleReceiveCertificate,
+      handleCycleKeyDisplay,
+      handleCycleNostrDisplay,
+      handleEditAttributes,
+      handleQuoteOnchainUpdate,
+      handleConfirmOnchainBroadcast,
+      handleForHexTool,
+    ]
+  );
+
+  return (
+    <SendSpaceModalProvider
+      onScan={handleSendSpaceScan}
+      onRecipient={logSendSpaceRecipient}
+      scannedSpaceAddress={scannedSpaceAddress}
+      onScannedSpaceAddressConsumed={clearScannedSpaceAddressParam}
+    >
+      {subspaceMainView}
+    </SendSpaceModalProvider>
   );
 }
 
@@ -2304,6 +2599,9 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     borderWidth: 1,
     borderColor: colors.primary,
+  },
+  takeOnchainButtonDisabled: {
+    opacity: 0.7,
   },
   takeOnchainButtonText: {
     fontSize: 16,
@@ -2503,6 +2801,12 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  modalPurchaseButtonContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
   },
   modalPurchaseButtonDisabled: {
     opacity: 0.7,

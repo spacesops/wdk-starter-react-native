@@ -1,5 +1,5 @@
 import getChainsConfig from '@/config/get-chains-config';
-import { deriveBip86TaprootFromMnemonic } from '@/utils/derive-bip86-taproot';
+import { createBip86ReceiveDeriver } from '@/utils/derive-bip86-taproot';
 import { getMnemonicWithoutWorklet } from '@/utils/mnemonic-from-secure-storage';
 import { WDKSpaces } from '@/utils/wdk-spaces';
 import {
@@ -85,14 +85,15 @@ async function derivePathLocally(params: {
   const bitcoinNetwork = (getChainsConfig().bitcoin as { network?: string } | undefined)?.network;
   const target = params.targetSpk?.trim().toLowerCase();
 
+  const deriveIndex = createBip86ReceiveDeriver({
+    mnemonic: params.mnemonic,
+    account,
+    coinType,
+    network: bitcoinNetwork,
+  });
+
   const tryIndex = (index: number) => {
-    const derived = deriveBip86TaprootFromMnemonic({
-      mnemonic: params.mnemonic,
-      account,
-      index,
-      coinType,
-      network: bitcoinNetwork,
-    });
+    const derived = deriveIndex(index);
     if (target && derived.scriptPubKeyHex.toLowerCase() !== target) {
       return null;
     }
