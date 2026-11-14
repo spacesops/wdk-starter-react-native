@@ -96,7 +96,37 @@ if [[ -n "$DERIVED_APP" && -f "$DERIVED_APP/main.jsbundle" ]]; then
   echo "✓ Installed on device (${DEVICE}). Launch ${APP_NAME} without Metro."
 else
   echo ""
-  echo "⚠ Build finished but main.jsbundle was not found under DerivedData." >&2
-  echo "  Release builds should run export:embed in the Xcode bundle phase." >&2
+  echo "⚠ Release install did not produce ${APP_NAME}.app with main.jsbundle." >&2
+
+  XC_LOG="$PROJECT_ROOT/.expo/xcodebuild.log"
+  if [[ -f "$XC_LOG" ]]; then
+    XC_ERR="$(grep -E 'xcodebuild: error:|Timed out waiting|developer disk image' "$XC_LOG" 2>/dev/null | head -5 || true)"
+    if [[ -n "$XC_ERR" ]]; then
+      echo "" >&2
+      echo "From .expo/xcodebuild.log:" >&2
+      printf '  %s\n' "$XC_ERR" >&2
+    fi
+  fi
+
+  if command -v xcrun >/dev/null 2>&1; then
+    DDI_STATE="$(xcrun devicectl list devices 2>/dev/null | grep -i "$DEVICE" || true)"
+    if [[ "$DDI_STATE" == *"no DDI"* ]]; then
+      echo "" >&2
+      echo "Device is connected (no DDI) — Xcode cannot mount the developer disk image." >&2
+      echo "  • Unlock the phone, trust this Mac, keep it awake on the home screen" >&2
+      echo "  • Xcode → Window → Devices and Simulators → wait until the device is ready" >&2
+      echo "  • Install an Xcode version that supports the iOS version on the device" >&2
+    fi
+  fi
+
+  if [[ -z "$DERIVED_APP" ]]; then
+    echo "" >&2
+    echo "No ${APP_NAME}.app under DerivedData — xcodebuild likely never finished." >&2
+    echo "  (expo run:ios may exit 0 even when the native build fails.)" >&2
+  else
+    echo "" >&2
+    echo "Found ${DERIVED_APP} but no main.jsbundle." >&2
+    echo "  Check the \"Bundle React Native code and images\" phase (Release → BUNDLE_COMMAND=export:embed)." >&2
+  fi
   exit 1
 fi

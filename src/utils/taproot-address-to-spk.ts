@@ -47,6 +47,14 @@ function convertBits(data: number[], from: number, to: number, pad: boolean): nu
   return ret;
 }
 
+/** P2TR scriptPubKey: OP_1 (0x51) + push 32 (0x20) + 32-byte x-only output key → pubkey hex. */
+export function taprootXOnlyPubkeyHexFromScriptPubkeyHex(scriptPubkeyHex: string): string | null {
+  const h = scriptPubkeyHex.trim().toLowerCase().replace(/^0x/, '');
+  if (!/^[0-9a-f]+$/.test(h) || h.length < 68) return null;
+  if (!h.startsWith('5120')) return null;
+  return h.slice(4, 68);
+}
+
 /**
  * P2TR scriptPubKey: OP_1 (0x51) + push32 (0x20) + 32-byte x-only output key.
  * Returns lowercase hex, or null if the address is not a Taproot bech32m address.

@@ -1,3 +1,4 @@
+import * as ecc from '@bitcoinerlab/secp256k1';
 import { bech32 } from 'bech32';
 
 function hexToBytes(hex: string): Uint8Array | null {
@@ -12,16 +13,16 @@ function hexToBytes(hex: string): Uint8Array | null {
   return out;
 }
 
-/** NIP-19 bech32 encode (npub / nsec) from a 32-byte secp256k1 key hex string. */
+/**
+ * Bech32 encode (npub / nsec) from a 32-byte secp256k1 key hex string.
+ * Matches `spaces` wallet / `space-cli getnsec` (raw 32-byte payload, no NIP-19 type byte).
+ */
 function encodeNip19(prefix: 'npub' | 'nsec', keyHex: string): string | null {
   const keyBytes = hexToBytes(keyHex);
   if (!keyBytes || keyBytes.length !== 32) {
     return null;
   }
-  const data = new Uint8Array(1 + keyBytes.length);
-  data[0] = 0;
-  data.set(keyBytes, 1);
-  return bech32.encode(prefix, bech32.toWords(data));
+  return bech32.encode(prefix, bech32.toWords(keyBytes));
 }
 
 export function encodeNpubFromPubKeyHex(pubKeyHex: string | undefined): string | null {
@@ -32,4 +33,14 @@ export function encodeNpubFromPubKeyHex(pubKeyHex: string | undefined): string |
 export function encodeNsecFromPrivKeyHex(privKeyHex: string | undefined): string | null {
   if (!privKeyHex?.trim()) return null;
   return encodeNip19('nsec', privKeyHex);
+}
+
+/** X-only secp256k1 pubkey hex (32 bytes) for NIP-19 npub, from a 32-byte secret key. */
+export function xOnlyPubKeyHexFromPrivKeyHex(privKeyHex: string | undefined): string | null {
+  const priv = hexToBytes(privKeyHex ?? '');
+  if (!priv || priv.length !== 32) return null;
+  const compressed = ecc.pointFromScalar(priv, true);
+  if (!compressed || compressed.length !== 33) return null;
+  const xOnly = compressed.subarray(1, 33);
+  return Array.from(xOnly, (b) => b.toString(16).padStart(2, '0')).join('');
 }

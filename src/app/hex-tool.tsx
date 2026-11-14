@@ -3,6 +3,9 @@ import {
   type RecordRow,
   type RecordType,
   RECOMMENDED_KEYS,
+  TYPE_ADDR,
+  TYPE_BLOB,
+  TYPE_TXT,
   applyInternalWireSplit,
   bytesToHex,
   decodeRecordSet,
@@ -17,8 +20,10 @@ import {
 } from '@/lib/wire';
 import { colors } from '@/constants/colors';
 import { useDebouncedNavigation } from '@/hooks/use-debounced-navigation';
+import { encodeNpubFromPubKeyHex } from '@/utils/nip19-encode';
 import { publishRecordsToCertrelay } from '@/utils/publish-records-to-certrelay';
 import { resolveCurrentWalletId } from '@/utils/resolve-current-wallet-id';
+import { taprootXOnlyPubkeyHexFromScriptPubkeyHex } from '@/utils/taproot-address-to-spk';
 import { useWalletManager } from '@spacesops/wdk-react-native-core';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Clipboard from 'expo-clipboard';
@@ -50,9 +55,10 @@ function certificateStorageKeyFor(subspace: string, spaceName: string): string {
   return `spaces_cert_${String(spaceName).toLowerCase()}_${subspace.trim()}`;
 }
 
-const RECORD_TYPES: { type: RecordType; label: string }[] = [
-  { type: 'txt', label: 'TXT' },
-  { type: 'blob', label: 'BLOB' },
+const RECORD_TYPES: { type: RecordType; label: string; rtype: number }[] = [
+  { type: 'txt', label: 'TXT', rtype: TYPE_TXT },
+  { type: 'addr', label: 'ADDR', rtype: TYPE_ADDR },
+  { type: 'blob', label: 'BLOB', rtype: TYPE_BLOB },
 ];
 
 const KEY_CATEGORIES = ['Spaces Protocol', 'Payment Addresses', 'Identity & Keys', 'General'] as const;
@@ -103,6 +109,29 @@ function getPlaceholder(row: RecordRow): string {
 
 function getKeyLabel(key: string): string {
   return RECOMMENDED_KEYS[key]?.label ?? key;
+}
+
+const NPUB_BECH32_PATTERN = /^(npub1[ac-hj-np-z02-9]+)/i;
+
+function npubFromNostrAddrValue(value: string): string | null {
+  const trimmed = value.trim();
+  const match = trimmed.match(NPUB_BECH32_PATTERN);
+  return match ? match[1].toLowerCase() : null;
+}
+
+function nostrAddrValueMatchesNpub(storedValue: string, expectedNpub: string): boolean {
+  const expected = expectedNpub.trim().toLowerCase();
+  const parsed = npubFromNostrAddrValue(storedValue);
+  if (parsed) return parsed === expected;
+  return storedValue.trim().toLowerCase() === expected;
+}
+
+function deriveHandleNpubFromScriptPubKey(scriptPubKeyHex: string | undefined): string | null {
+  const spk = scriptPubKeyHex?.trim();
+  if (!spk) return null;
+  const xOnlyHex = taprootXOnlyPubkeyHexFromScriptPubkeyHex(spk);
+  if (!xOnlyHex) return null;
+  return encodeNpubFromPubKeyHex(xOnlyHex);
 }
 
 export default function HexToolScreen() {
@@ -418,7 +447,7 @@ export default function HexToolScreen() {
     setTableRows((prev) => prev.filter((r) => r.id !== id));
   };
 
-  const insertRow = (recordType: 'txt' | 'blob' = 'txt') => {
+  const insertRow = (recordType: Extract<RecordType, 'txt' | 'blob' | 'addr'> = 'txt') => {
     const newRow: RecordRow = {
       id: Date.now().toString(),
       recordType,
@@ -475,7 +504,7 @@ export default function HexToolScreen() {
     }
   };
 
-  const handlePublishHexString = async () => {
+  const handlePublishHexString = async (wireHexOverride?: string) => {
     if (!subspace || !spaceName) {
       Alert.alert('Cannot Publish', 'Open Hex Tool from a space to publish for that handle.');
       return;
@@ -484,7 +513,7 @@ export default function HexToolScreen() {
       Alert.alert('Cannot Publish', 'Missing script pubkey for this space.');
       return;
     }
-    const trimmed = hexString.trim().toUpperCase();
+    const trimmed = (typeof wireHexOverride === 'string' ? wireHexOverride : hexString).trim().toUpperCase();
     if (trimmed.length > 0 && (trimmed.length % 2 !== 0 || !isValidHex(trimmed))) {
       Alert.alert('Invalid Hex', 'Use an even number of hexadecimal digits, or leave empty.');
       return;
@@ -526,7 +555,67 @@ export default function HexToolScreen() {
     }
   };
 
-  const handleFooterPress = isAttributesMode ? handlePublishHexString : handleSaveHexString;
+  const handleFooterPress = isAttributesMode
+    ? () => void handlePublishHexString()
+    : handleSaveHexString;
+
+  const canLink2Nostr = Boolean(isAttributesMode && scriptPubKeyHexParam?.trim());
+
+  const handleLink2Nostr = () => {
+    if (!canLink2Nostr) {
+      Alert.alert(
+        'Cannot link',
+        'Open Edit Attributes from a subspace with a known Taproot script pubkey.'
+      );
+      return;
+    }
+
+    const expectedNpub = deriveHandleNpubFromScriptPubKey(firstParam(scriptPubKeyHexParam));
+    if (!expectedNpub) {
+      Alert.alert('Cannot link', 'Could not derive an npub from this handle’s Taproot script pubkey.');
+      return;
+    }
+
+    const nostrRow = tableRows.find((row) => row.recordType === 'addr' && row.key === 'nostr');
+
+    if (nostrRow) {
+      if (nostrAddrValueMatchesNpub(nostrRow.value ?? '', expectedNpub)) {
+        Alert.alert('Link verified', 'The ADDR nostr record matches this handle’s npub.');
+      } else {
+        const storedNpub = npubFromNostrAddrValue(nostrRow.value ?? '') ?? (nostrRow.value?.trim() || '—');
+        Alert.alert(
+          'Link mismatch',
+          `The ADDR nostr record does not match this handle’s npub.\n\nOn record: ${storedNpub}\nExpected: ${expectedNpub}`
+        );
+      }
+      return;
+    }
+
+    const newRow: RecordRow = {
+      id: Date.now().toString(),
+      recordType: 'addr',
+      key: 'nostr',
+      value: expectedNpub,
+    };
+    const nextRows = [...tableRows, newRow];
+    setTableRows(nextRows);
+    let publishHex = hexString;
+    try {
+      publishHex = bytesToHex(encodeEditableRecordSet(nextRows, seqVersion));
+      setHexString(publishHex);
+    } catch {
+      // encoding error — publish will use prior hex unless user fixes rows
+    }
+
+    Alert.alert(
+      'Nostr link added',
+      'An ADDR nostr record was added with this handle’s npub. Publish the hex string to certrelay to make it live.',
+      [
+        { text: 'Later', style: 'cancel' },
+        { text: 'Publish', onPress: () => void handlePublishHexString(publishHex) },
+      ]
+    );
+  };
 
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
@@ -662,6 +751,21 @@ export default function HexToolScreen() {
               activeOpacity={0.7}>
               <Text style={styles.insertButtonText}>+ TXT</Text>
             </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.insertButton, styles.insertButtonBelow]}
+              onPress={() => insertRow('addr')}
+              activeOpacity={0.7}>
+              <Text style={styles.insertButtonText}>+ ADDR</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.link2NostrButton, styles.insertButtonBelow]}
+              onPress={handleLink2Nostr}
+              activeOpacity={0.7}
+              disabled={!canLink2Nostr}>
+              <Text style={[styles.link2NostrButtonText, !canLink2Nostr && styles.insertButtonDisabledText]}>
+                Link2Nostr
+              </Text>
+            </TouchableOpacity>
             {/* + BLOB — enable when blob record editing is supported in the hex tool UI */}
           </View>
         </View>
@@ -694,7 +798,7 @@ export default function HexToolScreen() {
                     <View style={styles.modalOptionContent}>
                       <Text style={styles.modalOptionName}>{rt.label}</Text>
                       <Text style={styles.modalOptionType}>
-                        0x{rt.type === 'txt' ? '01' : '02'}
+                        0x{rt.rtype.toString(16).padStart(2, '0')}
                       </Text>
                     </View>
                   </TouchableOpacity>
@@ -985,10 +1089,32 @@ const styles = StyleSheet.create({
     backgroundColor: colors.primary,
     borderColor: colors.primary,
   },
+  insertButtonBelow: {
+    marginTop: 8,
+  },
   insertButtonText: {
     color: colors.black,
     fontSize: 14,
     fontWeight: '600',
+  },
+  link2NostrButton: {
+    width: '100%',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.cardDark,
+    borderColor: colors.primary,
+  },
+  link2NostrButtonText: {
+    color: colors.primary,
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  insertButtonDisabledText: {
+    opacity: 0.45,
   },
   modalOverlay: {
     flex: 1,

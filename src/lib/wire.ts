@@ -1,14 +1,14 @@
 /**
- * Spaces wire record encoding (SEQ / TXT / BLOB).
+ * Spaces wire record encoding (SIP-7: SEQ / TXT / BLOB / SIG / ADDR).
  * Ported from spaces-hex-tool; base64 helpers are RN-safe (no global btoa/atob).
  */
 
 const TYPE_SEQ = 0x00;
-const TYPE_TXT = 0x01;
-const TYPE_BLOB = 0x02;
-const TYPE_ADDR = 0x03;
+export const TYPE_TXT = 0x01;
+export const TYPE_BLOB = 0x02;
 /** SIP-7 signature record — internal; stripped in the hex tool UI. */
 export const TYPE_SIG = 0x04;
+export const TYPE_ADDR = 0x05;
 
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
@@ -346,6 +346,7 @@ export type JsonRecord =
   | { type: 'seq'; version: number }
   | { type: 'txt'; key: string; value: string }
   | { type: 'blob'; key: string; value: string }
+  | { type: 'addr'; key: string; value: string }
   | { type: 'unknown'; rtype: number; rdata: string };
 
 export function rowsToJson(rows: RecordRow[]): JsonRecord[] {
@@ -358,7 +359,7 @@ export function rowsToJson(rows: RecordRow[]): JsonRecord[] {
       case 'blob':
         return { type: 'blob', key: row.key ?? '', value: row.value ?? '' };
       case 'addr':
-        return { type: 'txt', key: row.key ?? '', value: row.value ?? '' };
+        return { type: 'addr', key: row.key ?? '', value: row.value ?? '' };
       case 'unknown':
         return { type: 'unknown', rtype: row.rtype ?? 0, rdata: row.rdata ?? '' };
       case 'sig':
@@ -377,6 +378,8 @@ export function jsonToRows(records: JsonRecord[]): RecordRow[] {
         return { id, recordType: 'txt', key: rec.key, value: rec.value };
       case 'blob':
         return { id, recordType: 'blob', key: rec.key, value: rec.value };
+      case 'addr':
+        return { id, recordType: 'addr', key: rec.key, value: rec.value };
       case 'unknown':
         return { id, recordType: 'unknown', rtype: rec.rtype, rdata: rec.rdata };
     }
@@ -428,6 +431,14 @@ export function validateJsonRecords(data: unknown): JsonRecord[] {
         if (typeof value !== 'string') throw new Error(`Record ${i}: blob requires a "value" (base64) string`);
         if (!validateKey(key)) throw new Error(`Record ${i}: invalid key "${key}"`);
         records.push({ type: 'blob', key, value });
+        break;
+      }
+      case 'addr': {
+        const { key, value } = item as { key?: unknown; value?: unknown };
+        if (typeof key !== 'string') throw new Error(`Record ${i}: addr requires a "key" string`);
+        if (typeof value !== 'string') throw new Error(`Record ${i}: addr requires a "value" string`);
+        if (!validateKey(key)) throw new Error(`Record ${i}: invalid key "${key}"`);
+        records.push({ type: 'addr', key, value });
         break;
       }
       case 'unknown': {

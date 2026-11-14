@@ -32,7 +32,10 @@ import { FiatCurrency, pricingService } from '@/services/pricing-service';
 import { useWalletManager } from '@spacesops/wdk-react-native-core';
 import { resolveCurrentWalletId } from '@/utils/resolve-current-wallet-id';
 import { resolveTaprootForScriptPubKey } from '@/utils/resolve-taproot-for-script-pubkey';
-import { scriptPubKeyHexToTaprootAddress } from '@/utils/taproot-address-to-spk';
+import {
+  scriptPubKeyHexToTaprootAddress,
+  taprootXOnlyPubkeyHexFromScriptPubkeyHex,
+} from '@/utils/taproot-address-to-spk';
 import getChainsConfig from '@/config/get-chains-config';
 import {
   buildSpacesScanDerivationPaths,
@@ -41,7 +44,11 @@ import {
 } from '@/utils/spaces-scan-paths';
 import { buildPaymentWatchRequestBody } from '@/utils/build-payment-watch-body';
 import { formatMySpaceHandleStatusLabel } from '@/utils/format-my-space-status';
-import { encodeNpubFromPubKeyHex, encodeNsecFromPrivKeyHex } from '@/utils/nip19-encode';
+import {
+  encodeNpubFromPubKeyHex,
+  encodeNsecFromPrivKeyHex,
+  xOnlyPubKeyHexFromPrivKeyHex,
+} from '@/utils/nip19-encode';
 import { validateStoredCertificate } from '@/utils/validate-stored-certificate';
 import type { VerifiedZoneSummary } from '@/utils/extract-zone-attributes';
 import { WDKSpaces, type UpdateOnchainHexParams } from '@/utils/wdk-spaces';
@@ -720,14 +727,6 @@ const NOSTR_DISPLAY_LABELS: Record<NostrDisplayMode, string> = {
 function nextNostrDisplayMode(mode: NostrDisplayMode): NostrDisplayMode {
   return mode === 'npub' ? 'nsec' : 'npub';
 }
-/** P2TR scriptPubKey: OP_1 (0x51) + push 32 (0x20) + 32-byte x-only output key. */
-function taprootXOnlyPubkeyHexFromScriptPubkeyHex(scriptPubkeyHex: string): string | null {
-  const h = scriptPubkeyHex.trim().toLowerCase().replace(/^0x/, '');
-  if (!/^[0-9a-f]+$/i.test(h) || h.length < 68) return null;
-  if (!h.startsWith('5120')) return null;
-  return h.slice(4, 68);
-}
-
 export default function SubspaceScreen() {
   const insets = useSafeAreaInsets();
   const router = useDebouncedNavigation();
@@ -1379,7 +1378,7 @@ export default function SubspaceScreen() {
         result.attributes.length > 0
           ? JSON.stringify(
               result.attributes.map((attr) => ({
-                type: 'txt' as const,
+                type: attr.type,
                 key: attr.key,
                 value: attr.values.join(''),
               }))
@@ -1887,8 +1886,12 @@ export default function SubspaceScreen() {
     return taprootKeyMaterial?.tweakedPrivateKeyHex?.toLowerCase() ?? '—';
   }, [keyDisplayMode, taprootKeyMaterial, publicKeyFromScript, keyMaterialPending]);
 
-  const nostrPubKeyHex =
-    taprootKeyMaterial?.internalPubKeyHex?.toLowerCase() || publicKeyFromScript || '';
+  const nostrPubKeyHex = useMemo(() => {
+    if (publicKeyFromScript) return publicKeyFromScript;
+    return (
+      xOnlyPubKeyHexFromPrivKeyHex(taprootKeyMaterial?.tweakedPrivateKeyHex)?.toLowerCase() ?? ''
+    );
+  }, [publicKeyFromScript, taprootKeyMaterial?.tweakedPrivateKeyHex]);
   const displayedNostrValue = useMemo(() => {
     if (keyMaterialPending) {
       return 'Deriving…';
@@ -1896,8 +1899,13 @@ export default function SubspaceScreen() {
     if (nostrDisplayMode === 'npub') {
       return encodeNpubFromPubKeyHex(nostrPubKeyHex) ?? '—';
     }
-    return encodeNsecFromPrivKeyHex(taprootKeyMaterial?.privateKeyHex) ?? '—';
-  }, [nostrDisplayMode, nostrPubKeyHex, taprootKeyMaterial?.privateKeyHex, keyMaterialPending]);
+    return encodeNsecFromPrivKeyHex(taprootKeyMaterial?.tweakedPrivateKeyHex) ?? '—';
+  }, [
+    nostrDisplayMode,
+    nostrPubKeyHex,
+    taprootKeyMaterial?.tweakedPrivateKeyHex,
+    keyMaterialPending,
+  ]);
 
   const handleCycleKeyDisplay = () => {
     setKeyDisplayMode((mode) => nextKeyDisplayMode(mode));
